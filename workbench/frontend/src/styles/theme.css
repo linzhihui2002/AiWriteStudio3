@@ -1,0 +1,114 @@
+/* ============================================================================
+   主题层 —— 只覆盖「色彩类」与「排印类」token
+   ----------------------------------------------------------------------------
+   亮色为 :root 默认值（见 tokens.css），此处显式声明一份便于调试与扩展。
+   新增主题：追加一个 [data-theme='xxx'] 选择器块即可，组件无需改动。
+   已支持：light / dark / paper（纸感阅读，M9 护眼模式将在此深化）
+   ============================================================================ */
+
+/* ── 亮色（默认）────────────────────────────────────────────────────────── */
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+/* ── 暗色 ───────────────────────────────────────────────────────────────── */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --color-bg: #191918;
+  --color-bg-sunken: #131312;
+  --color-bg-raised: #212120;
+  --color-bg-hover: #262625;
+  --color-bg-active: #2e2e2c;
+
+  --color-fg: #e8e8e5;
+  --color-fg-muted: #a3a39d;
+  --color-fg-subtle: #74746f;
+  --color-fg-inverse: #191918;
+
+  --color-border: #2e2e2c;
+  --color-border-strong: #42423f;
+
+  --color-primary: #7fa0c4;
+  --color-primary-hover: #93b1d1;
+  --color-primary-fg: #14161a;
+  --color-primary-subtle: #1e2530;
+
+  --color-success: #7fb392;
+  --color-success-subtle: #1b2620;
+  --color-warning: #c9a25f;
+  --color-warning-subtle: #2a2418;
+  --color-danger: #d1887c;
+  --color-danger-subtle: #2b1f1d;
+
+  --color-focus: #7fa0c4;
+  --color-overlay: rgba(0, 0, 0, 0.6);
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 14px 36px rgba(0, 0, 0, 0.6);
+
+  /* 高亮色板在暗色下提亮，保证可辨识 */
+  --highlight-1: #86a9d1;
+  --highlight-2: #d98679;
+  --highlight-3: #85b79a;
+  --highlight-4: #d8b268;
+  --highlight-5: #b391c4;
+}
+
+/* ── 纸感阅读（占位可扩展）─────────────────────────────────────────────────
+   目标：低对比暖色纸面 + 衬线正文 + 更宽行距，适合长时间阅读。
+   当前仅提供基础色板与排印参数，护眼模式的色温/对比度调节在 M9 实装。 */
+:root[data-theme='paper'] {
+  color-scheme: light;
+
+  --color-bg: #f6f1e6;
+  --color-bg-sunken: #efe8d9;
+  --color-bg-raised: #fbf7ee;
+  --color-bg-hover: #eee7d7;
+  --color-bg-active: #e6ddc9;
+
+  --color-fg: #332e26;
+  --color-fg-muted: #6a6155;
+  --color-fg-subtle: #948a7b;
+  --color-fg-inverse: #fbf7ee;
+
+  --color-border: #ded4c0;
+  --color-border-strong: #c9bda4;
+
+  --color-primary: #6b5a3e;
+  --color-primary-hover: #57492f;
+  --color-primary-fg: #fbf7ee;
+  --color-primary-subtle: #ece4d4;
+
+  --color-success: #55704f;
+  --color-success-subtle: #e8ebdf;
+  --color-warning: #8a6a24;
+  --color-warning-subtle: #f2e9d5;
+  --color-danger: #8f4a3c;
+  --color-danger-subtle: #f0e2da;
+
+  --color-focus: #6b5a3e;
+  --color-overlay: rgba(51, 46, 38, 0.42);
+
+  /* 纸感排印预留 */
+  --prose-line-height: 2;
+  --prose-max-width: 34rem;
+  --paper-tint: #f6f1e6;
+
+  /* 高亮色板在纸感（暖底）下压深，保证对比度 */
+  --highlight-1: #34506f;
+  --highlight-2: #8a3a2f;
+  --highlight-3: #3a6449;
+  --highlight-4: #7a5713;
+  --highlight-5: #5c4168;
+}
+
+/* ── 减少动效（M9 无障碍）────────────────────────────────────────────────── */
+:root[data-reduce-motion='on'] * {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}

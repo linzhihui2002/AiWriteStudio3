@@ -1,0 +1,69 @@
+第三方许可证全文（workbench/backend/gates/）
+================================================================================
+本目录下的三个门禁模块由下列 MIT 项目引入并改造，各自文件头含来源声明。
+MIT 要求「版权声明与本许可声明须随副本或实质部分一并保留」，故此处收录全文。
+
+引入登记见 docs/third-party-notices.md。
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. huahuakandaima__human-novel-writer
+   引入文件：
+     scripts/density_check.py  ->  workbench/backend/gates/density_gate.py
+     scripts/check_prose.py    ->  workbench/backend/gates/prose_gate.py
+   原文件位置：projects/huahuakandaima__human-novel-writer/
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 huahuakandaima
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+--------------------------------------------------------------------------------
+2. qin1473692580-ux__oh-story-claudecode
+   引入文件：
+     scripts/check-chinese-prose-contract.py                 ->  language_gate.py（契约）
+     skills/story-deslop/scripts/language_gate.js            ->  language_gate.py（实现移植）
+   原文件位置：projects/qin1473692580-ux__oh-story-claudecode/
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2025-2026 oh-story-claudecode
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

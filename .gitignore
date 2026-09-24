@@ -6,3 +6,37 @@ projects/
 
 # 含 API Key 的敏感文件，禁止提交
 模型API.md
+
+# ── 工作台运行时（隔离原则：运行时产物一律不入库）──
+.workbench/
+.writerHelper/
+workbench/vendor/dsh/node_modules/
+workbench/frontend/dist/
+
+# ── dsh 技能同步产物（源目录为 skills/，此处为自动生成的投影，不入库）──
+.dsh/
+
+# ── 依赖与构建产物 ──
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 凭据与密钥（FR-MODEL-003 兜底，防误提交）──
+secrets.json
+*.secrets.json
+.env
+.env.*
+!.env.example
+
+# ── 编辑器与系统 ──
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.log

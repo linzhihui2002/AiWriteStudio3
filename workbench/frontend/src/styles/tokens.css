@@ -1,0 +1,138 @@
+/* ============================================================================
+   设计 token —— 单一事实源（Single Source of Truth）
+   ----------------------------------------------------------------------------
+   本文件只负责「定义」，不负责「主题差异」：
+     · 结构类 token（字体 / 字号 / 间距 / 圆角 / 阴影 / 层级 / 尺寸）在此定稿；
+     · 色彩类 token 在此给出「亮色」默认值，暗色与纸感在 theme.css 中覆盖。
+   组件内严禁硬编码色值、间距与字号，一律引用本文件变量。
+   ============================================================================ */
+
+:root {
+  /* ── 色彩 · 表面 ───────────────────────────────────────────────────────── */
+  --color-bg: #fbfbfa; /* 应用底色 */
+  --color-bg-sunken: #f3f3f1; /* 侧栏 / 下沉区域 */
+  --color-bg-raised: #ffffff; /* 卡片 / 面板 */
+  --color-bg-hover: #f0f0ee;
+  --color-bg-active: #e9e9e6;
+
+  /* ── 色彩 · 前景 ───────────────────────────────────────────────────────── */
+  --color-fg: #1e1e1c;
+  --color-fg-muted: #5d5d58;
+  --color-fg-subtle: #8b8b85;
+  --color-fg-inverse: #fafaf9;
+
+  /* ── 色彩 · 边框 ───────────────────────────────────────────────────────── */
+  --color-border: #e5e5e1;
+  --color-border-strong: #cfcfc9;
+
+  /* ── 色彩 · 主色（低饱和墨蓝，非营销紫）───────────────────────────────── */
+  --color-primary: #3d5a80;
+  --color-primary-hover: #334c6d;
+  --color-primary-fg: #ffffff;
+  --color-primary-subtle: #edf1f6;
+
+  /* ── 色彩 · 语义状态 ───────────────────────────────────────────────────── */
+  --color-success: #3f7357;
+  --color-success-subtle: #eaf2ec;
+  --color-warning: #8a6417;
+  --color-warning-subtle: #f7f0e0;
+  --color-danger: #9c4034;
+  --color-danger-subtle: #f7ecea;
+
+  /* ── 色彩 · 交互 ───────────────────────────────────────────────────────── */
+  --color-focus: #3d5a80;
+  --color-overlay: rgba(24, 24, 22, 0.42);
+
+  /* ── 字体族 ────────────────────────────────────────────────────────────── */
+  --font-sans: system-ui, -apple-system, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-serif: 'Iowan Old Style', 'Source Han Serif SC', 'Noto Serif SC',
+    'Songti SC', 'SimSun', Georgia, 'Times New Roman', serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', 'Cascadia Mono', Consolas,
+    'Liberation Mono', monospace;
+
+  /* ── 字号阶梯 ──────────────────────────────────────────────────────────── */
+  --text-xs: 0.75rem; /* 12px 辅助说明 */
+  --text-sm: 0.8125rem; /* 13px 导航 / 按钮 / 表格 */
+  --text-base: 0.875rem; /* 14px UI 正文 */
+  --text-md: 1rem; /* 16px 强调正文 */
+  --text-lg: 1.125rem; /* 18px 页面标题 */
+  --text-xl: 1.375rem; /* 22px 空状态标题 */
+  --text-2xl: 1.75rem; /* 28px 罕见大标题 */
+
+  /* ── 行高 ──────────────────────────────────────────────────────────────── */
+  --leading-tight: 1.25;
+  --leading-snug: 1.4;
+  --leading-normal: 1.6;
+  --leading-relaxed: 1.85; /* 长文阅读 */
+
+  /* ── 字重与字距 ────────────────────────────────────────────────────────── */
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --tracking-normal: 0;
+  --tracking-wide: 0.02em;
+
+  /* ── 间距阶梯（4px 基准）───────────────────────────────────────────────── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ── 圆角（写作工具走小圆角，避免胶囊化）──────────────────────────────── */
+  --radius-sm: 3px;
+  --radius-md: 5px;
+  --radius-lg: 8px;
+  --radius-full: 999px;
+
+  /* ── 阴影 ──────────────────────────────────────────────────────────────── */
+  --shadow-xs: 0 1px 2px rgba(24, 24, 22, 0.06);
+  --shadow-sm: 0 1px 3px rgba(24, 24, 22, 0.08);
+  --shadow-md: 0 4px 14px rgba(24, 24, 22, 0.1);
+  --shadow-lg: 0 14px 36px rgba(24, 24, 22, 0.16);
+
+  /* ── 层级 ──────────────────────────────────────────────────────────────── */
+  --z-base: 0;
+  --z-sticky: 100;
+  --z-header: 200;
+  --z-dropdown: 300;
+  --z-overlay: 400;
+  --z-modal: 500;
+  --z-toast: 600;
+
+  /* ── 布局尺寸 ──────────────────────────────────────────────────────────── */
+  --sidebar-width: 208px;
+  --topbar-height: 44px;
+  --content-max-width: 1120px;
+  --content-padding-x: var(--space-8);
+  --content-padding-y: var(--space-6);
+
+  /* ── 正文排印（供编辑区 / 阅读区使用，M9 护眼模式将在此扩展）──────────── */
+  --prose-font: var(--font-serif);
+  --prose-line-height: var(--leading-relaxed);
+  --prose-max-width: 36rem;
+
+  /* ── 色彩 · 设定卡片高亮（token 化有限色板，主题自适应）───────────────── */
+  --highlight-1: #3d5a80; /* 墨蓝：主角 */
+  --highlight-2: #9c4034; /* 赤褐：核心反派 */
+  --highlight-3: #3f7357; /* 松绿：盟友 */
+  --highlight-4: #8a6417; /* 赭金：关键道具/资源 */
+  --highlight-5: #6b4b7a; /* 灰紫：伏笔/悬念（低饱和，非装饰渐变） */
+
+  /* ── 动效 ──────────────────────────────────────────────────────────────── */
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  /* ── 护眼 / 外观（由 useAppearance 在 :root 上覆盖）────────────────────── */
+  --prose-font-size: 17px;
+  --prose-letter-spacing: 0px;
+  --contrast-filter: none;
+  --warmth-overlay: transparent;
+}

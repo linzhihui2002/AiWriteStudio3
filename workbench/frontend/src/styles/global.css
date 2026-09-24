@@ -1,0 +1,444 @@
+/* ============================================================================
+   基础样式 + 布局壳 + 通用组件
+   ----------------------------------------------------------------------------
+   所有取值来自 tokens.css / theme.css，禁止硬编码色值与尺寸。
+   风格定位：克制的专业写作工具 —— 中性色、细边框、低饱和、信息密度适中。
+   ============================================================================ */
+
+/* ── 重置与基础元素 ─────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--color-fg);
+  background: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+h4,
+p,
+figure {
+  margin: 0;
+}
+
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 1px;
+  border-radius: var(--radius-sm);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
+}
+
+/* ── 应用外壳：左侧窄导航 + 主内容区 ──────────────────────────────────────
+   用 flex 而非 grid：侧栏宽度由 --app-sidebar-w（拖拽分隔条时实时改写）决定，
+   主内容区 flex:1 自动占满，收起侧栏时立即接管全部宽度。 */
+.app-shell {
+  display: flex;
+  height: 100%;
+  background: var(--color-bg);
+}
+
+.app-sidebar {
+  flex: none;
+  width: var(--app-sidebar-w, var(--sidebar-width));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-3) var(--space-2);
+  background: var(--color-bg-sunken);
+  border-right: 1px solid var(--color-border);
+  overflow-y: auto;
+}
+
+.app-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3);
+}
+
+.app-brand__name {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  color: var(--color-fg);
+}
+
+.app-brand__meta {
+  font-size: var(--text-xs);
+  color: var(--color-fg-subtle);
+}
+
+.app-nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.app-nav__group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.app-nav__label {
+  padding: 0 var(--space-3);
+  margin-bottom: var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--color-fg-subtle);
+}
+
+.app-nav__hint {
+  padding: var(--space-1) var(--space-3) 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--color-fg-subtle);
+}
+
+.app-nav__project {
+  padding: 0 var(--space-3);
+  margin-bottom: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 导航项 ─────────────────────────────────────────────────────────────── */
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  color: var(--color-fg-muted);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+.nav-item:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg);
+}
+
+.nav-item.is-active {
+  background: var(--color-bg-raised);
+  border-color: var(--color-border);
+  /* ui-style-ok: 选中指示条用 inset 阴影实现（色值本身仍取 token） */
+  box-shadow: inset 2px 0 0 var(--color-primary);
+  color: var(--color-fg);
+  font-weight: var(--weight-medium);
+}
+
+.nav-item.is-disabled {
+  color: var(--color-fg-subtle);
+  cursor: not-allowed;
+}
+
+.nav-item.is-disabled:hover {
+  background: transparent;
+  color: var(--color-fg-subtle);
+}
+
+/* ── 主内容区 ───────────────────────────────────────────────────────────── */
+.app-main {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.app-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex: none;
+  height: var(--topbar-height);
+  padding: 0 var(--space-5);
+  background: var(--color-bg);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.app-topbar__title {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-fg);
+}
+
+.app-topbar__crumb {
+  color: var(--color-fg-subtle);
+  font-weight: var(--weight-normal);
+}
+
+.app-topbar__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.app-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* ── 页面容器 ───────────────────────────────────────────────────────────── */
+.page {
+  max-width: var(--content-max-width);
+  margin: 0 auto;
+  padding: var(--content-padding-y) var(--content-padding-x);
+}
+
+/* 工作区页（编辑器与项目内各工作区）铺满可用宽度：把两侧留白还给工作区本身。
+   全局页（书架 / 设置 / 仪表盘 …）继续走上面的 1120px 限宽居中。 */
+.page--wide {
+  max-width: none;
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.page-header__title {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
+  color: var(--color-fg);
+}
+
+.page-header__desc {
+  margin-top: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--color-fg-muted);
+}
+
+/* 紧凑页头（编辑器等工作台页）：标题与快捷键提示压成一行，把高度让给内容区 */
+.page-header--compact {
+  align-items: center;
+  margin-bottom: var(--space-3);
+}
+
+.page-header__compact-main {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.page-header--compact .page-header__title {
+  font-size: var(--text-md);
+  white-space: nowrap;
+}
+
+.page-header--compact .page-header__desc {
+  margin-top: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.page-footnote {
+  margin-top: var(--space-5);
+  font-size: var(--text-xs);
+  color: var(--color-fg-subtle);
+}
+
+/* ── 主题切换 ───────────────────────────────────────────────────────────── */
+.theme-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: var(--color-bg-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.theme-switch__btn {
+  padding: 3px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: var(--text-xs);
+  color: var(--color-fg-muted);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+.theme-switch__btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg);
+}
+
+.theme-switch__btn[aria-pressed='true'] {
+  background: var(--color-bg-raised);
+  box-shadow: var(--shadow-xs);
+  color: var(--color-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* ── 按钮 ───────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-raised);
+  color: var(--color-fg);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+}
+
+.btn--primary {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: var(--color-primary-fg);
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--color-primary-hover);
+  border-color: var(--color-primary-hover);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* ── 提示 / 占位块 ──────────────────────────────────────────────────────── */
+.notice {
+  padding: var(--space-4) var(--space-5);
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+}
+
+.notice__label {
+  margin-bottom: var(--space-2);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--color-warning);
+}
+
+.notice__body {
+  max-width: 68ch;
+  color: var(--color-fg-muted);
+}
+
+.notice__sub {
+  margin-top: var(--space-4);
+  margin-bottom: var(--space-2);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--color-fg-subtle);
+}
+
+.notice__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--color-fg-muted);
+}
+
+.notice__list li::before {
+  content: '·';
+  margin-right: var(--space-2);
+  color: var(--color-fg-subtle);
+}
+
+/* ── 空状态 ─────────────────────────────────────────────────────────────── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-10) var(--space-8);
+  background: var(--color-bg-raised);
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius-lg);
+}
+
+.empty-state__title {
+  font-family: var(--font-serif);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-normal);
+  color: var(--color-fg);
+}
+
+.empty-state__desc {
+  max-width: 56ch;
+  font-size: var(--text-base);
+  color: var(--color-fg-muted);
+}
+
+/* ── 正文排印（编辑区 / 阅读区共用）─────────────────────────────────────── */
+.prose {
+  font-family: var(--prose-font);
+  line-height: var(--prose-line-height);
+  max-width: var(--prose-max-width);
+}

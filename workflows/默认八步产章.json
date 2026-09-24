@@ -1,0 +1,84 @@
+{
+  "name": "默认八步产章",
+  "description": "工作台内置：章节生产八步循环（LOAD→CHECK→CONTRACT→DRAFT→REVIEW→REVISE→UPDATE→DECIDE）",
+  "nodes": [
+    {
+      "id": "load",
+      "type": "LOAD",
+      "label": "载入上下文",
+      "engine": "",
+      "model": "",
+      "skill": "",
+      "next": "check"
+    },
+    {
+      "id": "check",
+      "type": "CHECK",
+      "label": "前置依赖门控",
+      "engine": "",
+      "model": "",
+      "skill": "",
+      "next": "contract"
+    },
+    {
+      "id": "contract",
+      "type": "CONTRACT",
+      "label": "生成/冻结合同",
+      "engine": "dsh-headless",
+      "model": "",
+      "skill": "",
+      "next": "draft"
+    },
+    {
+      "id": "draft",
+      "type": "DRAFT",
+      "label": "生成正文草稿",
+      "engine": "dsh-headless",
+      "model": "",
+      "skill": "",
+      "next": "review"
+    },
+    {
+      "id": "review",
+      "type": "REVIEW",
+      "label": "双门禁审稿",
+      "engine": "dsh-headless",
+      "model": "",
+      "skill": "novel-review",
+      "next": "revise"
+    },
+    {
+      "id": "revise",
+      "type": "REVISE",
+      "label": "修改回灌",
+      "engine": "",
+      "model": "",
+      "skill": "human-linguistics",
+      "next": "update"
+    },
+    {
+      "id": "update",
+      "type": "UPDATE",
+      "label": "应用落盘与摄取",
+      "engine": "",
+      "model": "",
+      "skill": "",
+      "next": "decide"
+    },
+    {
+      "id": "decide",
+      "type": "DECIDE",
+      "label": "状态流转与质量债",
+      "engine": "",
+      "model": "",
+      "skill": "",
+      "next": ""
+    }
+  ],
+  "batch": {
+    "chapters": [],
+    "stop_on_failure": false
+  },
+  "is_builtin": true,
+  "version": 1
+}

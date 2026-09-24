@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>AI 小说创作工作台</title>
+    <script>
+      // 首屏渲染前应用已持久化的主题，避免主题闪烁（与 src/theme/useTheme.ts 的键名保持一致）。
+      (function () {
+        try {
+          var stored = window.localStorage.getItem('aiw.theme');
+          var valid = stored === 'light' || stored === 'dark' || stored === 'paper';
+          var theme = valid
+            ? stored
+            : window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+              ? 'dark'
+              : 'light';
+          document.documentElement.setAttribute('data-theme', theme);
+        } catch (error) {
+          document.documentElement.setAttribute('data-theme', 'light');
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

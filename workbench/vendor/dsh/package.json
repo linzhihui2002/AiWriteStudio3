@@ -1,0 +1,7 @@
+{
+  "name": "workbench-vendor-dsh",
+  "private": true,
+  "version": "0.0.0",
+  "description": "工作台内置的版本锁定 dsh 运行时（隔离安装，不使用全局 dsh）",
+  "dependencies": { "@deepseek-ai/dsh": "0.1.0-rc.8" }
+}
