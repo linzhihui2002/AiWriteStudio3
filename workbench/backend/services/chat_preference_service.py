@@ -15,8 +15,27 @@ from .project_service import get_project_dir
 from .settings_service import read_settings
 
 PREFERENCE_FILE = ".meta/chat-preferences.json"
-SAFE_DEFAULT = {"permission_mode": "ask", "discussion_only": True}
+SAFE_DEFAULT = {"permission_mode": "auto", "discussion_only": False}
 PERMISSION_MODES = frozenset({"ask", "auto", "full"})
+#: 写域严格度：ask=范围外需批准（默认）/ reject=范围外一律拒绝
+SCOPE_STRICTNESS_VALUES = frozenset({"ask", "reject"})
+SCOPE_DEFAULT = {"scope_strictness": "ask", "scope_limit_full": False}
+
+
+def get_scope_prefs() -> dict:
+    """全局「写域」对话偏好：严格度与「完全访问是否也受写域限制」。
+
+    缺失或手工改坏时回落到默认值（范围外需批准 / 完全访问不受写域限制），绝不抛错。
+    """
+    chat = read_settings().get("chat")
+    chat = chat if isinstance(chat, dict) else {}
+    strictness = chat.get("scope_strictness")
+    if strictness not in SCOPE_STRICTNESS_VALUES:
+        strictness = SCOPE_DEFAULT["scope_strictness"]
+    limit_full = chat.get("scope_limit_full")
+    if not isinstance(limit_full, bool):
+        limit_full = SCOPE_DEFAULT["scope_limit_full"]
+    return {"scope_strictness": strictness, "scope_limit_full": limit_full}
 
 
 def _path(project_id: int) -> Path:
@@ -37,8 +56,9 @@ def _valid(value: object) -> bool:
 def get_chat_defaults(project_id: int) -> dict:
     """Read this book's defaults, or the validated global defaults.
 
-    A present but malformed book file never falls back to a more permissive
-    global value. It remains on disk for inspection and can be repaired by PUT.
+    A present but malformed book file falls back to the book-level safe default
+    instead of inheriting the global value. It remains on disk for inspection
+    and can be repaired by PUT.
     """
     path = _path(project_id)
     if not path.exists():

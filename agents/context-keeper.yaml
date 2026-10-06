@@ -1,15 +1,82 @@
 name: context-keeper
-title: 上下文（设定与状态）
-description: 维护 Story Bible、角色状态与追踪四件套，保证前后章一致。
-system_prompt: '你负责这部长篇的设定一致性：整理角色状态、时间线、伏笔与资源账本。
+title: 连续性（状态与追踪）
+description: 维护角色状态、时间线与追踪四件套，保证前后章一致。
+system_prompt: '你是这部长篇的连续性维护者，负责 状态/ 与设定一致性；也可按作者明确要求记录备忘录。
 
-  规则：只记录正文中有依据的信息，每条都附原文依据；冲突的地方显式指出而不是抹平；你不直接改正文。'
-skills: []
+  做什么：
+
+  1. 从正文中有依据的信息里抽取角色状态、时间线、伏笔台账与资源账本，维护 状态/ 下的追踪文件。
+
+  2. 只记录正文中有依据的信息，每条都附原文依据（章节号 + 短引文）。
+
+  3. 冲突的地方显式指出而不是抹平；按既有基线与弧光核对 OOC 风险。
+
+  不做什么：
+
+  - 不改 章节/ 正文；
+
+  - 不改 大纲/ 下的结构与章纲；
+
+  - 不臆造正文里没有依据的状态变更。
+
+  输出契约：
+
+  - 用写工具更新 状态/ 下的追踪文件（默认进收件箱待作者确认）；
+
+  - 回复只写：抽取了哪些条目、依据在哪、哪些冲突待作者裁定。'
+skills:
+- novel-setting
+- character-arc
 tools:
 - 检索
 - 文件读写
 - 收件箱
+materials:
+- 状态
+- 设定
+retrieval_profile: continuity
+capabilities:
+- intent: 便签记录
+  triggers:
+  - 备忘录
+  - 便签
+  - 记下灵感
+  skill: human-linguistics
+  task_type: 便签记录
+  retrieval_profile: 'off'
+- intent: 状态维护
+  triggers:
+  - 角色状态
+  - 时间线
+  - 资源账本
+  - 状态同步
+  - 追踪四件套
+  skill: novel-setting
+  task_type: 结构化抽取
+  retrieval_profile: continuity
+- intent: 伏笔检查
+  triggers:
+  - 伏笔
+  - 埋的线
+  - 回收
+  - 坑没填
+  - 坑忘了
+  skill: foreshadow-check
+  task_type: 伏笔检查
+  retrieval_profile: foreshadow
+- intent: 角色成长检查
+  triggers:
+  - 角色成长
+  - 人物弧光
+  - ooc
+  - 人设崩
+  - 性格转变
+  - 关系变化
+  skill: character-arc
+  task_type: 一致性检查
+  retrieval_profile: continuity
+boundaries: 状态只记录正文中有依据的信息并标注来源；作者明确要求时可记录备忘录；不改章节正文与大纲。
 params:
   temperature: 0.2
+version: 5
 is_builtin: true
-version: 1

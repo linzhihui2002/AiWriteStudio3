@@ -1,176 +1,103 @@
-/**
- * 轻量 Markdown 渲染 + 字数里程碑装饰层。
- *
- * 安全：**不注入 HTML**（纯文本 → React 元素），因此正文里的任何标记都不会被执行。
- * 里程碑（Task 29a）：只在**渲染层**插入「已满 N 字」徽标，绝不写入正文、不参与统计。
- */
-
-import { Fragment, type ReactNode } from 'react'
+/** Safe GFM documents and plain-text novel decorations. Display never changes the file. */
+import { Fragment, type CSSProperties, type ReactNode } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { buildNovelDecorations, type NovelDecorations, type NovelMark } from '../lib/novelDecorations'
+import { remarkSafeBreaks, rehypeSourceLabels } from '../lib/markdownRendering'
+import '../styles/markdown.css'
 
 export interface MilestoneInfo {
   step: number
   enabled: boolean
   budget: number
-  /** 只在阅读/预览态注入装饰 */
+  /** Decorations are only shown when this is enabled. */
   decorate: boolean
-}
-
-function inline(text: string, keyPrefix: string): ReactNode[] {
-  const nodes: ReactNode[] = []
-  const pattern = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g
-  let lastIndex = 0
-  let match: RegExpExecArray | null
-  let index = 0
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > lastIndex) nodes.push(text.slice(lastIndex, match.index))
-    const token = match[0]
-    index += 1
-    const key = `${keyPrefix}-i${index}`
-    if (token.startsWith('**')) {
-      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>)
-    } else if (token.startsWith('`')) {
-      nodes.push(<code key={key}>{token.slice(1, -1)}</code>)
-    } else {
-      nodes.push(<em key={key}>{token.slice(1, -1)}</em>)
-    }
-    lastIndex = match.index + token.length
-  }
-  if (lastIndex < text.length) nodes.push(text.slice(lastIndex))
-  return nodes
 }
 
 export interface MarkdownViewProps {
   text: string
   milestone?: MilestoneInfo
-  /** 空正文时的提示 */
   emptyHint?: string
+  /** Chapters remain literal text, including Markdown-looking characters. */
+  plain?: boolean
+  /** Full document typography, independent of novel reading typography. */
+  document?: boolean
+  /** Enable Chinese provenance labels only in explicitly identified creative documents. */
+  sourceLabels?: boolean
+  decorations?: NovelDecorations
 }
 
-export default function MarkdownView({ text, milestone, emptyHint }: MarkdownViewProps) {
-  const source = (text ?? '').replace(/\r\n/g, '\n')
-  if (!source.trim()) {
-    return <p className="muted">{emptyHint ?? '（正文为空）'}</p>
+function markText(value: string, marks: NovelMark[], key: string): ReactNode {
+  let content: ReactNode = value
+  const name = marks.find((mark) => mark.kind === 'name')
+  if (name) {
+    const style = name.colors ? {
+      '--novel-name-light': name.colors.light,
+      '--novel-name-dark': name.colors.dark,
+      '--novel-name-paper': name.colors.paper,
+    } as CSSProperties : undefined
+    content = <span className="novel-reading__name" style={style} data-entity-id={name.entityId}>{content}</span>
   }
-
-  const lines = source.split('\n')
-  const blocks: ReactNode[] = []
-  let paragraph: string[] = []
-  let quote: string[] = []
-  let list: string[] = []
-  let written = 0
-  let nextMilestone = milestone?.step ?? 0
-  let milestoneIndex = 0
-
-  const flushParagraph = () => {
-    if (!paragraph.length) return
-    const textBlock = paragraph.join(' ')
-    blocks.push(<p key={`p${blocks.length}`}>{inline(textBlock, `p${blocks.length}`)}</p>)
-    paragraph = []
+  if (marks.some((mark) => mark.kind === 'dialogue')) {
+    content = <em className="novel-reading__dialogue">{content}</em>
   }
-  const flushQuote = () => {
-    if (!quote.length) return
-    blocks.push(
-      <blockquote key={`q${blocks.length}`}>{inline(quote.join(' '), `q${blocks.length}`)}</blockquote>,
-    )
-    quote = []
-  }
-  const flushList = () => {
-    if (!list.length) return
-    blocks.push(
-      <ul key={`u${blocks.length}`} className="prose-list">
-        {list.map((item, index) => (
-          <li key={index}>{inline(item, `l${blocks.length}-${index}`)}</li>
-        ))}
-      </ul>,
-    )
-    list = []
-  }
-  const flushAll = () => {
-    flushParagraph()
-    flushQuote()
-    flushList()
-  }
+  return <Fragment key={key}>{content}</Fragment>
+}
 
-  const maybeMilestone = (count: number) => {
-    if (!milestone?.decorate || !milestone.enabled || milestone.step <= 0) return
-    while (nextMilestone > 0 && count >= nextMilestone) {
-      milestoneIndex += 1
-      const reached = nextMilestone
-      const percent = milestone.budget
-        ? ` · 预算 ${milestone.budget} · ${Math.round((reached / milestone.budget) * 100)}%`
-        : ''
-      blocks.push(
-        <div className="milestone-badge" key={`m-${milestoneIndex}-${reached}`} aria-hidden="true">
-          已满 {reached} 字{percent}
-        </div>,
-      )
-      nextMilestone += milestone.step
+function plainLine(text: string, from: number, to: number, decorations: NovelDecorations): ReactNode[] {
+  const marks = decorations.marks.filter((mark) => mark.from < to && mark.to > from)
+  const milestones = decorations.milestones.filter((node) => node.at >= from && node.at <= to)
+  const boundaries = new Set([from, to])
+  marks.forEach((mark) => { boundaries.add(Math.max(from, mark.from)); boundaries.add(Math.min(to, mark.to)) })
+  milestones.forEach((node) => boundaries.add(node.at))
+  const positions = [...boundaries].sort((left, right) => left - right)
+  const nodes: ReactNode[] = []
+  positions.forEach((position, index) => {
+    milestones.filter((node) => node.at === position).forEach((node) => {
+      nodes.push(<span key={`m-${position}-${node.count}`} className="novel-reading__milestone"
+        aria-hidden="true" data-count={node.count} data-label={`已满 ${node.count} 字`} />)
+    })
+    const end = positions[index + 1]
+    if (end !== undefined && end > position) {
+      nodes.push(markText(text.slice(position, end),
+        marks.filter((mark) => mark.from <= position && mark.to >= end), `${position}-${end}`))
     }
-  }
-
-  lines.forEach((raw, lineIndex) => {
-    const line = raw.trimEnd()
-    const trimmed = line.trim()
-
-    if (!trimmed) {
-      flushAll()
-      return
-    }
-    if (/^#{1,4}\s+/.test(trimmed)) {
-      flushAll()
-      const level = trimmed.match(/^#+/)![0].length
-      const content = trimmed.replace(/^#{1,4}\s+/, '')
-      const Tag = (level <= 2 ? 'h3' : 'h4') as 'h3' | 'h4'
-      blocks.push(
-        <Tag key={`h${lineIndex}`} className={`prose-heading prose-heading--${level}`}>
-          {inline(content, `h${lineIndex}`)}
-        </Tag>,
-      )
-      written += content.replace(/\s/g, '').length
-      maybeMilestone(written)
-      return
-    }
-    if (/^(-{3,}|\*{3,})$/.test(trimmed)) {
-      flushAll()
-      blocks.push(<hr key={`hr${lineIndex}`} className="prose-rule" />)
-      return
-    }
-    if (trimmed.startsWith('>')) {
-      flushParagraph()
-      flushList()
-      quote.push(trimmed.replace(/^>\s?/, ''))
-      written += trimmed.replace(/\s/g, '').length
-      return
-    }
-    if (/^([-*+]|\d+\.)\s+/.test(trimmed)) {
-      flushParagraph()
-      flushQuote()
-      list.push(trimmed.replace(/^([-*+]|\d+\.)\s+/, ''))
-      written += trimmed.replace(/\s/g, '').length
-      maybeMilestone(written)
-      return
-    }
-    if (trimmed.startsWith('|')) {
-      flushAll()
-      const cells = trimmed.replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim())
-      if (cells.every((cell) => /^:?-{2,}:?$/.test(cell) || cell === '')) return
-      blocks.push(
-        <div className="prose-table-row" key={`tr${lineIndex}`}>
-          {cells.map((cell, index) => (
-            <span key={index}>{inline(cell, `td${lineIndex}-${index}`)}</span>
-          ))}
-        </div>,
-      )
-      return
-    }
-
-    flushQuote()
-    flushList()
-    paragraph.push(trimmed)
-    written += trimmed.replace(/\s/g, '').length
-    maybeMilestone(written)
   })
-  flushAll()
+  return nodes
+}
 
-  return <div className="prose">{blocks.map((block, index) => <Fragment key={index}>{block}</Fragment>)}</div>
+export default function MarkdownView({ text, milestone, emptyHint, plain = false, document = false,
+  sourceLabels = false, decorations }: MarkdownViewProps) {
+  const source = text ?? ''
+  if (!source.trim()) return <p className="muted">{emptyHint ?? '（正文为空）'}</p>
+
+  if (plain) {
+    const display = decorations ?? buildNovelDecorations(source, {
+      milestone: { enabled: !!milestone?.decorate && milestone.enabled, step: milestone?.step ?? 0 },
+    })
+    const paragraphs: ReactNode[] = []
+    let offset = 0
+    // Preserve original offsets, including CRLF, for evidence and shared editing decorations.
+    const pieces = source.split(/(\r\n|\n|\r)/)
+    pieces.forEach((piece, index) => {
+      if (index % 2 === 0 && piece.trim()) {
+        paragraphs.push(<p key={offset}>{plainLine(source, offset, offset + piece.length, display)}</p>)
+      }
+      offset += piece.length
+    })
+    return <div className="prose novel-reading">{paragraphs}</div>
+  }
+
+  return <div className={`markdown-view${document ? ' markdown-view--document' : ''}`}>
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkSafeBreaks]} skipHtml
+      rehypePlugins={document && sourceLabels ? [rehypeSourceLabels] : []}
+      components={{
+        table: ({ node: _node, ...props }) => <div className="markdown-table-scroll" tabIndex={0}
+          role="region" aria-label="表格，可横向滚动"><table {...props} /></div>,
+        a: ({ node: _node, href, ...props }) => <a {...props} href={href}
+          {...(/^https?:\/\//i.test(href ?? '') ? { target: '_blank', rel: 'noopener noreferrer' } : {})} />,
+      }}>
+      {source}
+    </ReactMarkdown>
+  </div>
 }

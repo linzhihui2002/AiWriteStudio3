@@ -202,6 +202,7 @@ def upsert_provider(
     # The editor can save an already-enabled provider without toggling it. Native
     # chat reads the isolated projection, so saving must update that projection.
     project_to_dsh_home()
+    _refresh_cloud_knowledge(provider_id)
     return provider
 
 
@@ -223,6 +224,7 @@ def set_enabled(provider_id: str, enabled: bool) -> dict:
     provider = get_provider(provider_id)
     # Disabling must remove the route and its credential as well.
     project_to_dsh_home()
+    _refresh_cloud_knowledge(provider_id)
     return provider
 
 
@@ -235,7 +237,36 @@ def delete_provider(provider_id: str) -> dict:
 
     delete_secret(f"provider:{provider_id}")
     project_to_dsh_home()
+    _refresh_cloud_knowledge(provider_id)
     return {"provider_id": provider_id, "deleted": True}
+
+
+def _refresh_cloud_knowledge(provider_id: str) -> None:
+    """Recheck only active books explicitly using this cloud embedding source.
+
+    A provider endpoint, credential, or enabled-state change can make its old
+    vectors unusable. The book indexer compares fingerprints and rebuilds when
+    needed; other books and local-model indexes are untouched.
+    """
+    from . import knowledge_service, vector_service
+    from .operation_log import log
+
+    with db.get_conn() as conn:
+        project_ids = [int(row[0]) for row in conn.execute(
+            "SELECT id FROM projects WHERE deleted_at IS NULL")]
+    for project_id in project_ids:
+        try:
+            setting = vector_service.settings_for(project_id)
+            if (setting.get("mode") == "cloud"
+                    and setting.get("provider") == provider_id
+                    and knowledge_service.auto_enabled(project_id)):
+                knowledge_service.enqueue(project_id)
+        except Exception as exc:  # Provider CRUD must not depend on a derived index.
+            try:
+                log(project_id, "knowledge-sync-warning", None, {"reason": str(exc)})
+            except Exception:
+                # The project may have been purged after the id list was read.
+                pass
 
 
 def set_health(provider_id: str, health: str) -> None:

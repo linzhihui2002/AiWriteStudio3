@@ -37,6 +37,42 @@ class TemplateDuplicateIn(BaseModel):
     new_name: str
 
 
+class TemplateBlankIn(BaseModel):
+    name: str
+
+
+class TemplateRenameIn(BaseModel):
+    new_name: str
+
+
+class TemplatePrefsIn(BaseModel):
+    default: str | None = None
+    by_genre: dict | None = None
+    by_platform: dict | None = None
+
+
+class TemplateImportIn(BaseModel):
+    payload: dict
+    new_name: str | None = None
+
+
+class TemplateFileWriteIn(BaseModel):
+    rel_path: str
+    content: str = ""
+
+
+class TemplateNodeCreateIn(BaseModel):
+    parent_rel: str = Field(default="", description="父目录相对路径，空串表示模板根")
+    name: str
+    is_dir: bool = False
+
+
+class TemplateNodePatchIn(BaseModel):
+    rel_path: str
+    new_name: str | None = None
+    dst_parent_rel: str | None = None
+
+
 class SnapshotRestoreIn(BaseModel):
     snapshot_id: int
     expected_hash: str | None = None
@@ -94,6 +130,92 @@ def duplicate_template(name: str, payload: TemplateDuplicateIn) -> dict:
 def delete_template(name: str) -> dict:
     """删除模板（内置模板会被拒绝并给出复制指引）。"""
     return template_service.delete_template(name)
+
+
+@router.get("/templates/prefs")
+def get_template_prefs() -> dict:
+    """模板偏好：默认模板 + 题材/平台映射。"""
+    return template_service.get_template_prefs()
+
+
+@router.put("/templates/prefs")
+def update_template_prefs(payload: TemplatePrefsIn) -> dict:
+    """写入模板偏好；引用的模板必须存在，非法值返回 400。"""
+    return template_service.update_template_prefs(
+        default=payload.default,
+        by_genre=payload.by_genre,
+        by_platform=payload.by_platform,
+    )
+
+
+@router.post("/templates/blank", status_code=201)
+def create_blank_template(payload: TemplateBlankIn) -> dict:
+    """新建空白模板（工作区骨架 + 空 md 文件）。"""
+    return template_service.create_blank_template(payload.name)
+
+
+@router.post("/templates/import", status_code=201)
+def import_template(payload: TemplateImportIn) -> dict:
+    """从模板包导入新模板。"""
+    return template_service.import_template(payload.payload, new_name=payload.new_name)
+
+
+@router.patch("/templates/{name}")
+def rename_template(name: str, payload: TemplateRenameIn) -> dict:
+    """重命名自定义模板（内置模板会被拒绝）。"""
+    return template_service.rename_template(name, payload.new_name)
+
+
+@router.get("/templates/{name}/tree")
+def get_template_tree(name: str) -> dict:
+    """模板文件树（内置模板也可浏览）。"""
+    return template_service.list_template_tree(name)
+
+
+@router.get("/templates/{name}/file")
+def read_template_file(name: str, rel_path: str = Query(...)) -> dict:
+    return template_service.read_template_file(name, rel_path)
+
+
+@router.put("/templates/{name}/file")
+def write_template_file(name: str, payload: TemplateFileWriteIn) -> dict:
+    """写入模板内文件（内置模板会被拒绝）。"""
+    return template_service.write_template_file(name, payload.rel_path, payload.content)
+
+
+@router.post("/templates/{name}/node", status_code=201)
+def create_template_node(name: str, payload: TemplateNodeCreateIn) -> dict:
+    """在模板内新建文件（默认补 .md）或目录。"""
+    return template_service.create_template_node(
+        name, payload.parent_rel, payload.name, payload.is_dir
+    )
+
+
+@router.patch("/templates/{name}/node")
+def patch_template_node(name: str, payload: TemplateNodePatchIn) -> dict:
+    """重命名（``new_name``）与/或移动（``dst_parent_rel``）模板内条目。"""
+    if payload.new_name is None and payload.dst_parent_rel is None:
+        raise InvalidOperationError("需要提供 new_name 或 dst_parent_rel")
+
+    node: dict | None = None
+    if payload.dst_parent_rel is not None:
+        node = template_service.move_template_node(name, payload.rel_path, payload.dst_parent_rel)
+    if payload.new_name is not None:
+        current_rel = node["rel_path"] if node is not None else payload.rel_path
+        node = template_service.rename_template_node(name, current_rel, payload.new_name)
+    return node  # type: ignore[return-value]
+
+
+@router.delete("/templates/{name}/node")
+def delete_template_node(name: str, rel_path: str = Query(...)) -> dict:
+    """物理删除模板内的文件/目录（内置模板会被拒绝）。"""
+    return template_service.delete_template_node(name, rel_path)
+
+
+@router.get("/templates/{name}/export")
+def export_template(name: str) -> dict:
+    """导出模板包（JSON，仅文本）。"""
+    return template_service.export_template(name)
 
 
 # ─────────────────────────── 索引与检索 ───────────────────────────

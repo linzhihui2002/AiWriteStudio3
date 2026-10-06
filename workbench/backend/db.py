@@ -13,6 +13,9 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+import re
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -40,6 +43,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "reviews",
     "quality_debts",
     "style_fingerprints",
+    "style_fingerprints_archive",
     # M4/M6 编排与对话
     "skills",
     "agents",
@@ -69,19 +73,23 @@ _SCHEMA_SQL = """
 -- ───────────────────────── M1 数据层 ─────────────────────────
 
 -- 小说项目（索引层：事实源为 projects/{书名}/ 目录）
+-- deleted_at 为软删除标记：NULL=在架；非 NULL=已移入回收站（可恢复）
 CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL,
     path        TEXT    NOT NULL,
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-    archived    INTEGER NOT NULL DEFAULT 0
+    archived    INTEGER NOT NULL DEFAULT 0,
+    deleted_at  TEXT,
+    knowledge_key TEXT
 );
 
--- 章节索引
+-- 章节索引（同时也是章节元数据的事实源：标题/状态/合同ID/字数）
 CREATE TABLE IF NOT EXISTS chapters (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id  INTEGER NOT NULL,
     rel_path    TEXT    NOT NULL,
+    title       TEXT,
     status      TEXT    NOT NULL DEFAULT 'draft',
     word_count  INTEGER NOT NULL DEFAULT 0,
     hash        TEXT,
@@ -279,6 +287,18 @@ CREATE TABLE IF NOT EXISTS style_fingerprints (
     approved   INTEGER NOT NULL DEFAULT 0,
     payload    TEXT,
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 原始文风采样归档；迁移备份不参与当前授权、统计或生成引用。
+CREATE TABLE IF NOT EXISTS style_fingerprints_archive (
+    source_id  INTEGER PRIMARY KEY,
+    project_id INTEGER,
+    rel_path   TEXT,
+    approved   INTEGER,
+    payload    TEXT,
+    created_at TEXT,
+    reason     TEXT NOT NULL,
+    archived_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ───────────────────────── M4 / M6 编排与对话 ─────────────────────────
@@ -542,6 +562,7 @@ CREATE TABLE IF NOT EXISTS image_records (
 
 # 旧库补列（历史库文件可能缺列；SQLite 索引可重建，这里只做最小补齐）
 _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "projects": (("deleted_at", "TEXT"), ("knowledge_key", "TEXT")),
     "tasks": (
         ("provider", "TEXT"),
         ("agent", "TEXT"),
@@ -550,7 +571,7 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         ("context_snapshot", "TEXT"),
         ("result", "TEXT"),
     ),
-    "chapters": (("contract_id", "TEXT"),),
+    "chapters": (("contract_id", "TEXT"), ("title", "TEXT")),
     "providers": (
         ("source", "TEXT DEFAULT 'workbench_custom'"),
         ("secret_ref", "TEXT"),
@@ -600,6 +621,16 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
                 except sqlite3.Error:
                     pass
+    # Book identities survive rename/soft-delete; old shared vectors are never
+    # assigned to a new book merely because its numeric id/name happens to match.
+    for row in conn.execute("SELECT id FROM projects WHERE knowledge_key IS NULL OR knowledge_key=''").fetchall():
+        conn.execute("UPDATE projects SET knowledge_key=? WHERE id=?", (uuid.uuid4().hex, row["id"]))
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS projects_knowledge_key ON projects(knowledge_key)")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS projects_knowledge_key_immutable"
+                 " BEFORE UPDATE OF knowledge_key ON projects"
+                 " WHEN OLD.knowledge_key IS NOT NULL AND OLD.knowledge_key!=''"
+                 " AND NEW.knowledge_key IS NOT OLD.knowledge_key"
+                 " BEGIN SELECT RAISE(ABORT, 'knowledge_key is immutable'); END")
     # Empty is the migration sentinel. Existing titles are conservatively manual;
     # legacy direct-write sessions become auto, never full access.
     conn.execute("UPDATE chat_sessions SET permission_mode=CASE"
@@ -611,6 +642,55 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("DROP INDEX IF EXISTS chat_one_active_run")
     conn.execute("CREATE UNIQUE INDEX chat_one_active_run ON chat_runs(session_id)"
                  " WHERE status IN ('queued','running','waiting_input','cancelling')")
+    _migrate_style_fingerprints(conn)
+
+
+def _migrate_style_fingerprints(conn: sqlite3.Connection) -> None:
+    """A chapter has one current author authorization; archive before merging.
+
+    Paths are normalized syntactically, without touching book files. Approval of
+    a legacy Markdown file never implicitly authorizes its migrated TXT file.
+    The index is the completion marker, and every change shares the caller's
+    transaction, so a failed migration cannot leave an incomplete backup.
+    """
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='style_one_chapter'").fetchone():
+        return
+    rows = conn.execute("SELECT * FROM style_fingerprints ORDER BY id DESC").fetchall()
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        raw = str(row['rel_path'] or '')
+        normalized = raw.replace('\\', '/')
+        match = re.fullmatch(r'章节/第(\d{4,})章\.(txt|md)', normalized)
+        legacy = bool(match and match[2] == 'md')
+        canonical = (f'章节/第{int(match[1]):04d}章.txt' if legacy else normalized)
+        valid = bool(match and isinstance(row['project_id'], int) and row['project_id'] > 0)
+        key = (row['project_id'], canonical)
+        duplicate = valid and key in seen
+        reason = ('invalid_source' if not valid else 'duplicate_chapter' if duplicate else
+                  'legacy_chapter' if legacy else 'normalized_path' if raw != canonical else '')
+        if reason:
+            conn.execute("INSERT OR IGNORE INTO style_fingerprints_archive"
+                         " (source_id,project_id,rel_path,approved,payload,created_at,reason) VALUES (?,?,?,?,?,?,?)",
+                         (row['id'], row['project_id'], row['rel_path'], row['approved'],
+                          row['payload'], row['created_at'], reason))
+        if not valid or duplicate:
+            conn.execute("DELETE FROM style_fingerprints WHERE id=?", (row['id'],))
+            continue
+        seen.add(key)
+        payload = row['payload']
+        if legacy:
+            try:
+                data = json.loads(payload)
+            except (ValueError, TypeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data.update(requires_resample=True, legacy_rel_path=raw)
+            payload = json.dumps(data, ensure_ascii=False)
+        if raw != canonical or legacy:
+            conn.execute("UPDATE style_fingerprints SET rel_path=?,payload=? WHERE id=?",
+                         (canonical, payload, row['id']))
+    conn.execute("CREATE UNIQUE INDEX style_one_chapter ON style_fingerprints(project_id,rel_path)")
 
 
 def _init_fts(conn: sqlite3.Connection) -> bool:

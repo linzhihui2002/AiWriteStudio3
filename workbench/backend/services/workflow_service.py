@@ -12,12 +12,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import threading
 import time
 from pathlib import Path
 
 from .. import db
 from . import generation_service, operation_log, pipeline_service, proposal_service
-from .errors import InvalidNameError, InvalidOperationError, NodeNotFoundError
+from .errors import InvalidNameError, InvalidOperationError, NodeNotFoundError, ServiceError
 from .fs_utils import atomic_write_text, read_text
 from .project_service import get_project_dir
 
@@ -27,6 +29,8 @@ NODE_TYPES = (
     "大纲生成", "章节正文", "审稿", "去AI味软审", "结构化抽取", "润色", "拆书",
 )
 STEP_NODES = ("LOAD", "CHECK", "CONTRACT", "DRAFT", "REVIEW", "REVISE", "UPDATE", "DECIDE")
+_execution_lock = threading.Lock()
+_executing_runs: set[tuple[str, int]] = set()
 
 
 def workflows_root() -> Path:
@@ -119,6 +123,7 @@ def validate_definition(definition: dict) -> dict:
         raise InvalidOperationError("工作流至少需要一个节点")
     seen: set[str] = set()
     cleaned: list[dict] = []
+    from .agent_service import RETRIEVAL_PROFILES
     for index, node in enumerate(nodes):
         if not isinstance(node, dict):
             raise InvalidOperationError(f"节点 {index} 格式不正确")
@@ -131,6 +136,9 @@ def validate_definition(definition: dict) -> dict:
         if node_id in seen:
             raise InvalidOperationError(f"节点 id 重复：{node_id}")
         seen.add(node_id)
+        profile = str(node.get("retrieval_profile") or "")
+        if profile and profile not in RETRIEVAL_PROFILES:
+            raise InvalidOperationError(f"节点 {node_id} 的 retrieval_profile 无效")
         cleaned.append(
             {
                 "id": node_id,
@@ -140,6 +148,8 @@ def validate_definition(definition: dict) -> dict:
                 "model": str(node.get("model") or ""),
                 "skill": str(node.get("skill") or ""),
                 "next": str(node.get("next") or ""),
+                "retrieval_profile": profile,
+                "instruction": str(node.get("instruction") or ""),
             }
         )
     for node in cleaned:
@@ -237,6 +247,8 @@ def start_run(
         "node_index": 0,
         "completed": [],
         "workflow": workflow["name"],
+        "workflow_definition": {key: value for key, value in workflow.items() if key != "path"},
+        "node_checkpoints": {},
         "node_log": [],
     }
     with db.get_conn() as conn:
@@ -342,44 +354,90 @@ def _node_log(run_id: int, entry: dict) -> None:
     _update_run(run_id, log_entry={**entry, "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
 
 
+def recover_interrupted() -> None:
+    """Expose stale startup records for explicit continuation; never execute."""
+    from .. import config
+    with _execution_lock, db.get_conn() as conn:
+        live = {run_id for database, run_id in _executing_runs if database == str(config.DB_PATH)}
+        rows = conn.execute("SELECT id FROM workflow_runs WHERE status='running'").fetchall()
+        for row in rows:
+            if row["id"] not in live:
+                conn.execute("UPDATE workflow_runs SET status='interrupted',updated_at=datetime('now')"
+                             " WHERE id=? AND status='running'", (row["id"],))
+
+
 def execute_run(run_id: int, *, should_cancel=None, use_ai: bool = True) -> dict:
     """执行/续跑工作流（阻塞）：逐章逐节点推进，每步落检查点，可暂停/断点续跑。"""
+    from .. import config
+    key = (str(config.DB_PATH), int(run_id))
+    with _execution_lock:
+        if key in _executing_runs:
+            raise InvalidOperationError("这个工作流正在执行，请等待当前执行结束")
+        _executing_runs.add(key)
+    try:
+        return _execute_run(run_id, should_cancel=should_cancel, use_ai=use_ai)
+    finally:
+        with _execution_lock:
+            _executing_runs.discard(key)
+
+
+def _execute_run(run_id: int, *, should_cancel=None, use_ai: bool = True) -> dict:
     run = get_run(run_id)
-    if run["status"] not in ("pending", "running", "paused"):
+    if run["status"] not in ("pending", "running", "paused", "failed", "interrupted"):
         raise InvalidOperationError(f"当前状态不可执行：{run['status']}")
 
-    workflow = get_workflow(run["payload"].get("workflow") or DEFAULT_WORKFLOW_NAME)
     payload = run["payload"]
+    workflow = payload.get("workflow_definition") or get_workflow(payload.get("workflow") or DEFAULT_WORKFLOW_NAME)
+    payload.setdefault("workflow_definition", {key: value for key, value in workflow.items() if key != "path"})
     _update_run(run_id, status="running", payload=payload)
 
     chapters: list[str] = payload.get("chapters") or []
-    start_chapter = int(payload.get("chapter_index", 0))
+    # Legacy failures advanced the cursor before marking the chapter complete.
+    # The completed set, rather than that cursor, is the recovery authority.
+    completed = set(payload.get("completed") or [])
+    start_chapter = next((index for index, chapter in enumerate(chapters) if chapter not in completed), len(chapters))
+
+    def cancelled():
+        return bool((should_cancel and should_cancel()) or get_run(run_id)["status"] == "paused")
 
     for chapter_index in range(start_chapter, len(chapters)):
         chapter_rel = chapters[chapter_index]
         if chapter_rel in (payload.get("completed") or []):
             continue
-        if should_cancel and should_cancel():
+        payload["chapter_index"] = chapter_index
+        if cancelled():
             _update_run(run_id, status="paused", payload=payload)
             return get_run(run_id)
 
-        step_result = _run_chapter(workflow, run["project_id"], chapter_rel,
-                                   use_ai=use_ai, should_cancel=should_cancel)
-        payload["chapter_index"] = chapter_index + 1
-        payload["node_index"] = len(workflow["nodes"])
+        checkpoints = payload.setdefault("node_checkpoints", {}).setdefault(chapter_rel, {})
+        def checkpoint_node(index, node_id, receipt):
+            checkpoints[node_id] = receipt
+            payload["node_index"] = index + 1 if receipt.get("ok") else index
+            _update_run(run_id, payload=payload)
+        try:
+            step_result = _run_chapter(workflow, run["project_id"], chapter_rel,
+                use_ai=use_ai, should_cancel=cancelled, checkpoints=checkpoints, checkpoint_node=checkpoint_node)
+        except Exception as error:
+            step_result = {"ok": False, "error": str(error)}
         if step_result.get("ok"):
             payload.setdefault("completed", []).append(chapter_rel)
+            payload["chapter_index"] = chapter_index + 1
+            payload["node_index"] = len(workflow["nodes"])
         _node_log(run_id, {"chapter": chapter_rel, **step_result})
 
+        if step_result.get("status") == "paused" or cancelled():
+            _update_run(run_id, status="paused", payload=payload)
+            return get_run(run_id)
         if not step_result.get("ok") and workflow.get("batch", {}).get("stop_on_failure"):
             _update_run(run_id, status="failed", payload=payload)
-            return get_run(run_id)
-        if step_result.get("status") == "paused":
-            _update_run(run_id, status="paused", payload=payload)
             return get_run(run_id)
 
         _update_run(run_id, payload=payload)
 
+    missing = [chapter for chapter in chapters if chapter not in (payload.get("completed") or [])]
+    if missing:
+        payload["chapter_index"] = chapters.index(missing[0])
+        return _update_run(run_id, status="failed", payload=payload)
     _update_run(run_id, status="done", payload=payload)
     operation_log.log(run["project_id"], "workflow-done", None,
                       {"run_id": run_id, "completed": payload.get("completed")})
@@ -387,7 +445,7 @@ def execute_run(run_id: int, *, should_cancel=None, use_ai: bool = True) -> dict
 
 
 def _run_chapter(workflow: dict, project_id: int, chapter_rel: str, *,
-                 use_ai: bool, should_cancel=None) -> dict:
+                 use_ai: bool, should_cancel=None, checkpoints: dict | None = None, checkpoint_node=None) -> dict:
     """按工作流节点执行单章：八步节点交给 pipeline，其他节点走通用生成。"""
     node_types = [node["type"] for node in workflow["nodes"]]
     is_pipeline = all(node in STEP_NODES for node in node_types)
@@ -410,22 +468,63 @@ def _run_chapter(workflow: dict, project_id: int, chapter_rel: str, *,
 
     # 自定义流程：逐节点生成，产物进收件箱
     produced: list[dict] = []
-    for node in workflow["nodes"]:
+    for index, node in enumerate(workflow["nodes"]):
         if should_cancel and should_cancel():
             return {"ok": False, "status": "paused", "nodes": produced}
+        node_hash = hashlib.sha256(json.dumps(node, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        saved = (checkpoints or {}).get(node["id"])
+        if saved and saved.get("ok"):
+            try:
+                proposal = proposal_service.get_proposal(saved["proposal_id"])
+                digest = hashlib.sha256(proposal["content"].encode("utf-8")).hexdigest()
+                valid = (saved.get("node_hash") == node_hash and proposal["project_id"] == project_id
+                    and saved.get("content_hash") == digest and proposal.get("status") not in {"discarded", "rejected"})
+            except (KeyError, ServiceError):
+                valid = False
+            if not valid:
+                return {"ok": False, "error": f"节点「{node['label']}」的既有提案已更改或移除，请核对后新建运行。", "nodes": produced}
+            produced.append({**saved, "reused": True})
+            continue
         from .context_service import assemble, to_messages
 
-        context = assemble(project_id, chapter_rel=chapter_rel, query=node["type"])
-        _sys, messages = to_messages(context)
+        from . import agent_service, skill_service
+        profile = node.get("retrieval_profile") or (
+            "off" if node["type"] == "润色" else agent_service.retrieval_profile_for_task(
+                node["type"], skill=node.get("skill", "")))
+        context = assemble(project_id, chapter_rel=chapter_rel,
+                           query=node.get("instruction", ""), retrieval_profile=profile)
+        system, messages = to_messages(context)
+        selected_skill = str(node.get("skill") or "").strip()
+        if selected_skill:
+            compiled = skill_service.compile_skills([selected_skill])
+            if compiled["unavailable"]:
+                return {"ok": False, "nodes": produced,
+                        "error": f"节点「{node['label']}」的技能不可用：{compiled['unavailable'][0]['error']}"}
+            system = "\n\n".join(part for part in (system, compiled["text"]) if part)
+        # 前序提案是该运行已核验的实际产物，续跑与首次执行使用相同交接材料。
+        # 节点指令必须进入生成请求，不能仅作为检索 query。
+        messages = list(messages)
+        for item in produced:
+            previous = proposal_service.get_proposal(item["proposal_id"])
+            messages.append({"role": "user", "content":
+                             f"前序节点已保存提案：{previous['title']}\n{previous['content']}"})
+        messages.append({"role": "user", "content":
+                         f"执行当前工作流节点「{node['label']}」。当前章节：{chapter_rel}。\n"
+                         f"{node.get('instruction') or '按节点类型完成任务。'}\n"
+                         "返回本节点的完整产物，供作者在收件箱中审核。"})
         result = generation_service.run_task(
             project_id=project_id,
             task_type=node["type"] if node["type"] in NODE_TYPES else "章节正文",
+            system=system,
             messages=messages,
             engine=node.get("engine", ""),
             model=node.get("model", ""),
             agent="",
             context_snapshot={"chapter": chapter_rel, "node": node["id"]},
+            should_cancel=should_cancel,
         )
+        if should_cancel and should_cancel():
+            return {"ok": False, "status": "paused", "nodes": produced}
         proposal_id = None
         if result["ok"] and result.get("text"):
             proposal = proposal_service.create_proposal(
@@ -439,9 +538,14 @@ def _run_chapter(workflow: dict, project_id: int, chapter_rel: str, *,
                 meta={"node": node["id"], "engine": result.get("engine")},
             )
             proposal_id = proposal["id"]
-        produced.append({"node": node["id"], "ok": result["ok"],
-                         "proposal_id": proposal_id,
-                         "error": result.get("error_message")})
+        receipt = {"node": node["id"], "node_hash": node_hash, "ok": bool(result["ok"] and proposal_id),
+                   "proposal_id": proposal_id, "content_hash": hashlib.sha256(result.get("text", "").encode("utf-8")).hexdigest(),
+                   "error": result.get("error_message") or (None if proposal_id else "节点未交付可保存内容")}
+        produced.append(receipt)
+        if checkpoint_node:
+            checkpoint_node(index, node["id"], receipt)
+        if not receipt["ok"]:
+            return {"ok": False, "nodes": produced, "error": receipt["error"]}
     return {"ok": all(item["ok"] for item in produced) if produced else False,
             "nodes": produced}
 
@@ -460,6 +564,7 @@ __all__ = [
     "list_runs",
     "list_workflows",
     "pause_run",
+    "recover_interrupted",
     "save_workflow",
     "start_run",
     "validate_definition",

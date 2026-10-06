@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { deleteChatMemory, getChatMemory, updateChatMemory } from '../api/client'
 import type { ChatMemoryEntry } from '../api/types'
 import { errorMessage } from '../state/useToast'
-import Modal from './Modal'
+import Drawer from './Drawer'
 
 export default function ChatMemoryPanel({ projectId, open, onClose, onSource }: {
   projectId: number
@@ -45,7 +45,7 @@ export default function ChatMemoryPanel({ projectId, open, onClose, onSource }: 
     } catch (err) { setError(errorMessage(err)) }
     finally { setBusy(false) }
   }
-  return <Modal title="本书对话记忆" open={open} onClose={onClose} width={680}>
+  return <Drawer title="本书对话记忆" open={open} onClose={onClose} width={680}>
     <p className="muted">这里保存已提取的创作偏好和决定，供本书后续对话参考。你可以更正、删除，或回到来源对话核对。</p>
     {error ? <p className="chat__error" role="alert">{error}</p> : null}
     {loading ? <p className="muted">正在读取记忆…</p> : entries.length === 0 ? <p className="muted">暂时没有记忆。对话中的明确偏好和决定会在处理后显示在这里。</p> : <div className="chat__memory-list">{entries.map((entry) => <article className="chat__memory-entry" key={entry.id}>
@@ -56,5 +56,5 @@ export default function ChatMemoryPanel({ projectId, open, onClose, onSource }: 
       <div className="chat__interaction-actions">{editing === entry.id ? <><button type="button" className="btn btn--primary btn--sm" disabled={busy || !content.trim()} onClick={() => void save(entry)}>保存更正</button><button type="button" className="btn btn--ghost btn--sm" disabled={busy} onClick={() => setEditing(null)}>取消</button></> : <button type="button" className="btn btn--ghost btn--sm" disabled={busy} onClick={() => { setEditing(entry.id); setContent(entry.content) }}>修改</button>}
         {entry.source_session_id ? <button type="button" className="btn btn--ghost btn--sm" disabled={busy} onClick={() => { onClose(); onSource(entry.source_session_id!, entry.source_message_id) }}>查看来源</button> : null}<button type="button" className="btn btn--ghost btn--sm" disabled={busy} onClick={() => void remove(entry)}>删除</button></div>
     </article>)}</div>}
-  </Modal>
+  </Drawer>
 }

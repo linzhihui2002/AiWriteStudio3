@@ -43,7 +43,7 @@ export function apply(ctx) {
         {id:'direction',question:'本书保留哪些方向？',multi_select:true,options:[{label:'修仙'},{label:'搜打撤'},{label:'现实侧猎妖'}]}
       ]}]];
       else if(text.includes('新建验收备忘录')) actions=[['create_file',{rel_path:'备忘录/验收线索.md',content:'茶杯缺角。',title:'验收线索'}]];
-      else if(text.includes('慢速章节修改')) actions=[read('章节/第0001章.md'),['write_file',{rel_path:'章节/第0001章.md',content:CLEAN_BODY+'\n他把旧账本放在桌上。'}]];
+      else if(text.includes('慢速章节修改')) actions=[read('章节/第0001章.txt'),['write_file',{rel_path:'章节/第0001章.txt',content:CLEAN_BODY+'\n他把旧账本放在桌上。'}]];
       else if(text.includes('修改验收备忘录')||text.includes('慢速修改')) actions=[read('备忘录/验收线索.md'),['replace_text',{rel_path:'备忘录/验收线索.md',old_text:'茶杯缺角。',new_text:'铜钱缺口。'}]];
       else if(text.includes('多文件联动')) actions=[read('设定/人物设定.md'),['write_file',{rel_path:'设定/人物设定.md',content:'林川是码头掌柜。'}],read('大纲/大纲.md'),['write_file',{rel_path:'大纲/大纲.md',content:'第一章，林川在码头找到铜钱。'}]];
       else if(text.includes('改名验收')) actions=[read('备忘录/验收线索.md'),['move_file',{rel_path:'备忘录/验收线索.md',destination:'备忘录/验收改名.md'}]];

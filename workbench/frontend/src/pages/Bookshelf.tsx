@@ -1,3 +1,4 @@
+import WorkspacePage, { ResourceState, useResourceRequest, ActionMenu, WorkspaceTabs } from '../components/WorkspacePage'
 /** 书架：项目列表 / 开书（含模板选择）/ 归档 / 进入工作区 / 回收站 / 导入导出。 */
 
 import { useCallback, useEffect, useState } from 'react'
@@ -7,24 +8,28 @@ import {
   buildPublishExport,
   createProject,
   deleteCover,
-  deleteTemplate,
+  deleteProject,
   exportChapters,
   exportPackage,
+  getTemplatePrefs,
   importDocument,
   listProjects,
   listPublishPlatforms,
   listTemplates,
   listTrash,
   restorePackage,
+  restoreProject,
   restoreTrash,
   saveAsTemplate,
   updateProject,
   uploadCover,
 } from '../api/client'
 import type { PublishPlatform } from '../api/client'
-import type { Project, Template, TrashEntry } from '../api/types'
+import type { Project, Template, TemplatePrefs, TrashEntry } from '../api/types'
 import Modal from '../components/Modal'
-import { usePrompt } from '../components/PromptDialog'
+import Drawer from '../components/Drawer'
+import { useConfirm } from '../components/ConfirmDialog'
+import InlineEdit from '../components/InlineEdit'
 import { errorMessage, useToast } from '../state/useToast'
 import { NO_AUTOFILL } from '../lib/autofill'
 
@@ -32,11 +37,26 @@ export default function Bookshelf() {
   const navigate = useNavigate()
   const toast = useToast()
   const [projects, setProjects] = useState<Project[]>([])
+  const [shelfTab, setShelfTab] = useState<'books' | 'trash'>('books')
+  const [search, setSearch] = useState('')
+  const auxiliaryResource = useResourceRequest('shelf-auxiliary')
   const [includeArchived, setIncludeArchived] = useState(false)
+  const projectResource = useResourceRequest(includeArchived ? 'archived' : 'active')
   const [templates, setTemplates] = useState<Template[]>([])
+  const [tplPrefs, setTplPrefs] = useState<TemplatePrefs>({
+    default: '',
+    by_genre: {},
+    by_platform: {},
+  })
+  const [templateTouched, setTemplateTouched] = useState(false)
   const [trash, setTrash] = useState<TrashEntry[]>([])
   const [busy, setBusy] = useState(false)
-  const [prompt, promptNode] = usePrompt()
+  const [confirm, confirmNode] = useConfirm()
+
+  // 模板表行内交互态：新建行 / 命名中 / 删除二次确认
+  // 书卡书名行内改名
+  const [renamingBook, setRenamingBook] = useState<number | null>(null)
+  const [coverDrag, setCoverDrag] = useState(false)
 
   const [createOpen, setCreateOpen] = useState(false)
   const [form, setForm] = useState({
@@ -73,20 +93,13 @@ export default function Bookshelf() {
   const [coverBust, setCoverBust] = useState(0)
 
   const reload = useCallback(async () => {
-    try {
-      const [items, tpl, trashItems] = await Promise.all([
-        listProjects(includeArchived),
-        listTemplates(),
-        listTrash(0).catch(() => [] as TrashEntry[]),
-      ])
-      setProjects(items)
-      setTemplates(tpl)
-      // 全局回收站接口按项目过滤；此处仅展示当前列表能拿到的条目
-      setTrash(trashItems)
-    } catch (err) {
-      toast.push(errorMessage(err), 'error')
-    }
-  }, [includeArchived, toast])
+    const booksToken = projectResource.begin()
+    const auxiliaryToken = auxiliaryResource.begin()
+    await Promise.allSettled([
+      listProjects(includeArchived).then(items => { if (projectResource.accept(booksToken)) { setProjects(items); projectResource.finish(booksToken) } }).catch(err => projectResource.fail(booksToken, errorMessage(err))),
+      Promise.all([listTemplates(), listTrash(), getTemplatePrefs()]).then(([tpl, trashItems, prefs]) => { if (auxiliaryResource.accept(auxiliaryToken)) { setTemplates(tpl); setTrash(trashItems); setTplPrefs(prefs); auxiliaryResource.finish(auxiliaryToken) } }).catch(err => auxiliaryResource.fail(auxiliaryToken, errorMessage(err))),
+    ])
+  }, [includeArchived])
 
   useEffect(() => {
     void reload()
@@ -97,6 +110,13 @@ export default function Bookshelf() {
       .then(setPlatforms)
       .catch(() => setPlatforms([]))
   }, [])
+
+  // 开书模板：用户未手动选择时，按「题材 → 模板」映射自动匹配
+  useEffect(() => {
+    if (templateTouched) return
+    const matched = tplPrefs.by_genre[form.genre.trim()]
+    if (matched) setForm((prev) => ({ ...prev, template: matched }))
+  }, [form.genre, tplPrefs, templateTouched])
 
   const onOpenPublish = (project: Project) => {
     setPublishTarget(project)
@@ -153,9 +173,9 @@ export default function Bookshelf() {
       })
       toast.push(`已创建《${project.name}》，工作区已生成`, 'success')
       setCreateOpen(false)
-      setForm({ name: '', genre: '', platform: '', protagonist: '', one_liner: '', template: '' })
+      setForm({ name: '', genre: '', platform: '', protagonist: '', one_liner: '', template: defaultTemplateName })
       await reload()
-      navigate(`/project/${project.id}/editor`)
+      navigate(`/project/${project.id}/chat`)
     } catch (err) {
       toast.push(errorMessage(err), 'error')
     } finally {
@@ -170,6 +190,83 @@ export default function Bookshelf() {
       await reload()
     } catch (err) {
       toast.push(errorMessage(err), 'error')
+    }
+  }
+
+  // 书卡书名双击行内改名：只改元信息，不打开「编辑信息」弹窗
+  const commitRenameBook = async (project: Project, name: string) => {
+    setRenamingBook(null)
+    if (!name || name === project.name) return
+    setBusy(true)
+    try {
+      const updated = await updateProject(project.id, { name })
+      toast.push(`已重命名为《${updated.name}》`, 'success')
+      await reload()
+    } catch (err) {
+      toast.push(errorMessage(err), 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // 移入回收站是可逆操作：直接执行 + Toast 撤销，不再用确认弹窗拦截
+  const onDelete = async (project: Project) => {
+    setBusy(true)
+    try {
+      await deleteProject(project.id)
+      toast.push(`已移入回收站《${project.name}》`, 'success', {
+        label: '撤销',
+        onAction: () => {
+          void restoreProject(project.id).then(reload).catch((err) => toast.push(errorMessage(err), 'error'))
+        },
+      })
+      // 删除的是当前打开的书时，清掉项目记忆，避免导航指向已失效的项目
+      try {
+        if (window.localStorage.getItem('aiw.currentProjectId') === String(project.id)) {
+          window.localStorage.removeItem('aiw.currentProjectId')
+        }
+      } catch {
+        // 隐私模式等场景忽略
+      }
+      await reload()
+    } catch (err) {
+      toast.push(errorMessage(err), 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const onPurge = async (projectId: number, name: string) => {
+    const ok = await confirm({
+      title: '彻底删除',
+      message: `将彻底删除《${name}》及其全部章节、设定、快照与索引记录，不可恢复。确定继续？`,
+      confirmText: '彻底删除',
+      danger: true,
+    })
+    if (!ok) return
+    setBusy(true)
+    try {
+      await deleteProject(projectId, true)
+      toast.push(`已彻底删除《${name}》`, 'success')
+      await reload()
+    } catch (err) {
+      toast.push(errorMessage(err), 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const onRestoreBook = async (entry: TrashEntry) => {
+    if (entry.project_id === null || entry.project_id === undefined) return
+    setBusy(true)
+    try {
+      await restoreProject(entry.project_id)
+      toast.push(`已恢复《${entry.project_name}》`, 'success')
+      await reload()
+    } catch (err) {
+      toast.push(errorMessage(err), 'error')
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -267,10 +364,10 @@ export default function Bookshelf() {
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
-      link.download = `${project.name}-项目包.json`
+      link.download = `${project.name}-书籍备份.json`
       link.click()
       URL.revokeObjectURL(url)
-      toast.push('项目包已导出（不含任何凭据）', 'success')
+      toast.push('书籍备份已导出（不含任何凭据）', 'success')
     } catch (err) {
       toast.push(errorMessage(err), 'error')
     }
@@ -280,48 +377,41 @@ export default function Bookshelf() {
     try {
       const text = await file.text()
       const payload = JSON.parse(text) as Record<string, unknown>
-      const name = await prompt({
-        title: '恢复项目包',
-        label: '书名（留空则用包内原名）',
-        allowEmpty: true,
-        confirmText: '恢复',
-      })
-      if (name === null) return
-      const result = await restorePackage(payload, name || undefined)
+      // 不再弹命名框：直接用包内原名恢复，恢复后可在模板表内行内改名
+      const result = await restorePackage(payload)
       const project = result.project as Project | undefined
-      toast.push(`已恢复项目《${project?.name ?? name}》`, 'success')
+      toast.push(`已恢复书籍《${project?.name ?? ''}》`, 'success')
       await reload()
     } catch (err) {
       toast.push(errorMessage(err), 'error')
     }
+  }
+
+  // 复制/另存时按已有名称生成唯一默认名，避免直接落库撞名
+  const uniqueName = (base: string) => {
+    const names = new Set(templates.map((item) => item.name))
+    if (!names.has(base)) return base
+    let index = 2
+    while (names.has(`${base}${index}`)) index += 1
+    return `${base}${index}`
   }
 
   const onSaveAsTemplate = async (project: Project) => {
-    const name = await prompt({
-      title: '另存为模板',
-      label: '模板名称',
-      placeholder: '例如：三幕式骨架',
-      confirmText: '保存模板',
-    })
-    if (!name) return
+    const name = uniqueName(`${project.name}·模板`)
     try {
-      await saveAsTemplate(name.trim(), project.id)
-      toast.push(`已另存为模板「${name.trim()}」`, 'success')
+      await saveAsTemplate(name, project.id)
+      toast.push(`已另存为模板「${name}」`, 'success')
       await reload()
     } catch (err) {
       toast.push(errorMessage(err), 'error')
     }
   }
 
-  const onDeleteTemplate = async (template: Template) => {
-    try {
-      await deleteTemplate(template.name)
-      toast.push('模板已删除', 'success')
-      await reload()
-    } catch (err) {
-      toast.push(errorMessage(err), 'error')
-    }
-  }
+
+
+
+
+
 
   const onImport = async () => {
     if (!importTarget) return
@@ -348,13 +438,8 @@ export default function Bookshelf() {
   }
 
   const onRestoreTrash = async (entry: TrashEntry) => {
-    const project = projects.find((item) => item.name === entry.project_name)
-    if (!project) {
-      toast.push('该项目不在当前列表（可能是归档项目），请先勾选「显示已归档」', 'error')
-      return
-    }
     try {
-      await restoreTrash(project.id, entry.trash_rel)
+      await restoreTrash(entry.trash_rel)
       toast.push('已恢复到原位置', 'success')
       await reload()
     } catch (err) {
@@ -367,14 +452,34 @@ export default function Bookshelf() {
     ? projects.find((item) => item.id === editTarget.id) ?? editTarget
     : null
 
+  // 开书模板：默认模板名（偏好为空时回落到内置模板）
+  const defaultTemplateName =
+    tplPrefs.default || templates.find((item) => item.is_builtin)?.name || ''
+  const genreMatched =
+    !templateTouched && form.genre.trim() !== '' && tplPrefs.by_genre[form.genre.trim()] === form.template
+
+  const onOpenCreate = () => {
+    setForm({
+      name: '',
+      genre: '',
+      platform: '',
+      protagonist: '',
+      one_liner: '',
+      template: defaultTemplateName,
+    })
+    setTemplateTouched(false)
+    setCreateOpen(true)
+  }
+
   return (
-    <div className="page">
+    <WorkspacePage className="workspace-shelf">
       <header className="page-header">
         <div>
           <h1 className="page-header__title">书架</h1>
-          <p className="page-header__desc">每本书一个完整工作区。</p>
+          <p className="page-header__desc">从一本书开始，继续你的创作。</p>
         </div>
         <div className="btn-row">
+          <button className="btn btn--ghost btn--sm" onClick={() => navigate('/settings?section=templates')}>管理开书模板</button>
           <label className="checkbox">
             <input
               type="checkbox"
@@ -384,7 +489,7 @@ export default function Bookshelf() {
             显示已归档
           </label>
           <label className="btn btn--ghost btn--sm" style={{ cursor: 'pointer' }}>
-            导入项目包
+            导入书籍备份
             <input
               type="file"
               accept="application/json"
@@ -396,38 +501,29 @@ export default function Bookshelf() {
               }}
             />
           </label>
-          <button className="btn btn--primary" type="button" onClick={() => setCreateOpen(true)}>
-            新建项目
+          <button className="btn btn--primary" type="button" onClick={onOpenCreate}>
+            新建书籍
           </button>
         </div>
       </header>
 
+      <WorkspaceTabs label="书架区域" items={[{key:'books',label:'我的书籍'}, {key:'trash',label:`回收站 · ${trash.length}`}]} value={shelfTab} onChange={setShelfTab} />
+      {shelfTab === 'books' && <>
+      <div className="workspace-shelf-toolbar"><input className="input" type="search" aria-label="搜索书籍" placeholder="搜索书名、题材、主角…" value={search} onChange={event => setSearch(event.target.value)} /><span className="muted">{projects.length} 本书</span><button className="btn btn--ghost btn--sm" onClick={() => void reload()}>刷新书架</button></div>
+      <ResourceState {...projectResource} hasData={projectResource.loaded && projects.length > 0} onRetry={() => void reload()}>
       {projects.length === 0 ? (
         <div className="empty-state">
-          <p className="empty-state__title">还没有项目</p>
+          <p className="empty-state__title">书架还是空的</p>
           <p className="empty-state__desc">
-            点「新建项目」开书：工作台会按模板生成 <code>projects/书名/</code> 完整工作区，
-            并初始化设定、状态与章节分组。
+            点「新建书籍」开书，工作台会准备设定、状态和章节，接着与写作助手讨论你的故事。
           </p>
         </div>
       ) : (
         <div className="shelf-grid">
-          {projects.map((project) => (
+          {projects.filter(project => `${project.name} ${project.genre} ${project.protagonist}`.toLowerCase().includes(search.toLowerCase())).map((project) => (
             <article
               key={project.id}
               className={`book-card${project.archived ? ' book-card--archived' : ''}`}
-              role={project.archived ? undefined : 'button'}
-              tabIndex={project.archived ? -1 : 0}
-              onClick={() => {
-                if (!project.archived) navigate(`/project/${project.id}/editor`)
-              }}
-              onKeyDown={(event) => {
-                if (project.archived) return
-                if (event.key === 'Enter' || event.key === ' ') {
-                  event.preventDefault()
-                  navigate(`/project/${project.id}/editor`)
-                }
-              }}
             >
               <div className="book-card__cover" aria-hidden="true">
                 <span className="book-card__cover-fallback">{project.name.slice(0, 1)}</span>
@@ -441,7 +537,26 @@ export default function Bookshelf() {
                 ) : null}
               </div>
               <div className="book-card__info">
-                <h2 className="book-card__name">{project.name}</h2>
+                {renamingBook === project.id ? (
+                  <InlineEdit
+                    defaultValue={project.name}
+                    ariaLabel="书名"
+                    onCommit={(value) => void commitRenameBook(project, value)}
+                    onCancel={() => setRenamingBook(null)}
+                  />
+                ) : (
+                  <h2
+                    className="book-card__name"
+                    title="双击改名"
+                    onClick={(event) => event.stopPropagation()}
+                    onDoubleClick={(event) => {
+                      event.stopPropagation()
+                      setRenamingBook(project.id)
+                    }}
+                  >
+                    {project.name}
+                  </h2>
+                )}
                 <p className="book-card__meta">
                   {project.genre || '未填题材'} · {project.platform || '未填平台'}
                   {project.protagonist ? ` · 主角 ${project.protagonist}` : ''}
@@ -458,11 +573,12 @@ export default function Bookshelf() {
                   type="button"
                   onClick={(event) => {
                     event.stopPropagation()
-                    navigate(`/project/${project.id}/editor`)
+                    navigate(`/project/${project.id}/chat`)
                   }}
                 >
-                  进入工作台
+                  进入创作
                 </button>
+                <ActionMenu ariaLabel={`《${project.name}》更多操作`}>
                 <button
                   className="btn btn--sm"
                   type="button"
@@ -533,42 +649,31 @@ export default function Bookshelf() {
                 >
                   {project.archived ? '取消归档' : '归档'}
                 </button>
+                <button
+                  className="btn btn--danger btn--sm"
+                  type="button"
+                  disabled={busy}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    void onDelete(project)
+                  }}
+                >
+                  删除
+                </button>
+                </ActionMenu>
               </div>
             </article>
           ))}
         </div>
       )}
 
-      <section className="panel" style={{ marginTop: 'var(--space-6)' }}>
-        <header className="panel__header">
-          <h2 className="panel__title">开书模板</h2>
-          <span className="muted">内置模板不可删除，可复制后修改</span>
-        </header>
-        <div className="panel__body">
-          <div className="row">
-            {templates.map((template) => (
-              <span key={template.id} className="tag">
-                {template.name}
-                {template.is_builtin ? '（内置）' : ''}
-                {template.is_builtin ? null : (
-                  <button
-                    className="btn btn--ghost btn--sm"
-                    type="button"
-                    onClick={() => void onDeleteTemplate(template)}
-                  >
-                    删除
-                  </button>
-                )}
-              </span>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="panel" style={{ marginTop: 'var(--space-4)' }}>
+      {projects.length > 0 && !projects.some(project => `${project.name} ${project.genre} ${project.protagonist}`.toLowerCase().includes(search.toLowerCase())) && <div className="empty-state"><p className="empty-state__title">没有匹配的书籍</p><p className="empty-state__desc">换个关键词，或清除搜索查看全部书籍。</p><button className="btn btn--sm" onClick={() => setSearch('')}>清除搜索</button></div>}
+      </ResourceState></>}
+      {auxiliaryResource.error && <div className="workspace-notice workspace-notice--error" role="alert">模板或回收站暂时无法更新：{auxiliaryResource.error}<button className="btn btn--sm" onClick={() => void reload()}>重试</button></div>}
+      {shelfTab === 'trash' && <ResourceState {...auxiliaryResource} hasData={auxiliaryResource.loaded} onRetry={() => void reload()}><section className="panel">
         <header className="panel__header">
           <h2 className="panel__title">回收站</h2>
-          <span className="muted">删除的文件在此可恢复</span>
+          <span className="muted">删除的书与文件在此可恢复</span>
         </header>
         <div className="panel__body">
           {trash.length === 0 ? (
@@ -577,35 +682,64 @@ export default function Bookshelf() {
             <table className="table">
               <thead>
                 <tr>
-                  <th>项目</th>
-                  <th>原路径</th>
                   <th>类型</th>
+                  <th>书籍</th>
+                  <th>原路径</th>
                   <th>删除时间</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody>
-                {trash.slice(0, 30).map((entry) => (
-                  <tr key={entry.trash_rel}>
-                    <td>{entry.project_name}</td>
-                    <td className="mono">{entry.rel_path}</td>
-                    <td>{entry.kind === 'dir' ? '文件夹' : '文件'}</td>
-                    <td className="mono">{entry.deleted_at}</td>
-                    <td>
-                      <button className="btn btn--sm" type="button" onClick={() => void onRestoreTrash(entry)}>
-                        恢复
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {trash.slice(0, 30).map((entry) => {
+                  const isBook = entry.kind === 'project'
+                  const kindLabel =
+                    isBook ? '整本书' : entry.kind === 'dir' ? '文件夹' : '文件'
+                  return (
+                    <tr
+                      key={`${entry.kind}-${entry.project_name}-${entry.trash_rel}-${entry.deleted_at}`}
+                    >
+                      <td>{kindLabel}</td>
+                      <td>{entry.project_name}</td>
+                      <td className="mono">{isBook ? '—' : entry.rel_path}</td>
+                      <td className="mono">{entry.deleted_at}</td>
+                      <td>
+                        <div className="btn-row">
+                          <button
+                            className="btn btn--sm"
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              isBook ? void onRestoreBook(entry) : void onRestoreTrash(entry)
+                            }
+                          >
+                            恢复
+                          </button>
+                          {isBook ? (
+                            <button
+                              className="btn btn--danger btn--sm"
+                              type="button"
+                              disabled={busy}
+                              onClick={() =>
+                                entry.project_id != null &&
+                                void onPurge(entry.project_id, entry.project_name)
+                              }
+                            >
+                              彻底删除
+                            </button>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           )}
         </div>
-      </section>
+      </section></ResourceState>}
 
       <Modal
-        title="新建项目"
+        title="新建书籍"
         open={createOpen}
         onClose={() => setCreateOpen(false)}
         footer={
@@ -690,18 +824,27 @@ export default function Bookshelf() {
               id="book-template"
               className="select"
               value={form.template}
-              onChange={(event) => setForm({ ...form, template: event.target.value })}
+              onChange={(event) => {
+                setTemplateTouched(true)
+                setForm({ ...form, template: event.target.value })
+              }}
             >
-              <option value="">默认模板（推荐）</option>
-              {templates
-                .filter((template) => !template.is_builtin)
-                .map((template) => (
-                  <option key={template.id} value={template.name}>
-                    {template.name}
-                  </option>
-                ))}
+              {templates.map((template) => (
+                <option key={template.id} value={template.name}>
+                  {template.name}
+                  {template.is_builtin ? '（内置）' : ''}
+                  {tplPrefs.default === template.name ? '（默认）' : ''}
+                </option>
+              ))}
+              {templates.length === 0 ? (
+                <option value="">默认模板（推荐）</option>
+              ) : null}
             </select>
-            <span className="field__hint">另存为模板可在项目卡片上操作。</span>
+            <span className="field__hint">
+              {genreMatched
+                ? `已按题材「${form.genre.trim()}」自动匹配模板。`
+                : '可在设置 → 模板管理 配置默认模板与题材/平台适配。'}
+            </span>
           </div>
         </div>
       </Modal>
@@ -729,7 +872,17 @@ export default function Bookshelf() {
         <div className="stack">
           <div className="row" style={{ alignItems: 'flex-start' }}>
             <div className="edit-cover">
-              <div className="edit-cover__preview">
+              <div
+                className={`edit-cover__preview${coverDrag ? ' is-dragover' : ''}`}
+                onDragOver={(event) => { event.preventDefault(); setCoverDrag(true) }}
+                onDragLeave={() => setCoverDrag(false)}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  setCoverDrag(false)
+                  const file = event.dataTransfer.files?.[0]
+                  if (file) void onUploadCover(file)
+                }}
+              >
                 {editing && editing.has_cover ? (
                   <img
                     key={coverBust}
@@ -744,7 +897,7 @@ export default function Bookshelf() {
               </div>
               <div className="btn-row">
                 <label className="btn btn--sm" style={{ cursor: 'pointer' }}>
-                  上传封面
+                  上传封面（也可拖入图片）
                   <input
                     type="file"
                     accept="image/png,image/jpeg,image/webp"
@@ -836,7 +989,7 @@ export default function Bookshelf() {
         </div>
       </Modal>
 
-      <Modal
+      <Drawer
         title={`发布导出 · ${publishTarget?.name ?? ''}`}
         open={publishTarget !== null}
         onClose={() => setPublishTarget(null)}
@@ -890,7 +1043,7 @@ export default function Bookshelf() {
                 checked={onlyCompleted}
                 onChange={(event) => setOnlyCompleted(event.target.checked)}
               />
-              只导出「完成」状态的章节
+              只导出已定稿章节（完成 / 发表）
             </label>
           </div>
 
@@ -993,7 +1146,7 @@ export default function Bookshelf() {
             <p className="muted">选择平台后点「按平台整理」查看自检结论与发布稿。</p>
           )}
         </div>
-      </Modal>
+      </Drawer>
 
       <Modal
         title={`导入章节到《${importTarget?.name ?? ''}》`}
@@ -1058,7 +1211,7 @@ export default function Bookshelf() {
         </div>
       </Modal>
 
-      {promptNode}
-    </div>
+      {confirmNode}
+    </WorkspacePage>
   )
 }

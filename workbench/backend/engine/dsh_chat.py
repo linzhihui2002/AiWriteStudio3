@@ -10,6 +10,7 @@ import atexit
 import hashlib
 import json
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -35,6 +36,40 @@ class RunControl:
         self._lock = threading.Lock()
         self._waiting_since: float | None = None
         self._paused = 0.0
+        self._started = time.monotonic()
+        self._last_progress = self._started
+        self._timeout = float(config.DSH_TIMEOUT_SECONDS)
+        self._idle_timeout = float(config.DSH_IDLE_TIMEOUT_SECONDS)
+        self._stop_reason: str | None = None
+
+    def configure(self, timeout: float, idle_timeout: float) -> None:
+        self._timeout, self._idle_timeout = timeout, idle_timeout
+
+    def progress(self) -> None:
+        self._last_progress = time.monotonic() - self.paused_seconds()
+
+    def expiration_reason(self) -> str | None:
+        active_now = time.monotonic() - self.paused_seconds()
+        if active_now - self._started >= self._timeout:
+            return "total"
+        if active_now - self._last_progress >= self._idle_timeout:
+            return "idle"
+        return None
+
+    def stop(self, reason: str = "cancelled") -> None:
+        # A detached tool must retain cancellation after its run has ended.
+        with self._lock:
+            if self._stop_reason is None:
+                self._stop_reason = reason
+
+    def should_cancel(self) -> bool:
+        return self._stop_reason is not None or self.expiration_reason() is not None
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self._timeout - self.active_seconds())
+
+    def active_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self._started - self.paused_seconds())
 
     def begin_wait(self) -> None:
         with self._lock:
@@ -56,6 +91,20 @@ class RunControl:
 def _safe_error(message: str) -> str:
     from ..services.secret_store import redact
     return redact(str(message))[:3000]
+
+
+def _safe_provider_error(event: dict) -> dict:
+    """Keep diagnostics, distinguishing explicit exhausted quota from auth."""
+    safe = {key: value for key, value in event.items() if key != "protocol"}
+    message = _safe_error(event.get("message", "对话失败。"))
+    code = str(event.get("code") or "DSH_CHAT_ERROR")
+    # A throttled request remains a rate-limit error even if its body mentions
+    # quota; only explicit provider balance failures receive QUOTA.
+    if code == "RATE_LIMIT" or event.get("status") == 429 or event.get("status_code") == 429:
+        code = "RATE_LIMIT"
+    elif re.search(r"insufficient_(?:user_)?quota|(?:余额|额度)不足|预扣费额度失败", message, re.I):
+        code = "QUOTA"
+    return {**safe, "code": code, "message": message}
 
 
 def _provider_config_revision() -> tuple[bytes | None, bytes | None]:
@@ -248,8 +297,9 @@ class DshChatRuntime:
         run_id = uuid.uuid4().hex
         cancelled_at = None
         timeout_reason: str | None = None
-        deadline = time.monotonic() + self.timeout_seconds
         control = wait_control or RunControl()
+        control.configure(self.timeout_seconds, self.idle_timeout_seconds)
+        deadline = control._started + self.timeout_seconds
         cancelled = should_cancel or (lambda: False)
         try:
             if not session_id or not provider or not model or not user_text.strip():
@@ -270,7 +320,7 @@ class DshChatRuntime:
                         self._discard(session_id, worker)
                         yield {"type": "cancelled", "session_id": session_id, "text": ""}
                         return
-                    if time.monotonic() >= min(deadline, worker.last_used + 45):
+                    if time.monotonic() - control.paused_seconds() >= deadline or time.monotonic() >= worker.last_used + 45:
                         raise DshChatError("内置对话引擎启动超时。", "DSH_STARTUP_TIMEOUT")
                     event = worker.receive()
                     if event is None:
@@ -284,7 +334,8 @@ class DshChatRuntime:
                         worker.initialized = True
                         yield {key: value for key, value in event.items() if key != "protocol"}
                     elif kind == "error":
-                        raise DshChatError(event.get("message", "初始化失败。"), event.get("code", "DSH_INIT_ERROR"))
+                        error = _safe_provider_error(event)
+                        raise DshChatError(error["message"], error["code"])
             else:
                 yield {"type": "session_ready", "session_id": session_id, "resumed": True}
 
@@ -292,6 +343,7 @@ class DshChatRuntime:
                          "message_id": message_id, "history": history or [], **fields})
             turn_sent = True
             last_progress_active = time.monotonic() - control.paused_seconds()
+            control.progress()
             seen_activity: set[tuple[str, str]] = set()
 
             def timeout_event() -> dict:
@@ -310,6 +362,7 @@ class DshChatRuntime:
                     if not cancelled():
                         timeout_reason = "total" if active_now >= deadline else "idle"
                     cancelled_at = now
+                    control.stop(timeout_reason or "cancelled")
                     worker.send({"type": "cancel"})
                 if cancelled_at is not None and now - cancelled_at > 5:
                     self._discard(session_id, worker)
@@ -325,16 +378,42 @@ class DshChatRuntime:
                 kind = event.get("type")
                 if kind == "tool_request":
                     last_progress_active = time.monotonic() - control.paused_seconds()
+                    control.progress()
                     if cancelled_at is not None or cancelled():
                         result = {"ok": False, "summary": "任务已取消，未执行工具。", "error": "CANCELLED"}
                     else:
-                        try:
-                            result = execute_tool(str(event["name"]), event.get("arguments") or {}, str(event["call_id"]))
-                            json.dumps(result, ensure_ascii=False, allow_nan=False)
-                        except Exception as exc:  # Tool errors belong to model context, not a second retry.
-                            result = {"ok": False, "summary": _safe_error(str(exc)), "error": "TOOL_ERROR"}
+                        # Tools may wait for a provider or filesystem operation.
+                        # Keep the run watchdog alive while they execute; the
+                        # shared control also guards the final file commit.
+                        results: queue.Queue[dict] = queue.Queue(maxsize=1)
+                        request_event = dict(event)
+                        def run_tool() -> None:
+                            try:
+                                value = execute_tool(str(request_event["name"]), request_event.get("arguments") or {}, str(request_event["call_id"]))
+                                json.dumps(value, ensure_ascii=False, allow_nan=False)
+                            except Exception as exc:
+                                value = {"ok": False, "summary": _safe_error(str(exc)), "error": "TOOL_ERROR"}
+                            results.put(value)
+                        threading.Thread(target=run_tool, daemon=True, name="chat-tool-" + str(event["call_id"])[:16]).start()
+                        while True:
+                            reason = control.expiration_reason()
+                            if reason or cancelled():
+                                timeout_reason = reason
+                                control.stop(reason or "cancelled")
+                                worker.send({"type": "cancel"})
+                                self._discard(session_id, worker, force=True)
+                                terminal = True
+                                yield (timeout_event() if reason else
+                                       {"type": "cancelled", "session_id": session_id, "text": ""})
+                                return
+                            try:
+                                result = results.get(timeout=0.05)
+                                break
+                            except queue.Empty:
+                                continue
                     worker.send({"type": "tool_response", "request_id": event["request_id"], "result": result})
                     last_progress_active = time.monotonic() - control.paused_seconds()
+                    control.progress()
                     continue
                 if kind in TERMINAL_EVENTS:
                     terminal = True
@@ -342,19 +421,21 @@ class DshChatRuntime:
                     if timeout_reason:
                         yield timeout_event()
                     elif kind == "error":
-                        yield {**event, "message": _safe_error(event.get("message", "对话失败。"))}
+                        yield _safe_provider_error(event)
                     else:
                         yield {key: value for key, value in event.items() if key != "protocol"}
                     return
-                if kind in {"delta", "tool_call", "tool_result", "usage", "delivery_ack", "activity"}:
+                if kind in {"delta", "tool_call", "tool_result", "usage", "delivery_ack", "activity", "compaction"}:
                     if ((kind == "delta" and str(event.get("text") or "").strip()) or
                             kind in {"tool_call", "tool_result"}):
                         last_progress_active = time.monotonic() - control.paused_seconds()
-                    elif kind == "activity":
+                        control.progress()
+                    elif kind in {"activity", "compaction"}:
                         marker = (str(event.get("activity_id") or ""), str(event.get("status") or ""))
                         if marker not in seen_activity:
                             seen_activity.add(marker)
                             last_progress_active = time.monotonic() - control.paused_seconds()
+                            control.progress()
                     yield {key: value for key, value in event.items() if key != "protocol"}
         except (DshChatError, OSError, ValueError) as exc:
             if worker is not None and acquired:
@@ -368,11 +449,11 @@ class DshChatRuntime:
                     self._discard(session_id, worker)
                 worker.lock.release()
 
-    def _discard(self, session_id: str, worker: _Worker) -> None:
+    def _discard(self, session_id: str, worker: _Worker, *, force: bool = False) -> None:
         with self._lock:
             if self._workers.get(session_id) is worker:
                 self._workers.pop(session_id, None)
-        worker.close()
+        worker.close(force=force)
 
     def close(self, session_id: str) -> None:
         with self._lock:

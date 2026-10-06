@@ -13,13 +13,14 @@ import pytest
 
 from workbench.backend import config, db
 from workbench.backend.api import writing
-from workbench.backend.services import chapter_service, contract_service, ingestion_service, pipeline_service, project_service, review_service, tree_service
+from workbench.backend.services import chapter_service, contract_service, ingestion_service, index_service, pipeline_service, project_service, review_service, tree_service
 from workbench.backend.services.errors import (
     InvalidChapterNameError,
     InvalidNameError,
     InvalidOperationError,
     NodeExistsError,
     ProjectExistsError,
+    ProjectNotFoundError,
 )
 from workbench.backend.services.fs_utils import (
     atomic_write_text,
@@ -160,7 +161,9 @@ def test_project_name_sanitized_and_duplicate_rejected(workspace) -> None:
 
 
 def test_archive_and_list_projects(workspace, project) -> None:
-    assert len(project_service.list_projects()) == 1
+    listed = project_service.list_projects()
+    assert len(listed) == 1
+    assert listed[0]["one_liner"] == "废柴少年靠搜刮系统一步步登顶。"
     archived = project_service.archive_project(project["id"])
     assert archived["archived"] is True
     assert project_service.list_projects() == []
@@ -179,14 +182,14 @@ def test_chapter_numbering_increments(workspace, project) -> None:
     second = chapter_service.create_chapter(project["id"])
     third = chapter_service.create_chapter(project["id"], title="初入宗门")
 
-    assert first["rel_path"] == "章节/第0001章.md"
-    assert second["rel_path"] == "章节/第0002章.md"
-    assert third["rel_path"] == "章节/第0003章.md"
+    assert first["rel_path"] == "章节/第0001章.txt"
+    assert second["rel_path"] == "章节/第0002章.txt"
+    assert third["rel_path"] == "章节/第0003章.txt"
     assert third["title"] == "初入宗门"
 
     root = workspace.projects / "测试书名" / "章节"
-    assert (root / "第0001章.md").is_file()
-    assert (root / "第0003章.md").is_file()
+    assert (root / "第0001章.txt").is_file()
+    assert (root / "第0003章.txt").is_file()
 
     chapters = chapter_service.list_chapters(project["id"])
     assert [item["number"] for item in chapters] == [1, 2, 3]
@@ -202,10 +205,10 @@ def test_save_chapter_recomputes_word_count_and_keeps_status(workspace, project)
     assert saved["status"] == "草稿"
     assert saved["meta"]["合同ID"] == ""
 
-    # 原子写后磁盘内容正确，且不留临时文件
+    # 原子写后磁盘内容为纯正文（无 frontmatter、无标题行），且不留临时文件
     path = workspace.projects / "测试书名" / rel_path
     text = path.read_text(encoding="utf-8")
-    assert text.endswith("你好，世界！\n")
+    assert text == "你好，世界！"
     assert not list(path.parent.glob("*.tmp"))
 
     # 状态可切换（完成 / 发表），字数按正文重算
@@ -221,7 +224,7 @@ def test_save_chapter_recomputes_word_count_and_keeps_status(workspace, project)
     assert chapters[0]["is_empty"] is False
 
 
-def test_save_chapter_body_only_keeps_existing_frontmatter(workspace, project) -> None:
+def test_save_chapter_body_only_keeps_existing_title(workspace, project) -> None:
     chapter = chapter_service.create_chapter(project["id"], title="初入宗门")
     saved = chapter_service.save_chapter(project["id"], chapter["rel_path"], "只有正文。")
 
@@ -272,15 +275,18 @@ def test_rename_chapter_validates_filename_convention(workspace, project) -> Non
     chapter = chapter_service.create_chapter(project["id"])
     rel_path = chapter["rel_path"]
 
-    renamed = tree_service.rename_node(project["id"], rel_path, "第0007章.md")
-    assert renamed["rel_path"] == "章节/第0007章.md"
+    renamed = tree_service.rename_node(project["id"], rel_path, "第0007章.txt")
+    assert renamed["rel_path"] == "章节/第0007章.txt"
     assert renamed["number"] == 7
 
     with pytest.raises(InvalidChapterNameError):
-        tree_service.rename_node(project["id"], renamed["rel_path"], "第二章.md")
+        tree_service.rename_node(project["id"], renamed["rel_path"], "第二章.txt")
 
     with pytest.raises(InvalidChapterNameError):
-        tree_service.rename_node(project["id"], renamed["rel_path"], "第2章.md")
+        tree_service.rename_node(project["id"], renamed["rel_path"], "第2章.txt")
+
+    with pytest.raises(InvalidChapterNameError):
+        tree_service.rename_node(project["id"], renamed["rel_path"], "第0008章.md")
 
     # 非章节文件不受命名规范约束
     created = tree_service.create_node(project["id"], "设定", "自定义设定")
@@ -290,17 +296,18 @@ def test_rename_chapter_validates_filename_convention(workspace, project) -> Non
 
 
 def test_create_node_in_chapter_dir_normalizes_name(project) -> None:
-    """「章节/」下新建文件自动规范化为 第NNNN章.md，输入的名字成为章节标题。"""
+    """「章节/」下新建文件自动规范化为 第NNNN章.txt，输入的名字成为章节标题。"""
     node = tree_service.create_node(project["id"], "章节", "第一章：test.txt")
-    assert node["rel_path"] == "章节/第0001章.md"
+    assert node["rel_path"] == "章节/第0001章.txt"
     assert node["is_chapter"] is True
     assert node["title"] == "第一章：test"
-    assert [item["file_name"] for item in chapter_service.list_chapters(project["id"])] == ["第0001章.md"]
+    assert [item["file_name"] for item in chapter_service.list_chapters(project["id"])] == ["第0001章.txt"]
 
     # 位数不足 → 补齐零填充，且不额外占用编号
-    assert tree_service.create_node(project["id"], "章节", "第7章")["rel_path"] == "章节/第0007章.md"
-    # 已规范 → 原样保留
-    assert tree_service.create_node(project["id"], "章节", "第0009章.md")["rel_path"] == "章节/第0009章.md"
+    assert tree_service.create_node(project["id"], "章节", "第7章")["rel_path"] == "章节/第0007章.txt"
+    # 旧 .md 名输入 → 规范化为 .txt（编号不变）
+    assert tree_service.create_node(project["id"], "章节", "第0009章.md")["rel_path"] == "章节/第0009章.txt"
+    assert tree_service.create_node(project["id"], "章节", "第0011章.txt")["rel_path"] == "章节/第0011章.txt"
     # 非章节分组不受影响
     assert tree_service.create_node(project["id"], "设定", "自定义设定")["rel_path"] == "设定/自定义设定.md"
 
@@ -316,11 +323,11 @@ def test_update_chapter_meta_title_and_status(project) -> None:
     assert updated["title"] == "雪夜归人"
     assert updated["status"] == "完成"
 
-    # 清空标题：删键而非写空串，状态不受影响
+    # 清空标题：库里写空串，正文与状态不受影响
     cleared = chapter_service.update_chapter_meta(project["id"], rel, title="")
     assert cleared["title"] == ""
     assert cleared["status"] == "完成"
-    assert "标题" not in cleared["meta"]
+    assert cleared["meta"]["标题"] == ""
     assert chapter_service.list_chapters(project["id"])[0]["status"] == "完成"
 
     # 只传 status 时不动已有标题
@@ -526,6 +533,133 @@ def test_cover_save_replace_and_delete(workspace, project) -> None:
     assert project_service.get_project(project_id)["has_cover"] is False
 
 
+# ─────────────────────── 章节 txt 存储与存量迁移 ───────────────────────
+
+
+def test_create_chapter_writes_plain_txt_without_frontmatter(workspace, project) -> None:
+    """新建章节落 ``第NNNN章.txt``：只有正文，没有 frontmatter、没有标题行。"""
+    chapter = chapter_service.create_chapter(project["id"], "码头夜话")
+    assert chapter["rel_path"] == "章节/第0001章.txt"
+    assert chapter["title"] == "码头夜话"
+    path = workspace.projects / "测试书名" / chapter["rel_path"]
+    assert path.is_file()
+    assert path.read_text(encoding="utf-8") == ""  # 空正文，无 frontmatter
+
+    body = "码头上的风带着咸味。老周把缆绳在桩子上绕了两圈。\n\n“今夜潮水涨得早。”他抬头看天。\n"
+    saved = chapter_service.save_chapter(project["id"], chapter["rel_path"], body)
+    assert saved["body"] == body
+    assert saved["title"] == "码头夜话"  # 标题在库，不在文件里
+    text = path.read_text(encoding="utf-8")
+    assert text == body
+    assert "---" not in text and "标题" not in text
+
+
+def test_update_chapter_meta_changes_db_only(workspace, project) -> None:
+    """改标题 / 状态只写 ``chapters`` 表，正文文件字节不变。"""
+    chapter = chapter_service.create_chapter(project["id"], "起风")
+    chapter_service.save_chapter(project["id"], chapter["rel_path"], "雪落在肩上。\n")
+    path = workspace.projects / "测试书名" / chapter["rel_path"]
+    before = path.read_bytes()
+
+    updated = chapter_service.update_chapter_meta(
+        project["id"], chapter["rel_path"], title="雪夜归人", status="完成"
+    )
+    assert (updated["title"], updated["status"]) == ("雪夜归人", "完成")
+    assert path.read_bytes() == before
+
+    row = chapter_service.fetch_chapter_meta(project["id"], chapter["rel_path"])
+    assert row["title"] == "雪夜归人" and row["status"] == "完成"
+    assert chapter_service.list_chapters(project["id"])[0]["title"] == "雪夜归人"
+
+
+def test_normalize_chapter_create_name_accepts_legacy_suffixes(project) -> None:
+    """``第7章.md`` / ``第7章.txt`` / ``第7章`` 都规范化为 ``第0007章.txt``。"""
+    _row, project_dir = project_service.get_project_dir(project["id"])
+    for raw in ("第7章.md", "第7章.txt", "第7章"):
+        assert chapter_service.normalize_chapter_create_name(project_dir, raw) == ("第0007章.txt", None)
+    assert chapter_service.normalize_chapter_create_name(
+        project_dir, "第0007章.txt"
+    ) == ("第0007章.txt", None)
+
+
+def test_migrate_legacy_chapter_md_is_idempotent(workspace, project) -> None:
+    """存量 ``章节/第NNNN章.md`` 幂等迁移：元数据入库、旧文件下线、快照可回滚。"""
+    from workbench.backend.services import snapshot_service
+
+    project_id = project["id"]
+    root = workspace.projects / "测试书名"
+    legacy_text = (
+        "---\n标题: 旧版第一章\n状态: 完成\n合同ID: C-1\n---\n\n"
+        "第一段正文。\n\n第二段正文。\n"
+    )
+    atomic_write_text(root / "章节" / "第0001章.md", legacy_text)
+    atomic_write_text(root / "大纲" / "第0002章.md", "# 非章节目录，不参与迁移\n")
+
+    first = chapter_service.migrate_chapter_files(project_id)
+    assert first["errors"] == []
+    assert first["migrated"] == ["章节/第0001章.txt"]
+    assert first["skipped"] == []
+
+    new_path = root / "章节" / "第0001章.txt"
+    assert new_path.is_file() and not (root / "章节" / "第0001章.md").exists()
+    assert new_path.read_text(encoding="utf-8") == "第一段正文。\n\n第二段正文。\n"
+
+    detail = chapter_service.read_chapter(project_id, "章节/第0001章.txt")
+    assert (detail["title"], detail["status"], detail["contract_id"]) == ("旧版第一章", "完成", "C-1")
+    assert detail["word_count"] == 12
+    # 旧 .md 的元数据行与索引记录已清理
+    assert chapter_service.fetch_chapter_meta(project_id, "章节/第0001章.md") is None
+    assert [item["rel_path"] for item in index_service.search(project_id, "第一段")] == ["章节/第0001章.txt"]
+
+    # 快照可回滚（迁移前内容完整留存）
+    snaps = snapshot_service.list_snapshots(project_id, "章节/第0001章.md")
+    assert snaps and snaps[0]["reason"] == "migrate"
+    assert Path(snaps[0]["snapshot_path"]).is_file()
+    assert "旧版第一章" in Path(snaps[0]["snapshot_path"]).read_text(encoding="utf-8")
+
+    # 非章节目录的 .md 不受影响
+    assert (root / "大纲" / "第0002章.md").is_file()
+
+    # 重复执行无副作用
+    second = chapter_service.migrate_chapter_files(project_id)
+    assert second["migrated"] == [] and second["errors"] == []
+    assert second["skipped"] == ["章节/第0001章.txt"]
+    assert new_path.read_text(encoding="utf-8") == "第一段正文。\n\n第二段正文。\n"
+
+    # 快照可回滚：恢复后旧 .md（含 frontmatter）回到原位，再次迁移会跳过（.txt 已在）
+    restored = snapshot_service.restore_snapshot(snaps[0]["id"])
+    assert restored["rel_path"] == "章节/第0001章.md"
+    assert (root / "章节" / "第0001章.md").read_text(encoding="utf-8") == legacy_text
+    again = chapter_service.migrate_chapter_files(project_id)
+    assert again["migrated"] == [] and again["errors"] == []
+    assert again["skipped"] == ["章节/第0001章.md", "章节/第0001章.txt"]
+
+
+def test_migrate_chapters_api_and_open_trigger(workspace, project) -> None:
+    """手动迁移接口可用；打开项目（GET 详情）时自动执行一次幂等迁移。"""
+    from fastapi.testclient import TestClient
+
+    from workbench.backend.app import create_app
+
+    project_id = project["id"]
+    root = workspace.projects / "测试书名"
+    with TestClient(create_app()) as client:
+        atomic_write_text(
+            root / "章节" / "第0003章.md",
+            "---\n标题: 打开即迁\n---\n\n码头夜色。\n",
+        )
+        # 打开项目 → 触发迁移
+        assert client.get(f"/api/projects/{project_id}").status_code == 200
+        assert (root / "章节" / "第0003章.txt").is_file()
+        assert not (root / "章节" / "第0003章.md").exists()
+
+        response = client.post(f"/api/projects/{project_id}/chapters/migrate")
+        assert response.status_code == 200
+        assert response.json() == {"project_id": project_id, "migrated": [],
+                                   "skipped": ["章节/第0003章.txt"], "errors": []}
+        assert client.post("/api/projects/99999/chapters/migrate").status_code == 404
+
+
 def test_cover_rejects_bad_type_empty_and_oversize(workspace, project) -> None:
     project_id = project["id"]
     with pytest.raises(InvalidOperationError):
@@ -536,3 +670,196 @@ def test_cover_rejects_bad_type_empty_and_oversize(workspace, project) -> None:
         project_service.save_cover(
             project_id, b"x" * (project_service.MAX_COVER_BYTES + 1), "image/png"
         )
+
+
+# ─────────────────────── 删除整本 / 回收站 / 恢复 ───────────────────────
+
+
+def _count(table: str, project_id: int) -> int:
+    with db.get_conn() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE project_id = ?", (project_id,)
+        ).fetchone()
+    return int(row["n"])
+
+
+def test_delete_project_moves_to_trash(workspace, project) -> None:
+    project_id = project["id"]
+    root = workspace.projects / "测试书名"
+    chapter_service.create_chapter(project_id)  # 产生 chapters 行
+
+    assert _count("chapters", project_id) == 1
+
+    result = project_service.delete_project(project_id)
+
+    assert result == {"id": project_id, "name": "测试书名", "deleted": True}
+    # 目录已移走，但本体在回收站
+    assert not root.exists()
+    trash_project = config.RUNTIME_DIR / "trash" / "测试书名"
+    payloads = list(trash_project.glob("*/payload"))
+    assert len(payloads) == 1 and payloads[0].is_dir()
+    # 项目行保留并打了软删除标记；章节元数据（事实源）不丢
+    assert _count("chapters", project_id) == 1
+    assert project_service.list_projects() == []
+    assert project_service.list_projects(include_archived=True) == []
+    deleted = project_service.list_deleted_projects()
+    assert [item["name"] for item in deleted] == ["测试书名"]
+    assert deleted[0]["deleted_at"]
+
+
+def test_delete_project_keeps_other_projects(workspace, project) -> None:
+    other = project_service.create_project(name="另一本")
+    project_id = project["id"]
+
+    project_service.delete_project(project_id)
+
+    assert not (workspace.projects / "测试书名").exists()
+    assert (workspace.projects / "另一本").is_dir()
+    names = {item["name"] for item in project_service.list_projects()}
+    assert names == {"另一本"}
+    assert other["id"] != project_id
+
+
+def test_delete_project_missing_raises(workspace) -> None:
+    with pytest.raises(ProjectNotFoundError):
+        project_service.delete_project(99999)
+
+
+def test_restore_project_restores_dir_and_metadata(workspace, project) -> None:
+    project_id = project["id"]
+    chapter = chapter_service.create_chapter(project_id, title="留存标题")
+
+    project_service.delete_project(project_id)
+    assert not (workspace.projects / "测试书名").exists()
+
+    result = project_service.restore_project(project_id)
+
+    assert result["rel_path"] == "测试书名"
+    assert (workspace.projects / "测试书名").is_dir()
+    assert {item["name"] for item in project_service.list_projects()} == {"测试书名"}
+    assert project_service.list_deleted_projects() == []
+    # 回收站条目已清理
+    assert not (config.RUNTIME_DIR / "trash" / "测试书名").exists()
+    # 章节标题（事实源在 chapters 表）恢复后仍在
+    assert chapter_service.read_chapter(project_id, chapter["rel_path"])["title"] == "留存标题"
+
+
+def test_restore_project_missing_raises(workspace) -> None:
+    with pytest.raises(ProjectNotFoundError):
+        project_service.restore_project(99999)
+
+
+def test_restore_project_rejects_when_not_deleted(workspace, project) -> None:
+    with pytest.raises(InvalidOperationError):
+        project_service.restore_project(project["id"])
+
+
+def test_restore_project_name_conflict_raises(workspace, project) -> None:
+    project_id = project["id"]
+    project_service.delete_project(project_id)
+    (workspace.projects / "测试书名").mkdir()  # 同名目录被占用
+
+    with pytest.raises(ProjectExistsError):
+        project_service.restore_project(project_id)
+
+
+def test_purge_project_removes_everything(workspace, project) -> None:
+    project_id = project["id"]
+    root = workspace.projects / "测试书名"
+    chapter_service.create_chapter(project_id)
+    snapshot_dir = config.snapshots_dir() / "测试书名"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    project_service.delete_project(project_id)
+
+    result = project_service.purge_project(project_id)
+
+    assert result == {"id": project_id, "name": "测试书名", "purged": True}
+    assert not root.exists()
+    assert not snapshot_dir.exists()
+    assert not (config.RUNTIME_DIR / "trash" / "测试书名").exists()
+    assert _count("chapters", project_id) == 0
+    assert project_service.list_projects(include_archived=True) == []
+    assert project_service.list_deleted_projects() == []
+
+
+def test_purge_project_cascades_chat_sessions(workspace, project) -> None:
+    project_id = project["id"]
+    with db.get_conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO chat_sessions (project_id, title) VALUES (?, ?)",
+            (project_id, "会话"),
+        )
+        session_id = int(cursor.lastrowid or 0)
+        conn.execute(
+            "INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, "user", "你好"),
+        )
+        conn.execute(
+            "INSERT INTO chat_runs (id, session_id, project_id, client_request_id, request)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("run-1", session_id, project_id, "req-1", "{}"),
+        )
+        conn.execute(
+            "INSERT INTO chat_run_events (run_id, seq, payload) VALUES (?, ?, ?)",
+            ("run-1", 1, "{}"),
+        )
+
+    project_service.delete_project(project_id)
+    project_service.purge_project(project_id)
+
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM chat_sessions").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) AS n FROM chat_messages").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) AS n FROM chat_runs").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) AS n FROM chat_run_events").fetchone()["n"] == 0
+
+
+def test_delete_project_api(workspace, project) -> None:
+    from fastapi.testclient import TestClient
+
+    from workbench.backend.app import create_app
+
+    project_id = project["id"]
+    with TestClient(create_app()) as client:
+        # 默认：软删除（进回收站）
+        response = client.delete(f"/api/projects/{project_id}")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == project_id and body["deleted"] is True
+        assert client.get("/api/trash").json()[0]["kind"] == "project"
+        # 恢复
+        assert client.post(f"/api/projects/{project_id}/restore").status_code == 200
+        assert client.get("/api/trash").json() == []
+        # 彻底删除
+        assert client.delete(f"/api/projects/{project_id}").status_code == 200
+        purged = client.delete(f"/api/projects/{project_id}", params={"permanent": "true"})
+        assert purged.status_code == 200 and purged.json()["purged"] is True
+        assert client.get("/api/trash").json() == []
+
+        assert client.delete("/api/projects/99999").status_code == 404
+
+
+def test_global_trash_lists_book_and_file_entries(workspace, project) -> None:
+    from fastapi.testclient import TestClient
+
+    from workbench.backend.app import create_app
+
+    project_id = project["id"]
+    # 文件级条目：写一节非空章节再删除 → 进回收站
+    chapter = chapter_service.create_chapter(project_id)
+    atomic_write_text(
+        workspace.projects / "测试书名" / chapter["rel_path"], "非空正文" * 50
+    )
+    chapter_service.delete_chapter(project_id, chapter["rel_path"])
+
+    other = project_service.create_project(name="待删之书")
+    project_service.delete_project(other["id"])
+
+    with TestClient(create_app()) as client:
+        entries = client.get("/api/trash").json()
+
+    kinds = {entry["kind"] for entry in entries}
+    assert {"file", "project"} <= kinds
+    book = next(entry for entry in entries if entry["kind"] == "project")
+    assert book["project_name"] == "待删之书"
+    assert book["project_id"] == other["id"]

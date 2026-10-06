@@ -17,7 +17,7 @@ export function chapterLabel(source: ChapterNameSource): string {
   const base =
     typeof number === 'number' && number > 0
       ? `第${String(number).padStart(4, '0')}章`
-      : (source.file_name ?? source.name ?? '').replace(/\.md$/i, '')
+      : (source.file_name ?? source.name ?? '').replace(/\.(?:md|txt)$/i, '')
   const title = (source.title ?? '').trim()
   return title ? `${base} · ${title}` : base
 }

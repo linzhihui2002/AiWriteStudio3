@@ -1,15 +1,20 @@
+import WorkspacePage, { ResourceState, useResourceRequest } from '../components/WorkspacePage'
 /**
  * 设置（全局页，不依赖项目上下文）。
  *
  * 分区：模型供应商 / 引擎路由 / 外观与护眼 / 编辑器偏好 / 预算与用量 /
  *       技能 / Agent / 规则 / 向量检索 / 关于与隔离。
  *
- * 纪律：只用既有 CSS 类（global.css / app.css），不写死颜色；控件全部为原生
+ * 纪律：复用全站主题 token，不写死颜色；控件全部为原生
  * button/input/select/label（键盘可达）；分区数据在切换分区时重新拉取。
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import Modal from '../components/Modal'
+import CredentialInput from '../components/CredentialInput'
+import '../styles/settingsProviders.css'
+import TemplateManager from '../components/TemplateManager'
 import { useConfirm } from '../components/ConfirmDialog'
 import {
   compileRules,
@@ -66,7 +71,7 @@ import { useSettings } from '../state/useSettings'
 import { useToast, errorMessage } from '../state/useToast'
 import { applyAppearance } from '../state/useAppearance'
 import { THEMES, type Theme } from '../theme/useTheme'
-import { CREDENTIAL_FIELD_EXTRA, NO_AUTOFILL, NO_AUTOFILL_PASSWORD } from '../lib/autofill'
+import { CREDENTIAL_FIELD_EXTRA, NO_AUTOFILL } from '../lib/autofill'
 import { CHAT_PERMISSION_OPTIONS } from '../lib/chatState'
 
 // ─────────────────────────── 常量与本地类型 ───────────────────────────
@@ -77,6 +82,7 @@ const SECTIONS = [
   { key: 'appearance', label: '外观与护眼' },
   { key: 'editor', label: '编辑器偏好' },
   { key: 'chat', label: '对话偏好' },
+  { key: 'templates', label: '模板管理' },
   { key: 'budget', label: '预算与用量' },
   { key: 'skills', label: '技能' },
   { key: 'agents', label: 'Agent' },
@@ -86,6 +92,14 @@ const SECTIONS = [
 ] as const
 
 type SectionKey = (typeof SECTIONS)[number]['key']
+
+/** 分区初始值：支持 `?section=xxx` 深链（如书架「管理模板」跳转）；非法值回落首个分区。 */
+function initialSection(search: URLSearchParams): SectionKey {
+  const requested = search.get('section')
+  const keys: readonly string[] = SECTIONS.map((item) => item.key)
+  if (requested && keys.includes(requested)) return requested as SectionKey
+  return 'providers'
+}
 
 /** 与后端 settings_service.DEFAULT_SETTINGS.appearance 一致。 */
 const DEFAULT_APPEARANCE: Settings['appearance'] = {
@@ -105,6 +119,13 @@ const ENGINE_OPTIONS = [
   { value: 'direct-api', label: 'direct-api（直连 API）' },
 ]
 
+/** 对话偏好：在共享 Settings.chat 类型上补齐后端 settings_service 的写域与意图判定三项。 */
+type ChatPrefs = NonNullable<Settings['chat']> & {
+  scope_strictness?: 'ask' | 'reject'
+  scope_limit_full?: boolean
+  intent_llm?: boolean
+}
+
 interface ProviderForm {
   provider_id: string
   display_name: string
@@ -123,6 +144,9 @@ interface AgentForm {
   system_prompt: string
   skills: string[]
   tools: string[]
+  materials: string[]
+  boundaries: string
+  capabilities: AgentCapability[]
   provider_id: string
   model_id: string
 }
@@ -144,10 +168,40 @@ interface CompileResult {
 interface SkillSyncResult {
   count?: number
   total_bytes?: number
+  core_bytes?: number
+  estimated_tokens?: number
   target_root?: string
   warnings?: string[]
   errors?: Array<{ path: string; error: string }>
 }
+
+/** 后端 /skills 在既有 SkillItem 上追加的绑定与引用字段（后端只加键，不删既有键）。 */
+interface SkillRow extends SkillItem {
+  appliesTo?: string[]
+  reference_files?: string[]
+  references_bytes?: number
+  agents?: string[]
+  suggested_agents?: string[]
+  missing_references?: string[]
+}
+
+/** Agent 能力声明（后端 _to_public 已回传 capabilities，前端只读展示）。 */
+interface AgentCapability {
+  intent?: string
+  triggers?: string[]
+  skill?: string
+  task_type?: string
+}
+
+/** 后端 Agent 定义上的声明式字段（materials / capabilities / boundaries）。 */
+interface AgentRow extends AgentItem {
+  materials?: string[]
+  capabilities?: AgentCapability[]
+  boundaries?: string
+}
+
+/** 主责材料取值兜底（与后端 agent_service.MATERIAL_DIRS 保持一致）。 */
+const FALLBACK_MATERIAL_DIRS = ['章节', '设定', '大纲', '状态', '备忘录']
 
 interface VectorModelFile {
   path: string
@@ -307,6 +361,9 @@ const EMPTY_AGENT_FORM: AgentForm = {
   system_prompt: '',
   skills: [],
   tools: [],
+  materials: [],
+  boundaries: '',
+  capabilities: [],
   provider_id: '',
   model_id: '',
 }
@@ -347,11 +404,20 @@ const SOURCE_LABEL: Record<string, string> = {
 // ─────────────────────────── 页面 ───────────────────────────
 
 export default function SettingsPage() {
-  const { settings, patch, setTheme, refresh } = useSettings()
+  const { settings, loading: settingsLoading, error: settingsError, patch, setTheme, refresh } = useSettings()
   const { push } = useToast()
   const [confirm, confirmNode] = useConfirm()
+  const [searchParams, setSearchParams] = useSearchParams()
 
-  const [active, setActive] = useState<SectionKey>('providers')
+  const active = initialSection(searchParams)
+  const setActive = (section: SectionKey) => { const next = new URLSearchParams(searchParams); next.set('section', section); setSearchParams(next) }
+  const providersResource = useResourceRequest('providers')
+  const enginesResource = useResourceRequest('engines')
+  const budgetResource = useResourceRequest('budget')
+  const skillsResource = useResourceRequest('skills')
+  const agentsResource = useResourceRequest('agents')
+  const vectorResource = useResourceRequest('vector')
+  const aboutResource = useResourceRequest('about')
   const [reloadToken, setReloadToken] = useState(0)
 
   const notifyError = useCallback(
@@ -379,6 +445,10 @@ export default function SettingsPage() {
   >({})
   const [yamlText, setYamlText] = useState('')
   const [providerNote, setProviderNote] = useState('')
+  const [providerSaving, setProviderSaving] = useState(false)
+  const providerSaveInFlight = useRef(false)
+  const [providerPulling, setProviderPulling] = useState(false)
+  const providerRequestVersion = useRef(0)
 
   // ── 引擎 ──
   const [routing, setRouting] = useState<RoutingInfo | null>(null)
@@ -394,8 +464,8 @@ export default function SettingsPage() {
   const [usage, setUsage] = useState<UsageSummary | null>(null)
 
   // ── 技能 ──
-  const [skills, setSkills] = useState<SkillItem[]>([])
-  const [skillBudget, setSkillBudget] = useState(0)
+  const [skills, setSkills] = useState<SkillRow[]>([])
+  const [skillEstimatedTokens, setSkillEstimatedTokens] = useState(0)
   const [skillTargetRoot, setSkillTargetRoot] = useState('')
   const [syncResult, setSyncResult] = useState<SkillSyncResult | null>(null)
   const [skillModal, setSkillModal] = useState<
@@ -413,16 +483,19 @@ export default function SettingsPage() {
   const [skillGenerateForm, setSkillGenerateForm] = useState({ description: '', name: '' })
 
   // ── Agent ──
-  const [agents, setAgents] = useState<AgentItem[]>([])
+  const [agents, setAgents] = useState<AgentRow[]>([])
   const [agentBuiltinCount, setAgentBuiltinCount] = useState(0)
   const [toolWhitelist, setToolWhitelist] = useState<string[]>([])
+  const [materialDirs, setMaterialDirs] = useState<string[]>(FALLBACK_MATERIAL_DIRS)
   const [agentModal, setAgentModal] = useState<
-    { mode: 'form' | 'duplicate' | 'model' | 'draft'; name?: string } | null
+    { mode: 'form' | 'draft'; name?: string } | null
   >(null)
   const [agentForm, setAgentForm] = useState<AgentForm>(EMPTY_AGENT_FORM)
+  // Agent 卡片的行内动作（复制 / 配置模型）：不再用单字段弹窗
+  const [agentInline, setAgentInline] = useState<{ name: string; mode: 'duplicate' | 'model' } | null>(null)
   const [duplicateName, setDuplicateName] = useState('')
   const [modelBinding, setModelBinding] = useState({ provider_id: '', model_id: '' })
-  /** 模型字段是否处于「自定义…」手填模式（两个弹窗互斥，共用一个标记）。 */
+  /** 模型字段是否处于「自定义…」手填模式（行内面板与弹窗互斥，共用一个标记）。 */
   const [modelCustom, setModelCustom] = useState(false)
   const [agentDraftForm, setAgentDraftForm] = useState({ description: '', name: '' })
   const [agentDraft, setAgentDraft] = useState<AgentForm | null>(null)
@@ -430,6 +503,7 @@ export default function SettingsPage() {
 
   // ── 规则 ──
   const [ruleProjectId, setRuleProjectId] = useState('')
+  const rulesResource = useResourceRequest(ruleProjectId)
   const ruleProjectIdRef = useRef('')
   const [ruleGlobal, setRuleGlobal] = useState<RuleItem[]>([])
   const [ruleProject, setRuleProject] = useState<RuleItem[]>([])
@@ -460,59 +534,85 @@ export default function SettingsPage() {
   // ─────────────────────────── 加载器 ───────────────────────────
 
   const loadProviders = useCallback(async () => {
+    const token = providersResource.begin()
     try {
       const data = await listProviders()
+      if (!providersResource.accept(token)) return
       setProviders(data.providers)
       setCapabilityTags(data.capability_tags)
       setCipher(data.cipher)
       setDefaultTarget(data.defaults ?? EMPTY_DEFAULT_TARGET)
+      providersResource.finish(token)
     } catch (error) {
-      notifyError(error)
+      providersResource.fail(token, errorMessage(error))
     }
   }, [notifyError])
 
   const loadEngines = useCallback(async () => {
+    const token = enginesResource.begin()
     try {
       const data = await getEngines()
+      if (!enginesResource.accept(token)) return
       setRouting(data)
       setOverrideRows(data.global_overrides)
+      enginesResource.finish(token)
     } catch (error) {
-      notifyError(error)
+      enginesResource.fail(token, errorMessage(error))
     }
   }, [notifyError])
 
   const loadUsage = useCallback(async () => {
+    const token = budgetResource.begin()
     try {
       const data = await getUsage()
+      if (!budgetResource.accept(token)) return
       setUsage(data)
+      budgetResource.finish(token)
     } catch (error) {
-      notifyError(error)
+      budgetResource.fail(token, errorMessage(error))
     }
   }, [notifyError])
 
   const loadSkills = useCallback(async () => {
+    const token = skillsResource.begin()
     try {
-      const data = await listSkills()
+      const data = (await listSkills()) as unknown as {
+        skills: SkillRow[]
+        estimated_tokens: number
+        target_root: string
+      }
+      if (!skillsResource.accept(token)) return
       setSkills(data.skills)
-      setSkillBudget(data.budget_bytes)
+      setSkillEstimatedTokens(data.estimated_tokens)
       setSkillTargetRoot(data.target_root)
+      skillsResource.finish(token)
     } catch (error) {
-      notifyError(error)
+      skillsResource.fail(token, errorMessage(error))
     }
   }, [notifyError])
 
   const loadAgents = useCallback(async () => {
+    const token = agentsResource.begin()
     try {
-      const data = await listAgents(true)
+      const data = (await listAgents(true)) as unknown as {
+        agents: AgentRow[]
+        builtin_count: number
+        tool_whitelist: string[]
+        material_dirs?: string[]
+      }
+      if (!agentsResource.accept(token)) return
       setAgents(data.agents)
       setAgentBuiltinCount(data.builtin_count)
       setToolWhitelist(data.tool_whitelist)
+      setMaterialDirs(data.material_dirs ?? FALLBACK_MATERIAL_DIRS)
+      agentsResource.finish(token)
     } catch (error) {
-      notifyError(error)
+      agentsResource.fail(token, errorMessage(error))
     }
   }, [notifyError])
 
   const loadRules = useCallback(async () => {
+    const token = rulesResource.begin()
     const raw = ruleProjectIdRef.current.trim()
     const projectId = raw ? Number(raw) : undefined
     try {
@@ -520,6 +620,7 @@ export default function SettingsPage() {
         listRules(projectId),
         resolvedRules(projectId),
       ])
+      if (!rulesResource.accept(token)) return
       setRuleGlobal(list.global as unknown as RuleItem[])
       setRuleProject(list.project as unknown as RuleItem[])
       setRuleSkill(list.skill_builtin as unknown as RuleItem[])
@@ -528,30 +629,38 @@ export default function SettingsPage() {
         conflicts: effective.conflicts as unknown as RuleConflict[],
         order: effective.order,
       })
+      rulesResource.finish(token)
     } catch (error) {
-      notifyError(error)
+      rulesResource.fail(token, errorMessage(error))
     }
-  }, [notifyError])
+  }, [notifyError, ruleProjectId])
 
   const loadVector = useCallback(async () => {
+    const token = vectorResource.begin()
     try {
       const data = (await vectorModelInfo()) as unknown as VectorModelInfo
+      if (!vectorResource.accept(token)) return
       setVectorInfo(data)
       setVectorForm({
         model_dir: data.active?.model_dir ?? '',
         provider: '',
         model: '',
       })
+      vectorResource.finish(token)
     } catch (error) {
-      notifyError(error)
+      vectorResource.fail(token, errorMessage(error))
     }
   }, [notifyError])
 
   const loadHealth = useCallback(async () => {
+    const token = aboutResource.begin()
     try {
-      setHealth(await getHealth())
+      const data = await getHealth()
+      if (!aboutResource.accept(token)) return
+      setHealth(data)
+      aboutResource.finish(token)
     } catch (error) {
-      notifyError(error)
+      aboutResource.fail(token, errorMessage(error))
     }
   }, [notifyError])
 
@@ -660,6 +769,8 @@ export default function SettingsPage() {
     setProviderForm((current) => ({ ...current, ...partial }))
 
   const resetProviderForm = () => {
+    providerRequestVersion.current += 1
+    setProviderPulling(false)
     setProviderForm(EMPTY_PROVIDER_FORM)
     setEditingProviderId('')
     setModelOptions([])
@@ -667,6 +778,8 @@ export default function SettingsPage() {
   }
 
   const startEditProvider = (provider: Provider) => {
+    providerRequestVersion.current += 1
+    setProviderPulling(false)
     setProviderForm({
       provider_id: provider.provider_id,
       display_name: provider.display_name,
@@ -691,6 +804,7 @@ export default function SettingsPage() {
 
   /** 关闭弹窗并复位表单：取消 / Esc / 点遮罩 / 保存后都走这里。 */
   const closeProviderModal = () => {
+    if (providerSaving) return
     resetProviderForm()
     setProviderModal(null)
   }
@@ -713,27 +827,32 @@ export default function SettingsPage() {
     }))
 
   const appendPulledModels = () => {
-    if (!pulledSelection.length) {
+    const existing = new Set(providerForm.models.map((model) => model.id))
+    const selected = [...new Set(pulledSelection)].filter((id) => !existing.has(id))
+    if (!selected.length) {
       push('请先勾选要添加的模型', 'error')
       return
     }
     setProviderForm((current) => {
       const existing = new Set(current.models.map((model) => model.id))
-      const added = pulledSelection
+      const added = selected
         .filter((id) => !existing.has(id))
         .map((id) => ({ ...EMPTY_MODEL_ROW, id }))
       return { ...current, models: [...current.models, ...added] }
     })
-    push(`已添加 ${pulledSelection.length} 个模型`, 'success')
+    push(`已添加 ${selected.length} 个模型`, 'success')
     setPulledSelection([])
   }
 
   const submitProvider = async () => {
+    if (providerSaveInFlight.current) return
     const providerId = providerForm.provider_id.trim()
     if (!providerId) {
       push('请填写 provider_id', 'error')
       return
     }
+    providerSaveInFlight.current = true
+    setProviderSaving(true)
     try {
       await upsertProvider({
         provider_id: providerId,
@@ -746,24 +865,34 @@ export default function SettingsPage() {
         enabled: providerForm.enabled,
       })
       push('供应商已保存', 'success')
-      closeProviderModal()
+      resetProviderForm()
+      setProviderModal(null)
       await loadProviders()
     } catch (error) {
       notifyError(error)
+    } finally {
+      providerSaveInFlight.current = false
+      setProviderSaving(false)
     }
   }
 
   const pullModels = async () => {
+    if (providerPulling) return
+    const version = providerRequestVersion.current
+    setProviderPulling(true)
     try {
       const payload = editingProviderId
         ? { provider_id: editingProviderId }
         : { base_url: providerForm.base_url, api_key: providerForm.api_key.trim() }
       const data = await listModels(payload)
+      if (providerRequestVersion.current !== version) return
       setModelOptions(data.models.map((item) => item.id))
       setPulledSelection([])
       push(`已拉取 ${data.count} 个模型`, 'success')
     } catch (error) {
-      notifyError(error)
+      if (providerRequestVersion.current === version) notifyError(error)
+    } finally {
+      if (providerRequestVersion.current === version) setProviderPulling(false)
     }
   }
 
@@ -795,17 +924,9 @@ export default function SettingsPage() {
     }
   }
 
+  // 启用前的「未做健康检查」只是提醒，不是危险操作：直接启用，改由卡片常驻 warn 标记提示
   const toggleProvider = async (provider: Provider) => {
     const next = !provider.enabled
-    if (next && !healthResults[provider.provider_id]?.ok) {
-      const confirmed = await confirm({
-        title: '启用供应商',
-        message:
-          '该供应商尚未通过健康检查（或本次会话未做过检查）。建议先做健康检查，确认连通后再启用。仍要启用吗？',
-        confirmText: '仍要启用',
-      })
-      if (!confirmed) return
-    }
     try {
       await enableProvider(provider.provider_id, next)
       push(next ? '已启用供应商' : '已停用供应商', 'success')
@@ -1021,6 +1142,19 @@ export default function SettingsPage() {
     }
   }
 
+  /** 必注入技能清单（settings.writing.always_inject_skills）：只允许勾选当前存在的技能。 */
+  const toggleAlwaysInject = (name: string, checked: boolean) => {
+    const current = settings?.writing?.always_inject_skills ?? []
+    if (checked && !skills.some((skill) => skill.name === name)) {
+      push(`技能「${name}」不存在，请先新建或同步后再加入必注入清单`, 'error')
+      return
+    }
+    const next = checked
+      ? Array.from(new Set([...current, name]))
+      : current.filter((item) => item !== name)
+    saveSettings({ writing: { always_inject_skills: next } })
+  }
+
   const removeSkill = async (name: string) => {
     const confirmed = await confirm({
       title: '删除技能',
@@ -1049,7 +1183,6 @@ export default function SettingsPage() {
     }
   }
 
-  const skillTotalBytes = skills.reduce((total, item) => total + item.size_bytes, 0)
 
   // ─────────────────────────── Agent 动作 ───────────────────────────
 
@@ -1059,7 +1192,7 @@ export default function SettingsPage() {
     setAgentModal({ mode: 'form' })
   }
 
-  const openAgentEdit = (agent: AgentItem) => {
+  const openAgentEdit = (agent: AgentRow) => {
     setAgentForm({
       name: agent.name,
       title: agent.title,
@@ -1067,6 +1200,9 @@ export default function SettingsPage() {
       system_prompt: agent.system_prompt,
       skills: agent.skills,
       tools: agent.tools,
+      materials: agent.materials ?? [],
+      boundaries: agent.boundaries ?? '',
+      capabilities: agent.capabilities ?? [],
       provider_id: agent.provider_id,
       model_id: agent.model_id,
     })
@@ -1084,6 +1220,9 @@ export default function SettingsPage() {
           system_prompt: agentForm.system_prompt,
           skills: agentForm.skills,
           tools: agentForm.tools,
+          materials: agentForm.materials,
+          boundaries: agentForm.boundaries,
+          capabilities: agentForm.capabilities,
           provider_id: agentForm.provider_id,
           model_id: agentForm.model_id,
         })
@@ -1096,6 +1235,9 @@ export default function SettingsPage() {
           system_prompt: agentForm.system_prompt,
           skills: agentForm.skills,
           tools: agentForm.tools,
+          materials: agentForm.materials,
+          boundaries: agentForm.boundaries,
+          capabilities: agentForm.capabilities,
           provider_id: agentForm.provider_id,
           model_id: agentForm.model_id,
           params: { temperature: 0.7 },
@@ -1109,28 +1251,26 @@ export default function SettingsPage() {
     }
   }
 
-  const runDuplicateAgent = async () => {
-    if (!agentModal?.name) return
+  const runDuplicateAgent = async (name: string) => {
     if (!duplicateName.trim()) {
       push('请填写副本名称', 'error')
       return
     }
     try {
-      await duplicateAgent(agentModal.name, duplicateName.trim())
+      await duplicateAgent(name, duplicateName.trim())
       push('已复制 Agent', 'success')
-      setAgentModal(null)
+      setAgentInline(null)
       await loadAgents()
     } catch (error) {
       notifyError(error)
     }
   }
 
-  const runSetAgentModel = async () => {
-    if (!agentModal?.name) return
+  const runSetAgentModel = async (name: string) => {
     try {
-      await setAgentModel(agentModal.name, modelBinding.provider_id, modelBinding.model_id)
+      await setAgentModel(name, modelBinding.provider_id, modelBinding.model_id)
       push('模型绑定已保存', 'success')
-      setAgentModal(null)
+      setAgentInline(null)
       await loadAgents()
     } catch (error) {
       notifyError(error)
@@ -1148,7 +1288,7 @@ export default function SettingsPage() {
         push(`草案生成失败：${result.error || '未知原因'}`, 'error')
         return
       }
-      const draft = result.draft
+      const draft = result.draft as unknown as Record<string, unknown>
       setAgentDraft({
         name: String(draft.name ?? ''),
         title: String(draft.title ?? ''),
@@ -1156,6 +1296,13 @@ export default function SettingsPage() {
         system_prompt: String(draft.system_prompt ?? ''),
         skills: Array.isArray(draft.skills) ? draft.skills.map((item) => String(item)) : [],
         tools: Array.isArray(draft.tools) ? draft.tools.map((item) => String(item)) : [],
+        materials: Array.isArray(draft.materials) ? draft.materials.map((item) => String(item)) : [],
+        boundaries: String(draft.boundaries ?? ''),
+        capabilities: Array.isArray(draft.capabilities)
+          ? (draft.capabilities as AgentCapability[]).filter(
+              (item) => item && typeof item === 'object',
+            )
+          : [],
         provider_id: '',
         model_id: '',
       })
@@ -1182,6 +1329,9 @@ export default function SettingsPage() {
         system_prompt: agentDraft.system_prompt,
         skills: agentDraft.skills,
         tools: agentDraft.tools,
+        materials: agentDraft.materials,
+        boundaries: agentDraft.boundaries,
+        capabilities: agentDraft.capabilities,
         provider_id: agentDraft.provider_id,
         model_id: agentDraft.model_id,
         params,
@@ -1306,286 +1456,156 @@ export default function SettingsPage() {
   function renderProviderModal() {
     if (!providerModal) return null
     const form = providerForm
-
-    const tokenPatch = (
-      key: 'context_window' | 'max_tokens',
-      value: number,
-    ): Partial<ProviderModel> =>
-      key === 'context_window' ? { context_window: value } : { max_tokens: value }
-
-    /** 上下文窗口 / 最大输出：手填数值 + 预设快选（再点一次取消，回到默认值）。 */
+    const availableModels = modelOptions.filter((id) => !form.models.some((model) => model.id === id))
     const renderTokenField = (
       index: number,
       key: 'context_window' | 'max_tokens',
       label: string,
       presets: Array<{ label: string; value: number }>,
-    ) => (
-      <label className="field" style={{ flex: '1 1 12rem' }}>
-        <span className="field__label">{label}</span>
-        <input
-          className="input"
-          type="number"
-          min={0}
-          value={form.models[index][key] || ''}
-          onChange={(event) =>
-            updateModelRow(index, tokenPatch(key, Number(event.target.value) || 0))
-          }
-          placeholder="留空用默认值"
-        />
-        <div className="chips">
-          {presets.map((preset) => {
-            const on = form.models[index][key] === preset.value
-            return (
-              <button
-                key={preset.label}
-                type="button"
-                className={on ? 'tag tag--primary' : 'tag'}
-                aria-pressed={on}
-                onClick={() => updateModelRow(index, tokenPatch(key, on ? 0 : preset.value))}
-              >
-                {preset.label}
-              </button>
-            )
-          })}
+    ) => {
+      const inputId = `provider-model-${index}-${key}`
+      return (
+        <div className="field">
+          <label className="field__label" htmlFor={inputId}>{label} <span className="provider-editor__unit">Token</span></label>
+          <input
+            id={inputId}
+            className="input"
+            type="number"
+            min={0}
+            value={form.models[index][key] || ''}
+            onChange={(event) => updateModelRow(index, { [key]: Number(event.target.value) || 0 })}
+            placeholder="使用默认值"
+          />
+          <div className="provider-editor__presets" role="group" aria-label={`模型 ${index + 1} ${label}预设`}>
+            {presets.map((preset) => {
+              const on = form.models[index][key] === preset.value
+              return (
+                <button key={preset.label} type="button" className="provider-editor__preset" aria-pressed={on}
+                  onClick={() => updateModelRow(index, { [key]: on ? 0 : preset.value })}>
+                  {preset.label}
+                </button>
+              )
+            })}
+          </div>
         </div>
-      </label>
-    )
-
+      )
+    }
     return (
       <Modal
-        title={
-          providerModal.mode === 'edit'
-            ? `编辑供应商：${providerModal.providerId}`
-            : '新建供应商'
-        }
-        open
-        onClose={closeProviderModal}
-        width={860}
+        title={providerModal.mode === 'edit' ? `编辑供应商：${providerModal.providerId}` : '新建供应商'}
+        open onClose={closeProviderModal} width={1040} className="provider-editor-modal"
         footer={
-          <div className="btn-row">
-            <button
-              className="btn"
-              type="button"
-              disabled={!editingProviderId}
-              onClick={() => void runHealth(editingProviderId)}
-            >
-              健康检查
-            </button>
-            <button className="btn" type="button" onClick={() => void pullModels()}>
-              拉取模型列表
-            </button>
-            <button className="btn" type="button" onClick={closeProviderModal}>
-              取消
-            </button>
-            <button className="btn btn--primary" type="button" onClick={() => void submitProvider()}>
-              保存供应商
-            </button>
+          <div className="provider-editor__footer">
+            <span className="field__hint">{form.models.length} 个模型 · 凭据仅保存在本机</span>
+            <div className="btn-row">
+              {editingProviderId ? <button className="btn" type="button" disabled={providerSaving} onClick={() => void runHealth(editingProviderId)}>健康检查</button> : null}
+              <button className="btn" type="button" disabled={providerSaving} onClick={closeProviderModal}>取消</button>
+              <button className="btn btn--primary" type="button" disabled={providerSaving} onClick={() => void submitProvider()}>
+                {providerSaving ? '保存中…' : '保存供应商'}
+              </button>
+            </div>
           </div>
         }
       >
-        <div className="stack">
-          <p className="field__hint">凭据保存在本机，接口只显示掩码。</p>
-          <div className="row">
-            <label className="field" style={{ flex: '1 1 12rem' }}>
-              <span className="field__label">标识 provider_id</span>
-              <input
-                className="input"
-                name="provider-id"
-                autoComplete={NO_AUTOFILL}
-                value={form.provider_id}
-                disabled={Boolean(editingProviderId)}
-                onChange={(event) => updateProviderForm({ provider_id: event.target.value })}
-                placeholder="例如 deepseek"
-              />
-            </label>
-            <label className="field" style={{ flex: '1 1 12rem' }}>
-              <span className="field__label">显示名</span>
-              <input
-                className="input"
-                name="provider-name"
-                autoComplete={NO_AUTOFILL}
-                value={form.display_name}
-                onChange={(event) => updateProviderForm({ display_name: event.target.value })}
-              />
-            </label>
-            <label className="field" style={{ flex: '2 1 18rem' }}>
-              <span className="field__label">base_url</span>
-              <input
-                className="input"
-                name="provider-base-url"
-                autoComplete={NO_AUTOFILL}
-                {...CREDENTIAL_FIELD_EXTRA}
-                value={form.base_url}
-                onChange={(event) => updateProviderForm({ base_url: event.target.value })}
-                placeholder="https://api.example.com/v1"
-              />
-            </label>
-          </div>
-          <div className="row">
-            <label className="field" style={{ flex: '0 1 10rem' }}>
-              <span className="field__label">超时（秒）</span>
-              <input
-                className="input"
-                type="number"
-                min={5}
-                value={form.timeout_seconds}
-                onChange={(event) =>
-                  updateProviderForm({ timeout_seconds: Number(event.target.value) || 60 })
-                }
-              />
-            </label>
-            <label className="field" style={{ flex: '1 1 14rem' }}>
-              <span className="field__label">api_key（留空表示不修改已存 Key）</span>
-              <input
-                className="input"
-                type="password"
-                name="provider-api-key"
-                autoComplete={NO_AUTOFILL_PASSWORD}
-                {...CREDENTIAL_FIELD_EXTRA}
-                value={form.api_key}
-                onChange={(event) => updateProviderForm({ api_key: event.target.value })}
-                placeholder="只写入安全存储，不会回显"
-              />
-            </label>
-          </div>
-          <div className="stack stack--tight">
-            <div className="row" style={{ alignItems: 'baseline' }}>
-              <span className="field__label">模型列表（可添加多个）</span>
-              <button
-                className="btn btn--sm"
-                type="button"
-                style={{ marginLeft: 'auto' }}
-                onClick={addModelRow}
-              >
-                添加模型
-              </button>
+        <fieldset className="provider-editor" disabled={providerSaving}>
+          <section className="provider-editor__section" aria-labelledby="provider-connection-title">
+            <div className="provider-editor__section-header">
+              <div><h3 id="provider-connection-title">连接配置</h3><p>填写服务地址与 API Key，连接你的模型服务。</p></div>
+              <span className="provider-editor__local-tag">本机安全存储</span>
             </div>
-            {form.models.length ? (
-              <div className="stack stack--tight">
-                {form.models.map((model, index) => (
-                  <div className="row" key={`model-${index}`}>
-                    <label className="field" style={{ flex: '1 1 14rem' }}>
-                      <span className="field__label">模型 id</span>
-                      <input
-                        className="input"
-                        autoComplete={NO_AUTOFILL}
-                        value={model.id}
-                        onChange={(event) => updateModelRow(index, { id: event.target.value })}
-                        placeholder="例如 deepseek-chat"
-                      />
-                    </label>
-                    <label className="field" style={{ flex: '1 1 12rem' }}>
-                      <span className="field__label">模型展示名称</span>
-                      <input
-                        className="input"
-                        autoComplete={NO_AUTOFILL}
-                        value={model.name}
-                        onChange={(event) => updateModelRow(index, { name: event.target.value })}
-                        placeholder="留空则显示模型 id"
-                      />
-                    </label>
-                    {renderTokenField(
-                      index,
-                      'context_window',
-                      '上下文窗口（Token）',
-                      CONTEXT_WINDOW_PRESETS,
-                    )}
-                    {renderTokenField(index, 'max_tokens', '最大输出（Token）', MAX_TOKENS_PRESETS)}
-                    <button
-                      className="btn btn--sm btn--danger"
-                      type="button"
-                      onClick={() => removeModelRow(index)}
-                    >
-                      删除
-                    </button>
+            <div className="provider-editor__connection-grid">
+              <label className="field">
+                <span className="field__label">供应商标识 <span className="provider-editor__unit">ID</span></span>
+                <input className="input mono" name="provider-id" autoComplete={NO_AUTOFILL} value={form.provider_id}
+                  disabled={Boolean(editingProviderId)} onChange={(event) => updateProviderForm({ provider_id: event.target.value })} placeholder="例如 deepseek" />
+              </label>
+              <label className="field">
+                <span className="field__label">显示名称</span>
+                <input className="input" name="provider-name" autoComplete={NO_AUTOFILL} value={form.display_name}
+                  onChange={(event) => updateProviderForm({ display_name: event.target.value })} placeholder="例如 我的模型服务" />
+              </label>
+              <label className="field">
+                <span className="field__label">请求超时 <span className="provider-editor__unit">秒</span></span>
+                <input className="input" type="number" min={5} value={form.timeout_seconds}
+                  onChange={(event) => updateProviderForm({ timeout_seconds: Number(event.target.value) || 60 })} />
+              </label>
+            </div>
+            <div className="provider-editor__endpoint-grid">
+              <label className="field">
+                <span className="field__label">服务地址 <span className="provider-editor__unit">Base URL</span></span>
+                <input className="input mono" name="provider-base-url" autoComplete={NO_AUTOFILL} {...CREDENTIAL_FIELD_EXTRA} value={form.base_url}
+                  onChange={(event) => updateProviderForm({ base_url: event.target.value })} placeholder="https://api.example.com/v1" />
+              </label>
+              <div className="field">
+                <label className="field__label" htmlFor="provider-credential">API Key</label>
+                <CredentialInput id="provider-credential" name="provider-api-key" value={form.api_key}
+                  onChange={(event) => updateProviderForm({ api_key: event.target.value })}
+                  placeholder={editingProviderId ? '已存凭据留空保留，填入新 Key 可替换' : '粘贴 API Key'} />
+              </div>
+            </div>
+          </section>
+          <section className="provider-editor__section" aria-labelledby="provider-models-title">
+            <div className="provider-editor__section-header">
+              <div><h3 id="provider-models-title">模型配置 <span className="provider-editor__count">{form.models.length}</span></h3><p>可配置多个模型；额度留空时使用服务默认值。</p></div>
+              <div className="btn-row">
+                <button className="btn btn--sm" type="button" disabled={providerPulling} onClick={() => void pullModels()}>{providerPulling ? '拉取中…' : '拉取模型列表'}</button>
+                <button className="btn btn--sm btn--primary" type="button" onClick={addModelRow}>＋ 添加模型</button>
+              </div>
+            </div>
+            {form.models.length ? <div className="provider-editor__models">
+              {form.models.map((model, index) => (
+                <article className="provider-model-card" key={`model-${index}`} aria-label={`模型 ${index + 1}`}>
+                  <div className="provider-model-card__header">
+                    <span className="provider-model-card__number">{String(index + 1).padStart(2, '0')}</span>
+                    <strong title={model.id || undefined}>{model.id || '新模型'}</strong>
+                    <button className="btn btn--ghost btn--sm provider-model-card__remove" type="button" aria-label={`删除模型 ${index + 1}`} onClick={() => removeModelRow(index)}>删除</button>
                   </div>
-                ))}
+                  <div className="provider-model-card__grid">
+                    <label className="field">
+                      <span className="field__label">模型 ID</span>
+                      <input className="input mono" autoComplete={NO_AUTOFILL} value={model.id} onChange={(event) => updateModelRow(index, { id: event.target.value })} placeholder="例如 deepseek-chat" />
+                    </label>
+                    <label className="field">
+                      <span className="field__label">显示名称 <span className="provider-editor__unit">可选</span></span>
+                      <input className="input" autoComplete={NO_AUTOFILL} value={model.name} onChange={(event) => updateModelRow(index, { name: event.target.value })} placeholder="默认显示模型 ID" />
+                    </label>
+                    {renderTokenField(index, 'context_window', '上下文窗口', CONTEXT_WINDOW_PRESETS)}
+                    {renderTokenField(index, 'max_tokens', '最大输出', MAX_TOKENS_PRESETS)}
+                  </div>
+                </article>
+              ))}
+            </div> : <div className="provider-editor__empty"><strong>添加你的第一个模型</strong><p>手动填写模型 ID，或从供应商拉取后批量添加。</p><button className="btn btn--sm" type="button" onClick={addModelRow}>添加模型</button></div>}
+            {modelOptions.length ? <div className="provider-editor__pulled">
+              <div className="provider-editor__section-header">
+                <div><h3>发现 {modelOptions.length} 个模型</h3><p>勾选需要的模型，添加到上方配置。</p></div>
+                <div className="btn-row">
+                  <button className="btn btn--sm" type="button" disabled={!availableModels.length} onClick={() => setPulledSelection(pulledSelection.length === availableModels.length ? [] : availableModels)}>{availableModels.length && pulledSelection.length === availableModels.length ? '取消全选' : '全选'}</button>
+                  <button className="btn btn--sm btn--primary" type="button" disabled={!pulledSelection.length} onClick={appendPulledModels}>添加所选模型</button>
+                </div>
               </div>
-            ) : (
-              <p className="muted">
-                尚未添加模型。可点「添加模型」手填，或先「拉取模型列表」勾选后批量添加。
-              </p>
-            )}
-          </div>
-          {modelOptions.length ? (
-            <div className="stack stack--tight">
-              <div className="row" style={{ alignItems: 'baseline' }}>
-                <span className="field__label">拉取到的模型（勾选后批量添加）</span>
-                <button
-                  className="btn btn--sm"
-                  type="button"
-                  style={{ marginLeft: 'auto' }}
-                  onClick={() =>
-                    setPulledSelection(
-                      pulledSelection.length === modelOptions.length ? [] : [...modelOptions],
-                    )
-                  }
-                >
-                  {pulledSelection.length === modelOptions.length ? '取消全选' : '全选'}
-                </button>
-                <button className="btn btn--sm btn--primary" type="button" onClick={appendPulledModels}>
-                  添加所选模型
-                </button>
-              </div>
-              <div className="chips">
+              <div className="provider-editor__pulled-options">
                 {modelOptions.map((id) => {
                   const added = form.models.some((model) => model.id === id)
                   const on = added || pulledSelection.includes(id)
-                  return (
-                    <label className="checkbox" key={id}>
-                      <input
-                        type="checkbox"
-                        checked={on}
-                        disabled={added}
-                        onChange={() =>
-                          setPulledSelection(
-                            pulledSelection.includes(id)
-                              ? pulledSelection.filter((item) => item !== id)
-                              : [...pulledSelection, id],
-                          )
-                        }
-                      />
-                      {added ? `${id}（已添加）` : id}
-                    </label>
-                  )
+                  return <label className="checkbox" key={id}><input type="checkbox" checked={on} disabled={added} onChange={() => setPulledSelection(pulledSelection.includes(id) ? pulledSelection.filter((item) => item !== id) : [...pulledSelection, id])} />{id}{added ? <span className="field__hint">已添加</span> : null}</label>
                 })}
               </div>
-            </div>
-          ) : null}
-          <div className="stack stack--tight">
-            <span className="field__label">能力标签</span>
-            <div className="chips">
-              {capabilityTags.map((tag) => {
-                const on = form.capabilities.includes(tag)
-                return (
-                  <button
-                    key={tag}
-                    type="button"
-                    className={on ? 'tag tag--primary' : 'tag'}
-                    aria-pressed={on}
-                    onClick={() =>
-                      updateProviderForm({
-                        capabilities: on
-                          ? form.capabilities.filter((item) => item !== tag)
-                          : [...form.capabilities, tag],
-                      })
-                    }
-                  >
-                    {tag}
-                  </button>
-                )
-              })}
-            </div>
+            </div> : null}
+          </section>
+          <div className="provider-editor__options">
+            <details>
+              <summary>能力标签 <span className="provider-editor__unit">{form.capabilities.length ? `已选 ${form.capabilities.length} 项` : '可选'}</span></summary>
+              <div className="chips">
+                {capabilityTags.map((tag) => {
+                  const on = form.capabilities.includes(tag)
+                  return <button key={tag} type="button" className={on ? 'tag tag--primary' : 'tag'} aria-pressed={on}
+                    onClick={() => updateProviderForm({ capabilities: on ? form.capabilities.filter((item) => item !== tag) : [...form.capabilities, tag] })}>{tag}</button>
+                })}
+              </div>
+            </details>
+            <label className="checkbox"><input type="checkbox" checked={form.enabled} onChange={(event) => updateProviderForm({ enabled: event.target.checked })} />保存后启用供应商</label>
           </div>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={form.enabled}
-              onChange={(event) => updateProviderForm({ enabled: event.target.checked })}
-            />
-            保存后立即启用（建议先通过健康检查）
-          </label>
-        </div>
+        </fieldset>
       </Modal>
     )
   }
@@ -1707,10 +1727,9 @@ export default function SettingsPage() {
                         className={
                           provider.health === 'ok'
                             ? 'tag tag--ok'
-                            : provider.health
-                              ? 'tag tag--warn'
-                              : 'tag'
+                            : 'tag tag--warn'
                         }
+                        title={provider.health === 'ok' ? undefined : '尚未通过健康检查，建议先做健康检查再启用'}
                       >
                         {provider.health || '未检查'}
                       </span>
@@ -2135,12 +2154,30 @@ export default function SettingsPage() {
 
   function renderChat() {
     if (!settings) return <p className="muted">设置加载中…</p>
-    const chat = settings.chat || { permission_mode: 'auto', discussion_only: false }
+    const chat = (settings.chat || { permission_mode: 'auto', discussion_only: false }) as ChatPrefs
     return <div className="panel"><div className="panel__header"><h3 className="panel__title">新对话默认设置</h3></div><div className="panel__body stack">
       <p className="muted">应用于以后创建的对话。已有对话保留自己的设置，也可以在对话面板中单独修改。</p>
       <fieldset className="chat__default-permissions"><legend>文件操作权限</legend>{CHAT_PERMISSION_OPTIONS.map((option) => <label className={`chat__option${chat.permission_mode === option.value ? ' is-selected' : ''}`} key={option.value}><input type="radio" name="default-chat-permission" checked={chat.permission_mode === option.value} onChange={() => saveSettings({ chat: { permission_mode: option.value } })} /><span><strong>{option.label}</strong><small>{option.description}</small></span></label>)}</fieldset>
       <label className="checkbox"><input type="checkbox" checked={chat.discussion_only} onChange={(event) => saveSettings({ chat: { discussion_only: event.target.checked } })} />默认仅讨论，不修改文件</label>
       <p className="muted">仅讨论开关优先于文件操作权限；关闭后继续使用所选权限。完全访问的范围始终限定在本书项目内。</p>
+      <label className="field" style={{ maxWidth: '26rem' }}>
+        <span className="field__label">意图判定（LLM）</span>
+        <select className="select" value={chat.intent_llm === false ? 'off' : 'on'} onChange={(event) => saveSettings({ chat: { intent_llm: event.target.value === 'on' } })}>
+          <option value="on">开启</option>
+          <option value="off">关闭</option>
+        </select>
+        <span className="field__hint">关闭后只用关键词快路径，不再调用模型做意图判定（更省钱、更快，复杂请求的归属可能不准）。</span>
+      </label>
+      <label className="field" style={{ maxWidth: '26rem' }}>
+        <span className="field__label">写域严格度</span>
+        <select className="select" value={chat.scope_strictness === 'reject' ? 'reject' : 'ask'} onChange={(event) => saveSettings({ chat: { scope_strictness: event.target.value === 'reject' ? 'reject' : 'ask' } })}>
+          <option value="ask">范围外需批准</option>
+          <option value="reject">范围外一律拒绝</option>
+        </select>
+        <span className="field__hint">本轮任务有明确产出材料时，改其他材料属于越界：默认需你在对话里批准；选「一律拒绝」则直接拒绝。</span>
+      </label>
+      <label className="checkbox"><input type="checkbox" checked={chat.scope_limit_full === true} onChange={(event) => saveSettings({ chat: { scope_limit_full: event.target.checked } })} />完全访问也受写域限制</label>
+      <p className="muted">默认关闭：「完全访问」档放行越界写入但会留痕；开启后完全访问档的越界写也要先批准。</p>
     </div></div>
   }
 
@@ -2148,12 +2185,17 @@ export default function SettingsPage() {
     if (!settings) return <p className="muted">设置加载中…</p>
     const milestone = settings.milestone
     const editor = settings.editor
+    const writing = settings.writing
+    const wordMin = writing?.chapter_min_words ?? 2000
+    const wordMax = writing?.chapter_max_words ?? 4000
+    const autoDeslop = writing?.auto_deslop ?? { enabled: true, max_rounds: 2 }
     return (
-      <div className="panel">
-        <div className="panel__header">
-          <h3 className="panel__title">编辑器偏好</h3>
-        </div>
-        <div className="panel__body stack">
+      <div className="stack">
+        <div className="panel">
+          <div className="panel__header">
+            <h3 className="panel__title">编辑器偏好</h3>
+          </div>
+          <div className="panel__body stack">
           <label className="checkbox">
             <input
               type="checkbox"
@@ -2207,6 +2249,71 @@ export default function SettingsPage() {
             />
             在正文中内联显示里程碑标记
           </label>
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel__header">
+            <h3 className="panel__title">每章字数区间与去 AI 味</h3>
+          </div>
+          <div className="panel__body stack">
+            <div className="row">
+              <label className="field" style={{ flex: '0 1 10rem' }}>
+                <span className="field__label">每章下限（汉字）</span>
+                <input
+                  className="input"
+                  type="number"
+                  min={1}
+                  max={50000}
+                  value={wordMin}
+                  onChange={(event) =>
+                    saveSettings({ writing: { chapter_min_words: Number(event.target.value) || 0 } })
+                  }
+                />
+              </label>
+              <label className="field" style={{ flex: '0 1 10rem' }}>
+                <span className="field__label">每章上限（汉字）</span>
+                <input
+                  className="input"
+                  type="number"
+                  min={1}
+                  max={50000}
+                  value={wordMax}
+                  onChange={(event) =>
+                    saveSettings({ writing: { chapter_max_words: Number(event.target.value) || 0 } })
+                  }
+                />
+              </label>
+            </div>
+            <span className="field__hint">
+              全局默认区间（默认 2000-4000）。低于下限会被字数门拒收，高于上限只告警；单本书可在「项目设置」中覆盖。
+            </span>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={autoDeslop.enabled}
+                onChange={(event) =>
+                  saveSettings({ writing: { auto_deslop: { enabled: event.target.checked } } })
+                }
+              />
+              章节落盘前自动去味（未过去 AI 味门禁时按 human-linguistics 重写）
+            </label>
+            <label className="field" style={{ maxWidth: '20rem' }}>
+              <span className="field__label">最多重写轮数（1-3）</span>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={3}
+                value={autoDeslop.max_rounds}
+                onChange={(event) => {
+                  const rounds = Math.max(1, Math.min(3, Number(event.target.value) || 2))
+                  saveSettings({ writing: { auto_deslop: { max_rounds: rounds } } })
+                }}
+              />
+              <span className="field__hint">重写仍不过门禁则拒绝落盘并给出定位清单。</span>
+            </label>
+          </div>
         </div>
       </div>
     )
@@ -2310,12 +2417,13 @@ export default function SettingsPage() {
                 {usage.by_day.length ? (
                   <div className="bar-chart">
                     {usage.by_day.map((row) => (
-                      <div className="bar" key={row.day}>
-                        <div
-                          className="bar__fill"
-                          style={{ height: `${Math.round((row.tokens / maxTokens) * 100)}%` }}
-                          title={`${row.day}：${row.tokens} tokens`}
-                        />
+                      <div className="bar" key={row.day} title={`${row.day}：${row.tokens} tokens`}>
+                        <div className="bar__track">
+                          <div
+                            className="bar__fill"
+                            style={{ height: `${Math.round((row.tokens / maxTokens) * 100)}%` }}
+                          />
+                        </div>
                         <span className="bar__label">{row.day.slice(5)}</span>
                       </div>
                     ))}
@@ -2334,15 +2442,14 @@ export default function SettingsPage() {
   // ─────────────────────────── 技能分区 ───────────────────────────
 
   function renderSkills() {
-    const overBudget = skillBudget > 0 && skillTotalBytes > skillBudget
     return (
       <div className="stack">
         <div className="panel">
           <div className="panel__header">
-            <h3 className="panel__title">技能同步与预算</h3>
+            <h3 className="panel__title">技能同步与用量</h3>
             <div className="btn-row">
-              <span className={overBudget ? 'tag tag--danger' : 'tag tag--ok'}>
-                {skillTotalBytes}B / {skillBudget}B
+              <span className="tag">
+                正文合计约 {skillEstimatedTokens.toLocaleString()} token
               </span>
               <button className="btn btn--sm" type="button" onClick={() => void loadSkills()}>
                 刷新
@@ -2354,16 +2461,11 @@ export default function SettingsPage() {
           </div>
           <div className="panel__body stack">
             <p className="field__hint">
-              技能体积超过预算会影响效果，请精简正文。
+              命中技能正文完整加载；引用文件按需读取。这里显示正文的 token 估算值，不包含尚未读取的引用文件。
             </p>
-            {overBudget ? (
-              <p className="field__hint">
-                当前合计 {skillTotalBytes}B，已超过预算 {skillBudget}B，同步时后端会给出体积告警。
-              </p>
-            ) : null}
             {syncResult ? (
               <div className="mono" style={{ whiteSpace: 'pre-wrap' }}>
-                {`已同步 ${syncResult.count ?? 0} 个技能，合计 ${syncResult.total_bytes ?? 0}B`}
+                {`已同步 ${syncResult.count ?? 0} 个技能：正文合计约 ${(syncResult.estimated_tokens ?? 0).toLocaleString()} token（估算值）`}
                 {syncResult.target_root ? `\n目标目录：${syncResult.target_root}` : ''}
                 {(syncResult.warnings ?? []).length
                   ? `\n告警：\n- ${(syncResult.warnings ?? []).join('\n- ')}`
@@ -2395,33 +2497,19 @@ export default function SettingsPage() {
             {skills.length === 0 ? (
               <p className="muted">尚未发现技能（skills/&lt;name&gt;/SKILL.md）。</p>
             ) : (
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>名称</th>
-                    <th>描述</th>
-                    <th>来源</th>
-                    <th>体积</th>
-                    <th>同步</th>
-                    <th>启停</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {skills.map((skill) => (
-                    <tr key={skill.name}>
-                      <td className="mono">{skill.name}</td>
-                      <td>{skill.error ? <span className="tag tag--danger">{skill.error}</span> : skill.description}</td>
-                      <td>
+              <div className="skill-list">
+                {skills.map((skill) => (
+                  <div className="skill-card" key={skill.name}>
+                    <div className="skill-card__head">
+                      <div className="skill-card__title">
+                        <span className="skill-card__name mono">{skill.name}</span>
                         <span className="tag">{SOURCE_LABEL[skill.source] ?? skill.source}</span>
-                      </td>
-                      <td className="mono">{skill.size_bytes}B</td>
-                      <td>
                         <span className={skill.synced ? 'tag tag--ok' : 'tag tag--warn'}>
                           {skill.synced ? '已同步' : '未同步'}
                         </span>
-                      </td>
-                      <td>
+                        {skill.error ? <span className="tag tag--danger">{skill.error}</span> : null}
+                      </div>
+                      <div className="btn-row">
                         <button
                           className="btn btn--sm"
                           type="button"
@@ -2430,26 +2518,94 @@ export default function SettingsPage() {
                         >
                           {skill.enabled ? '停用' : '启用'}
                         </button>
-                      </td>
-                      <td>
-                        <div className="btn-row">
-                          <button className="btn btn--sm" type="button" onClick={() => void openSkillEditor(skill.name)}>
-                            查看 / 编辑
-                          </button>
-                          <button
-                            className="btn btn--sm btn--danger"
-                            type="button"
-                            onClick={() => void removeSkill(skill.name)}
-                          >
-                            删除
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                        <button
+                          className="btn btn--sm"
+                          type="button"
+                          onClick={() => void openSkillEditor(skill.name)}
+                        >
+                          查看 / 编辑
+                        </button>
+                        <button
+                          className="btn btn--sm btn--danger"
+                          type="button"
+                          onClick={() => void removeSkill(skill.name)}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+
+                    {skill.error ? null : <p className="skill-card__desc">{skill.description}</p>}
+
+                    <div className="skill-card__meta">
+                      <span className="muted mono">正文约 {(skill.estimated_tokens ?? 0).toLocaleString()} token</span>
+                      <span className="muted mono">
+                        引用 {(skill.reference_files ?? []).length} 个 · 约 {(skill.references_estimated_tokens ?? 0).toLocaleString()} token（按需读取）
+                      </span>
+                      {(skill.agents ?? []).length ? (
+                        <span className="tag tag--ok">已绑定：{(skill.agents ?? []).join('、')}</span>
+                      ) : (skill.suggested_agents ?? []).length ? (
+                        <span className="tag tag--warn">
+                          未绑定，建议绑定到 {(skill.suggested_agents ?? []).join('、')}
+                        </span>
+                      ) : (
+                        <span className="tag">未绑定</span>
+                      )}
+                    </div>
+
+                    {(skill.missing_references ?? []).length ? (
+                      <div className="tag tag--warn">
+                        产物缺引用文件：{(skill.missing_references ?? []).join('、')}（请点「同步到 .dsh/skills」）
+                      </div>
+                    ) : null}
+                    {(skill.reference_files ?? []).length ? (
+                      <details>
+                        <summary className="muted">引用文件（按需完整读取）</summary>
+                        <ul>
+                          {(skill.reference_files ?? []).map((path) => <li className="mono" key={path}>{path}</li>)}
+                        </ul>
+                      </details>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
             )}
+          </div>
+        </div>
+      <div className="panel">
+          <div className="panel__header">
+            <h3 className="panel__title">必注入技能</h3>
+          </div>
+          <div className="panel__body stack">
+            <p className="field__hint">
+              勾选的技能会优先、完整地注入对话系统提示（写作轮次兜底注入）。技能须存在且已启用，不存在时注入环节自动跳过。
+            </p>
+            {skills.length === 0 ? (
+              <p className="muted">尚未发现技能，请先在上方新建或导入并同步。</p>
+            ) : (
+              <div className="stack">
+                {skills.map((skill) => (
+                  <label className="checkbox" key={skill.name}>
+                    <input
+                      type="checkbox"
+                      checked={(settings?.writing?.always_inject_skills ?? []).includes(skill.name)}
+                      onChange={(event) => toggleAlwaysInject(skill.name, event.target.checked)}
+                    />
+                    <span className="mono">{skill.name}</span>
+                    {skill.enabled ? '' : '（已停用，注入时跳过）'}
+                  </label>
+                ))}
+              </div>
+            )}
+            {(() => {
+              const known = new Set(skills.map((skill) => skill.name))
+              const missing = (settings?.writing?.always_inject_skills ?? []).filter((name) => !known.has(name))
+              return missing.length ? (
+                <p className="field__hint">
+                  以下必注入技能当前不存在，注入时会被跳过：{missing.join('、')}
+                </p>
+              ) : null
+            })()}
           </div>
         </div>
       </div>
@@ -2474,6 +2630,9 @@ export default function SettingsPage() {
             <>
               <p className="field__hint">
                 整篇编辑 SKILL.md（含 frontmatter）；frontmatter 的 name 必须与目录名一致，description 不能为空。
+              </p>
+              <p className="field__hint">
+                已保存正文约 {(skills.find((skill) => skill.name === skillModal.name)?.estimated_tokens ?? 0).toLocaleString()} token（估算值）；保存后更新用量。
               </p>
               <textarea
                 autoComplete={NO_AUTOFILL}
@@ -2686,8 +2845,8 @@ export default function SettingsPage() {
                         className="btn btn--sm"
                         type="button"
                         onClick={() => {
-                          setDuplicateName('')
-                          setAgentModal({ mode: 'duplicate', name: agent.name })
+                          setDuplicateName(`${agent.name}-copy`)
+                          setAgentInline({ name: agent.name, mode: 'duplicate' })
                         }}
                       >
                         复制
@@ -2698,7 +2857,7 @@ export default function SettingsPage() {
                         onClick={() => {
                           setModelBinding({ provider_id: agent.provider_id, model_id: agent.model_id })
                           setModelCustom(false)
-                          setAgentModal({ mode: 'model', name: agent.name })
+                          setAgentInline({ name: agent.name, mode: 'model' })
                         }}
                       >
                         配置模型
@@ -2721,6 +2880,76 @@ export default function SettingsPage() {
                         删除
                       </button>
                     </div>
+                    {agentInline?.name === agent.name ? (
+                      <div className="panel">
+                        <div className="panel__body panel__body--tight stack stack--tight">
+                          {agentInline.mode === 'duplicate' ? (
+                            <>
+                              <p className="field__hint">复制会带上原 Agent 的技能、工具与模型绑定；复制件是可修改的自定义 Agent。</p>
+                              <label className="field">
+                                <span className="field__label">副本名称（kebab-case）</span>
+                                <input
+                                  autoComplete={NO_AUTOFILL}
+                                  className="input"
+                                  value={duplicateName}
+                                  onChange={(event) => setDuplicateName(event.target.value)}
+                                />
+                              </label>
+                              <div className="btn-row">
+                                <button className="btn btn--primary btn--sm" type="button" onClick={() => void runDuplicateAgent(agent.name)}>
+                                  复制
+                                </button>
+                                <button className="btn btn--ghost btn--sm" type="button" onClick={() => setAgentInline(null)}>
+                                  取消
+                                </button>
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <p className="field__hint">留空则沿用全局默认模型。</p>
+                              <label className="field">
+                                <span className="field__label">供应商</span>
+                                <select
+                                  className="select"
+                                  value={modelBinding.provider_id}
+                                  onChange={(event) => {
+                                    const providerId = event.target.value
+                                    setModelBinding({
+                                      provider_id: providerId,
+                                      model_id: providerModels(providers, providerId)[0]?.id ?? '',
+                                    })
+                                    setModelCustom(false)
+                                  }}
+                                >
+                                  <option value="">跟随全局默认</option>
+                                  {providers.map((provider) => (
+                                    <option key={provider.provider_id} value={provider.provider_id}>
+                                      {provider.display_name || provider.provider_id}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              <ModelPicker
+                                providers={providers}
+                                providerId={modelBinding.provider_id}
+                                value={modelBinding.model_id}
+                                custom={modelCustom}
+                                onCustom={setModelCustom}
+                                onPick={(modelId) => setModelBinding({ ...modelBinding, model_id: modelId })}
+                              />
+                              <div className="btn-row">
+                                <button className="btn btn--primary btn--sm" type="button" onClick={() => void runSetAgentModel(agent.name)}>
+                                  保存绑定
+                                </button>
+                                <button className="btn btn--ghost btn--sm" type="button" onClick={() => setAgentInline(null)}>
+                                  取消
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 ))}
               </div>
@@ -2740,11 +2969,7 @@ export default function SettingsPage() {
         ? editing
           ? `编辑 Agent：${agentModal.name ?? ''}`
           : '新建 Agent'
-        : mode === 'duplicate'
-          ? `复制 Agent：${agentModal.name ?? ''}`
-          : mode === 'model'
-            ? `配置模型：${agentModal.name ?? ''}`
-            : 'AI 辅助创建 Agent'
+        : 'AI 辅助创建 Agent'
     return (
       <Modal title={title} open onClose={() => setAgentModal(null)}>
         <div className="stack">
@@ -2793,6 +3018,7 @@ export default function SettingsPage() {
               </label>
               <div className="stack stack--tight">
                 <span className="field__label">绑定技能</span>
+                <ResourceState {...skillsResource} hasData={skillsResource.loaded} onRetry={() => void loadSkills()}>
                 <div className="chips">
                   {skills.length === 0 ? (
                     <span className="muted">暂无可绑定技能（请先在「技能」分区创建）。</span>
@@ -2820,6 +3046,7 @@ export default function SettingsPage() {
                     })
                   )}
                 </div>
+                </ResourceState>
               </div>
               <div className="stack stack--tight">
                 <span className="field__label">工具（白名单内）</span>
@@ -2847,11 +3074,64 @@ export default function SettingsPage() {
                   })}
                 </div>
               </div>
+              <div className="stack stack--tight">
+                <span className="field__label">主责材料（可多选，路由据此判定写域）</span>
+                <div className="chips">
+                  {materialDirs.map((material) => {
+                    const on = agentForm.materials.includes(material)
+                    return (
+                      <button
+                        key={material}
+                        type="button"
+                        className={on ? 'tag tag--primary' : 'tag'}
+                        aria-pressed={on}
+                        onClick={() =>
+                          setAgentForm({
+                            ...agentForm,
+                            materials: on
+                              ? agentForm.materials.filter((item) => item !== material)
+                              : [...agentForm.materials, material],
+                          })
+                        }
+                      >
+                        {material}
+                      </button>
+                    )
+                  })}
+                </div>
+                <span className="field__hint">
+                  一个都不选表示「不写书稿或未声明」。
+                </span>
+              </div>
+              <label className="field">
+                <span className="field__label">边界声明（不做什么，一行）</span>
+                <input
+                  autoComplete={NO_AUTOFILL}
+                  className="input"
+                  value={agentForm.boundaries}
+                  onChange={(event) => setAgentForm({ ...agentForm, boundaries: event.target.value })}
+                  placeholder="例如：只维护 设定/，不写大纲与正文。"
+                />
+              </label>
+              {agentForm.capabilities.length ? (
+                <div className="stack stack--tight">
+                  <span className="field__label">能力声明（只读：会被什么词触发、绑定哪个技能）</span>
+                  {agentForm.capabilities.map((capability, index) => (
+                    <div className="muted mono" key={`${capability.intent ?? 'cap'}-${index}`}>
+                      {capability.intent ?? '（未命名意图）'}｜触发词：
+                      {(capability.triggers ?? []).join('、') || '—'}｜技能：
+                      {capability.skill || '—'}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <ResourceState {...providersResource} hasData={providersResource.loaded} onRetry={() => void loadProviders()}>
               <div className="row">
                 <label className="field" style={{ flex: '1 1 12rem' }}>
                   <span className="field__label">供应商（可留空）</span>
                   <select
                     className="select"
+                    aria-label="Agent 模型供应商"
                     value={agentForm.provider_id}
                     onChange={(event) => {
                       const providerId = event.target.value
@@ -2880,76 +3160,10 @@ export default function SettingsPage() {
                   onPick={(modelId) => setAgentForm({ ...agentForm, model_id: modelId })}
                 />
               </div>
+              </ResourceState>
               <div className="btn-row">
                 <button className="btn btn--primary" type="button" onClick={() => void saveAgentForm()}>
                   保存
-                </button>
-                <button className="btn" type="button" onClick={() => setAgentModal(null)}>
-                  取消
-                </button>
-              </div>
-            </>
-          ) : null}
-
-          {mode === 'duplicate' ? (
-            <>
-              <p className="field__hint">复制会带上原 Agent 的技能、工具与模型绑定；复制件是可修改的自定义 Agent。</p>
-              <label className="field">
-                <span className="field__label">副本名称（kebab-case）</span>
-                <input
-                  autoComplete={NO_AUTOFILL}
-                  className="input"
-                  value={duplicateName}
-                  onChange={(event) => setDuplicateName(event.target.value)}
-                />
-              </label>
-              <div className="btn-row">
-                <button className="btn btn--primary" type="button" onClick={() => void runDuplicateAgent()}>
-                  复制
-                </button>
-                <button className="btn" type="button" onClick={() => setAgentModal(null)}>
-                  取消
-                </button>
-              </div>
-            </>
-          ) : null}
-
-          {mode === 'model' ? (
-            <>
-              <p className="field__hint">留空则沿用全局默认模型。</p>
-              <label className="field">
-                <span className="field__label">供应商</span>
-                <select
-                  className="select"
-                  value={modelBinding.provider_id}
-                  onChange={(event) => {
-                    const providerId = event.target.value
-                    setModelBinding({
-                      provider_id: providerId,
-                      model_id: providerModels(providers, providerId)[0]?.id ?? '',
-                    })
-                    setModelCustom(false)
-                  }}
-                >
-                  <option value="">跟随全局默认</option>
-                  {providers.map((provider) => (
-                    <option key={provider.provider_id} value={provider.provider_id}>
-                      {provider.display_name || provider.provider_id}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <ModelPicker
-                providers={providers}
-                providerId={modelBinding.provider_id}
-                value={modelBinding.model_id}
-                custom={modelCustom}
-                onCustom={setModelCustom}
-                onPick={(modelId) => setModelBinding({ ...modelBinding, model_id: modelId })}
-              />
-              <div className="btn-row">
-                <button className="btn btn--primary" type="button" onClick={() => void runSetAgentModel()}>
-                  保存绑定
                 </button>
                 <button className="btn" type="button" onClick={() => setAgentModal(null)}>
                   取消
@@ -3532,7 +3746,7 @@ export default function SettingsPage() {
   // ─────────────────────────── 渲染 ───────────────────────────
 
   return (
-    <div className="page">
+    <WorkspacePage>
       <header className="page-header">
         <div>
           <h1 className="page-header__title">设置</h1>
@@ -3547,39 +3761,38 @@ export default function SettingsPage() {
         </div>
       </header>
 
-      <nav className="tabs" aria-label="设置分区">
-        {SECTIONS.map((item) => (
-          <button
-            key={item.key}
-            type="button"
-            className={item.key === active ? 'tab is-active' : 'tab'}
-            aria-pressed={item.key === active}
-            onClick={() => setActive(item.key)}
-          >
-            {item.label}
-          </button>
-        ))}
+      <div className="workspace-settings-layout">
+      <nav className="workspace-settings-nav" aria-label="设置分区">
+        {[{label:'模型与运行', keys:['providers','engines','budget']}, {label:'写作体验', keys:['appearance','editor','chat']}, {label:'创作资产', keys:['templates','skills','agents','rules']}, {label:'检索与系统', keys:['vector','about']}].map(group => <div key={group.label}><h2>{group.label}</h2>{SECTIONS.filter(item => group.keys.includes(item.key)).map(item => <button key={item.key} type="button" className={item.key === active ? 'is-active' : ''} aria-current={item.key === active ? 'page' : undefined} onClick={() => setActive(item.key)}>{item.label}</button>)}</div>)}
       </nav>
-
+      <div className="workspace-settings-body">
+      <ResourceState {...({providers:providersResource, engines:enginesResource, budget:budgetResource, skills:skillsResource, agents:agentsResource, rules:rulesResource, vector:vectorResource, about:aboutResource}[active as 'providers'] ?? {loading: settingsLoading, error: settingsError, loaded: !!settings})} hasData={active === 'templates' || ({providers:providersResource, engines:enginesResource, budget:budgetResource, skills:skillsResource, agents:agentsResource, rules:rulesResource, vector:vectorResource, about:aboutResource}[active as 'providers']?.loaded ?? !!settings)} onRetry={handleReload}>
       <div className="stack" style={{ marginTop: 'var(--space-4)' }}>
         {active === 'providers' ? renderProviders() : null}
         {active === 'engines' ? renderEngines() : null}
         {active === 'appearance' ? renderAppearance() : null}
         {active === 'editor' ? renderEditor() : null}
         {active === 'chat' ? renderChat() : null}
+        {active === 'templates' ? <TemplateManager /> : null}
         {active === 'budget' ? renderBudget() : null}
         {active === 'skills' ? renderSkills() : null}
-        {active === 'agents' ? renderAgents() : null}
+        {active === 'agents' ? <>
+          {(skillsResource.loading || skillsResource.error) ? <section aria-label="Agent 可选技能读取状态"><h3 className="panel__title">可选技能</h3><ResourceState {...skillsResource} hasData={skillsResource.loaded} onRetry={() => void loadSkills()} /></section> : null}
+          {(providersResource.loading || providersResource.error) ? <section aria-label="Agent 模型供应商读取状态"><h3 className="panel__title">可选模型供应商</h3><ResourceState {...providersResource} hasData={providersResource.loaded} onRetry={() => void loadProviders()} /></section> : null}
+          {renderAgents()}
+        </> : null}
         {active === 'rules' ? renderRules() : null}
         {active === 'vector' ? renderVector() : null}
         {active === 'about' ? renderAbout() : null}
       </div>
+
+      </ResourceState></div></div>
 
       {renderProviderModal()}
       {renderSkillModal()}
       {renderAgentModal()}
 
       {confirmNode}
-    </div>
+    </WorkspacePage>
   )
 }

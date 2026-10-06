@@ -184,3 +184,206 @@ def test_skill_digest_skips_missing_and_disabled(workspace: SimpleNamespace) -> 
     assert skill_service.skill_digest(["novel-review"]) == ""
 
 
+def _write_skill(workspace: SimpleNamespace, name: str, body: str) -> str:
+    directory = workspace.skills / name
+    directory.mkdir()
+    (directory / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {name} 说明\n---\n\n{body}\n", encoding="utf-8")
+    return body
+
+
+def test_skill_digest_prioritizes_always_inject(workspace: SimpleNamespace) -> None:
+    """优先技能完整加载；旧预算参数不再裁剪其余技能或技能尾部。"""
+    from workbench.backend.services import skill_service
+    from workbench.backend.engine.runtime import estimate_tokens
+
+    body = _write_skill(workspace, "human-linguistics", "去AI味正文" * 20)
+    _write_skill(workspace, "novel-setting", "设定正文" * 40)
+    must_block = f"### 技能 human-linguistics（human-linguistics 说明）\n{body}"
+
+    digest = skill_service.skill_digest(["novel-setting", "human-linguistics"],
+                                        budget_chars=len(must_block) + 5,
+                                        priority_names=["human-linguistics"])
+    assert must_block in digest                       # 必注入技能正文完整出现
+    assert "超预算" not in digest
+    assert "设定正文" * 40 in digest
+    assert digest.index("### 技能 human-linguistics") < digest.index("### 技能 novel-setting")
+
+    # 不做优先级时保持原顺序，所有正文仍完整保留。
+    plain = skill_service.skill_digest(["novel-setting", "human-linguistics"],
+                                       budget_chars=len(must_block) + 5)
+    assert body in plain
+    assert plain.index("### 技能 novel-setting") < plain.index("### 技能 human-linguistics")
+
+    # 即使兼容调用显式传入极小预算，也完整保留。
+    cramped = skill_service.skill_digest(["human-linguistics"], budget_chars=20,
+                                         priority_names=["human-linguistics"])
+    assert cramped.startswith("### 技能")
+    assert body in cramped and "截断" not in cramped
+    compiled = skill_service.compile_skills(["novel-setting", "human-linguistics", "novel-setting"],
+                                            priority_names=["human-linguistics"])
+    assert [item["name"] for item in compiled["skills"]] == ["human-linguistics", "novel-setting"]
+    assert compiled["skills"][0]["estimated_tokens"] == estimate_tokens(must_block)
+    assert compiled["estimated_tokens"] == estimate_tokens(digest)
+
+
+def test_skill_reference_remains_complete_in_both_tool_paths(workspace: SimpleNamespace) -> None:
+    from workbench.backend.engine.runtime import estimate_tokens
+    from workbench.backend.services import skill_service, chat_workspace_tools
+
+    refs = workspace.skills / "novel-review" / "references"
+    refs.mkdir()
+    content = "正文条目。\n" * 6000 + "引用尾部验证。"
+    (refs / "long.md").write_text(content, encoding="utf-8")
+    reference = skill_service.read_reference("novel-review", "long.md")
+    assert reference["content"] == content
+    assert reference["truncated"] is False
+    assert reference["estimated_tokens"] == estimate_tokens(content)
+    args = {"skill": "novel-review", "path": "references/long.md"}
+    legacy = chat_tools.tool_read_skill_reference(args, ToolContext(project_id=1, session_id=1))
+    assert legacy["text"] == content and legacy["estimated_tokens"] == estimate_tokens(content)
+    native = chat_workspace_tools._read_skill_reference(args)
+    assert native["data"]["content"] == content
+    assert "截断" not in native["summary"]
+    assert json.dumps(native, ensure_ascii=False).count("引用尾部验证。") == 1
+
+
+def test_skill_compilation_reports_unavailable_without_false_loading(workspace: SimpleNamespace) -> None:
+    from workbench.backend.services import skill_service
+
+    invalid = workspace.skills / "invalid-skill"
+    invalid.mkdir()
+    (invalid / "SKILL.md").write_text("---\nname: invalid-skill\n---\n正文", encoding="utf-8")
+    skill_service.sync_skills()
+    skill_service.set_enabled("novel-review", False)
+    compiled = skill_service.compile_skills(["invalid-skill", "missing-skill", "novel-review"])
+    assert compiled["text"] == "" and compiled["skills"] == []
+    assert compiled["estimated_tokens"] == 0
+    assert {item["name"] for item in compiled["unavailable"]} == {
+        "invalid-skill", "missing-skill", "novel-review"}
+
+
+def test_skill_compilation_only_reads_requested_bodies(workspace: SimpleNamespace, monkeypatch) -> None:
+    from workbench.backend.services import skill_service
+
+    read_paths = []
+    original = skill_service.read_text
+
+    def read_body(path):
+        read_paths.append(Path(path))
+        assert Path(path).name == "SKILL.md", "引用应在模型按需读取时加载"
+        return original(path)
+
+    monkeypatch.setattr(skill_service, "read_text", read_body)
+    compiled = skill_service.compile_skills(["novel-review", "novel-review"])
+    assert compiled["skills"][0]["name"] == "novel-review"
+    assert read_paths == [workspace.skills / "novel-review/SKILL.md"]
+
+
+def test_workspace_list_files_shows_chapter_txt(workspace: SimpleNamespace) -> None:
+    """章节改为 .txt 后仍能被对话工具列出与搜索，且不越界。"""
+    from workbench.backend.services import chat_workspace_tools
+
+    project, rel, project_dir = make_project("txt 可见书")
+    assert rel == "章节/第0001章.txt"
+    # 越界 txt（非章节目录）与隐藏文件不得出现在结果里
+    (project_dir / "设定").mkdir(parents=True, exist_ok=True)
+    (project_dir / "设定" / "杂记.txt").write_text("不应出现。", encoding="utf-8")
+    (project_dir / "章节" / ".隐藏.txt").write_text("不应出现。", encoding="utf-8")
+    ctx = {"project_id": project["id"], "session_id": 1, "run_id": "run-one",
+           "tool_call_id": "call-one", "read_hashes": {}}
+
+    listing = chat_workspace_tools.execute("list_files", {}, ctx)
+    assert listing["ok"] and rel in listing["data"]["files"]
+    assert "设定/杂记.txt" not in listing["data"]["files"]
+    assert "章节/.隐藏.txt" not in listing["data"]["files"]
+
+    found = chat_workspace_tools.execute("search_files", {"query": "码头上的风"}, ctx)
+    assert found["ok"] and any(hit["path"] == rel for hit in found["data"]["matches"])
+
+
+# ───────────────────── 工具可见性：只按 Agent 白名单与只读过滤 ─────────────────────
+
+
+def test_list_specs_filters_by_agent_tools_whitelist(workspace: SimpleNamespace) -> None:
+    from workbench.backend.services import chat_workspace_tools
+
+    reviewer = chat_workspace_tools.list_specs(agent_tools=["检索", "审稿门禁"])
+    names = {spec["name"] for spec in reviewer}
+    assert not any(spec["write"] for spec in reviewer)          # 审稿类 Agent 没有写工具
+    assert {"list_files", "read_file", "search_files", "run_gates", "check_tracking"} <= names
+    assert "ask_user_question" in names                          # 提问工具始终保留
+    assert not {"create_file", "write_file", "replace_text", "delete_file"} & names
+
+    writer = {spec["name"] for spec in
+              chat_workspace_tools.list_specs(agent_tools=["检索", "文件读写", "收件箱"])}
+    assert {"create_file", "new_chapter", "replace_text", "write_file",
+            "move_file", "delete_file"} <= writer
+    assert "ask_user_question" in writer
+    # 写工具不因「不在本轮写域内」而消失（否则模型无法发起越界申请）
+    assert "create_file" in {spec["name"] for spec in
+                             chat_workspace_tools.list_specs(agent_tools=["检索", "文件读写"])}
+    # 只读轮次仍然过滤写工具；无白名单（旧调用）时保持全量
+    assert all(not spec["write"] for spec in
+               chat_workspace_tools.list_specs(read_only=True, agent_tools=["检索", "文件读写"]))
+    assert len(chat_workspace_tools.list_specs()) == len(chat_workspace_tools.TOOLS)
+    assert [spec["name"] for spec in chat_workspace_tools.list_specs(agent_tools=["无"])] == [
+        "ask_user_question", "read_skill_reference"]
+
+
+def test_list_specs_exposes_readonly_teardown_recall(workspace: SimpleNamespace) -> None:
+    """拆书召回工具只读、归「检索」分组：检索类与审稿类 Agent 可见且都不带写工具。"""
+    from workbench.backend.services import chat_workspace_tools
+
+    retrieval = chat_workspace_tools.list_specs(agent_tools=["检索"])
+    assert "list_teardown" in {spec["name"] for spec in retrieval}
+    assert not any(spec["write"] for spec in retrieval)
+
+    reviewer = chat_workspace_tools.list_specs(agent_tools=["检索", "审稿门禁"])
+    assert "list_teardown" in {spec["name"] for spec in reviewer}
+    assert not any(spec["write"] for spec in reviewer)
+
+
+# ───────────────────── 旧提案路径：写域判定与提案标注 ─────────────────────
+
+
+def test_chat_tools_scope_gates_direct_apply_and_annotates_proposals(workspace: SimpleNamespace) -> None:
+    from workbench.backend.services import scope_guard, settings_service
+
+    project, _rel, project_dir = make_project("写域旧路径书")
+    scope = scope_guard.build_scope(project_id=project["id"], write_targets=["设定"])
+    out_scope = {"which": "大纲", "content": "新大纲。"}
+
+    # 范围外 + 直接落盘档：不走自动落盘，降级为收件箱提案并标注越界
+    ctx = ToolContext(project_id=project["id"], session_id=3, auto_apply=True,
+                      scope=scope, scope_key="run-out")
+    result = chat_tools.execute("propose_outline_edit", out_scope, ctx)
+    assert result["ok"] is True and result["applied"] is False
+    assert result["scope"]["out_of_scope"] is True
+    proposal = proposal_service.get_proposal(ctx.proposals[0])
+    assert proposal["meta"]["scope"]["out_of_scope"] is True
+    assert proposal["status"] == "pending"        # 越界时不自动落盘，等作者在收件箱确认
+
+    # 范围内 + 直接落盘档：保持既有语义（直接落盘）
+    ctx_in = ToolContext(project_id=project["id"], session_id=4, auto_apply=True,
+                         scope=scope, scope_key="run-in")
+    applied = chat_tools.execute("propose_setting_edit",
+                                 {"category": "人物", "content": "新的设定内容。"}, ctx_in)
+    assert applied["ok"] is True and applied["applied"] is True
+
+    # 默认（只产提案）时提案 meta 也带 scope 说明
+    ctx_prop = ToolContext(project_id=project["id"], session_id=6, auto_apply=False, scope=scope)
+    drafted = chat_tools.execute("propose_outline_edit", out_scope, ctx_prop)
+    assert drafted["ok"] is True and drafted["applied"] is False
+    assert proposal_service.get_proposal(ctx_prop.proposals[0])["meta"]["scope"]["material"] == "大纲"
+
+    # 严格模式：范围外直接拒绝，连提案都不生成
+    settings_service.update_settings({"chat": {"scope_strictness": "reject"}})
+    ctx_strict = ToolContext(project_id=project["id"], session_id=5, auto_apply=True,
+                             scope=scope, scope_key="run-strict")
+    denied = chat_tools.execute("propose_outline_edit", out_scope, ctx_strict)
+    assert denied["ok"] is False and denied["code"] == "out_of_scope"
+    assert "越界" in denied["summary"]
+    assert ctx_strict.proposals == []
+
+

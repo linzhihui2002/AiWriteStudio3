@@ -1,0 +1,193 @@
+{
+  "meta": {
+    "name": "agent-scope",
+    "version": 1,
+    "updated": "2026-09-25",
+    "purpose": "金标准评测集：验证「作者原话 → 执行 Agent / 写域 / 多步计划」的路由正确性，重点覆盖越界与邻近意图干扰。不接入 pytest / CI。",
+    "related_spec": ".trae/specs/upgrade-agent-routing-and-skills/spec.md（ADDED Requirements → 金标准评测集）",
+    "field_contract": "字段与判定口径见同目录 README.md；expected_write_targets 为「必须包含」口径，forbidden_write_targets 为硬约束，expected_plan_steps=0 表示不得产生多步计划。",
+    "notes": "期望值按 .trae/specs 的验收口径登记（spec 为唯一判据）。部分用例的关键词快路径实测值与期望不一致，已在各条 notes 内注明，供作者复核。"
+  },
+  "cases": [
+    {
+      "id": "pk-01-wanshan-sheding",
+      "tags": ["正例", "写域"],
+      "input": "现在我需要完善设定",
+      "expected_agent": "setting-keeper",
+      "expected_write_targets": ["设定"],
+      "forbidden_write_targets": ["大纲", "状态", "章节"],
+      "expected_plan_steps": 0,
+      "expectation": "「完善设定」只落到设定 Agent，写域仅 设定/，不得连带改 大纲/、状态/ 或正文。",
+      "notes": "本次 bug 的直接回归锚点：关键词快路径唯一命中「完善设定」「设定」→ source=keyword 即成立。实测：agent=setting-keeper、write_targets=[设定]、plan=0，全部命中。"
+    },
+    {
+      "id": "pk-02-dagang-from-sheding",
+      "tags": ["正例", "写域", "依据与产出分离"],
+      "input": "根据现有设定把大纲补出来",
+      "expected_agent": "planner",
+      "expected_write_targets": ["大纲"],
+      "forbidden_write_targets": ["设定", "状态", "章节"],
+      "expected_plan_steps": 0,
+      "expected_read_only_refs": ["设定"],
+      "expectation": "「根据设定写大纲」里设定是只读依据、大纲才是产出，不得顺手把 设定/ 写成产出。",
+      "notes": "按 spec（checklist「write_targets 仅含 大纲/」）登记：设定是依据、不是产出。关键词命中「大纲」「设定」并列 → 取注册表顺序首个（planner）。实测（修正后关键词路径）：agent=planner、write_targets=[大纲]、read_only_refs=[设定]、plan=0，命中——「根据」后的「设定」现计入只读依据，不再并入 write_targets（关键词路径已可为依据材料回填 read_only_refs）。"
+    },
+    {
+      "id": "pk-03-plan-sheding-then-dagang",
+      "tags": ["正例", "多步计划"],
+      "input": "先帮我把设定补全，再按设定列一版卷纲",
+      "expected_agent": "planner",
+      "expected_write_targets": ["设定", "大纲"],
+      "forbidden_write_targets": ["章节", "状态"],
+      "expected_plan_steps": 2,
+      "expectation": "跨材料要求应产出两步计划：先由设定类 Agent 写 设定/，再由大纲类 Agent 读 设定/ 写 大纲/。",
+      "notes": "顶层 agent 允许取值集合 {planner, setting-keeper}（当前关键词路径给 planner；多步计划下顶层取值取决于判定给谁做主步）。判定重点是 plan：要求长度 ≥ 2，且第 2 步（大纲）的 read_only_refs 含 设定——_material_plan 会把前序步骤的产出材料填为后续步骤的依据。实测：agent=planner、write_targets=[设定,大纲]、plan=2（第 2 步 read_only_refs=[设定]），命中。"
+    },
+    {
+      "id": "pk-04-xuxie-this-chapter",
+      "tags": ["正例", "写域"],
+      "input": "续写这一章",
+      "context": {"active_file": "章节/第0031章.txt", "target_chapter": "第0031章"},
+      "expected_agent": "writer",
+      "expected_write_targets": ["章节"],
+      "forbidden_write_targets": ["设定", "大纲", "状态"],
+      "expected_plan_steps": 0,
+      "expectation": "续写正文交写作 Agent，写域含 章节/，不得越界到设定、大纲与状态。",
+      "notes": "关键词唯一命中「续写」→ source=keyword。context 字段当前仅供人工用支持上下文的入口复现（routing_service.route 未透传 active_file/target_chapter），run_cases.py 只按 input 调用。实测：agent=writer、write_targets=[章节]、plan=0，命中。"
+    },
+    {
+      "id": "pk-05-character-state-timeline",
+      "tags": ["正例", "写域"],
+      "input": "把角色状态和时间线更新一下",
+      "expected_agent": "context-keeper",
+      "expected_write_targets": ["状态"],
+      "forbidden_write_targets": ["章节", "大纲"],
+      "expected_plan_steps": 0,
+      "expectation": "状态/时间线维护交连续性 Agent，写域含 状态/，不得写正文与大纲。",
+      "notes": "关键词命中「角色状态」「时间线」两条 → context-keeper（source=keyword）。该 Agent 主责材料为 状态/ 与 设定/，故实际 write_targets 为 [设定,状态]（期望按包含口径）。按 spec「只涉及一类材料的要求不产生多步计划」登记 expected_plan_steps=0。实测（修正后关键词路径）：agent=context-keeper、write_targets=[设定,状态]、plan=0，命中——多步计划只由作者显式点名的多类产出材料触发，Agent 自带的多类材料不再自动分步。"
+    },
+    {
+      "id": "pk-06-review-chapter",
+      "tags": ["正例", "只读", "写域为空"],
+      "input": "帮我审一下这章，看看能不能发",
+      "context": {"target_chapter": "第0031章"},
+      "expected_agent": "reviewer",
+      "expected_write_targets": [],
+      "forbidden_write_targets": ["章节", "设定", "大纲", "状态"],
+      "expected_plan_steps": 0,
+      "expectation": "审稿是只读角色，只报告不改稿：不得获得任何写域。",
+      "notes": "关键词命中「审一下」「能不能发」→ reviewer（source=keyword）；其 materials 为空，故 write_targets=[]，scope_unresolved=true——「无写域」而非「拒绝」，判定只要求 write_targets 为空数组（即便消息里出现「这章」，只读角色也不得获得写域）。实测：[], 命中。"
+    },
+    {
+      "id": "pk-07-forbidden-wanshan",
+      "tags": ["越界反例"],
+      "input": "完善设定",
+      "expected_agent": "setting-keeper",
+      "expected_write_targets": ["设定"],
+      "forbidden_write_targets": ["大纲", "状态", "章节"],
+      "expected_plan_steps": 0,
+      "expectation": "越界反例：要求「完善设定」时禁止把 大纲/、状态/、章节/ 纳入写域（本次 bug 的直接验收）。",
+      "notes": "与 pk-01 同源、输入更短；关键词唯一命中「设定」「完善设定」→ setting-keeper。实测：write_targets=[设定]、plan=0，无越界，命中。"
+    },
+    {
+      "id": "pk-08-forbidden-ref-not-target",
+      "tags": ["越界反例", "依据与产出分离"],
+      "input": "照着设定把大纲整理一版",
+      "expected_agent": "planner",
+      "expected_write_targets": ["大纲"],
+      "forbidden_write_targets": ["设定"],
+      "expected_plan_steps": 0,
+      "expected_read_only_refs": ["设定"],
+      "expectation": "「照设定写大纲」中设定只是依据，禁止把 设定/ 当作产出写入。",
+      "notes": "关键词命中「设定」「大纲」并列 → 取首个 planner。实测（修正后关键词路径）：agent=planner、write_targets=[大纲]、read_only_refs=[设定]、plan=0，命中——「照着」后的「设定」计入只读依据，不再并入 write_targets（与 pk-02 同类修正）。"
+    },
+    {
+      "id": "pk-09-sheding-vs-status",
+      "tags": ["邻近意图干扰", "写域"],
+      "input": "把设定里的角色状态更新一下",
+      "expected_agent": "context-keeper",
+      "expected_write_targets": ["状态"],
+      "forbidden_write_targets": ["章节", "大纲"],
+      "expected_plan_steps": 0,
+      "expectation": "「设定 vs 状态」易混：句子落点是 角色状态，应判给连续性 Agent，而不是只因出现「设定」就只改设定。",
+      "notes": "关键词命中「设定」「角色状态」并列 → 取注册表顺序首个（context-keeper）。agent 允许取值集合 {context-keeper, setting-keeper}（前者为期望值）。expected_plan_steps=0 依据 spec「单材料不产生多步计划」。实测（修正后关键词路径）：agent=context-keeper、write_targets=[状态]、read_only_refs=[设定]、plan=0，命中——「设定里的…」属位置限定，只作只读查找位置，不计产出。"
+    },
+    {
+      "id": "pk-10-dagang-vs-arc",
+      "tags": ["邻近意图干扰"],
+      "input": "大纲里人物的成长弧线检查一下",
+      "expected_agent": "planner",
+      "expected_write_targets": ["大纲"],
+      "forbidden_write_targets": ["章节"],
+      "expected_plan_steps": 0,
+      "expectation": "「大纲 vs 角色成长」易混：这是检查类请求，无论判给 planner 还是 context-keeper，都不得把 章节/ 纳入写域。",
+      "notes": "关键词快路径唯一命中「大纲」→ planner（source=keyword）；语义判定可能给 context-keeper（角色成长检查）。agent 允许取值集合 {planner, context-keeper}；写域允许集合 [大纲]（planner）或 [状态,设定]（context-keeper）。硬约束：forbidden 含 章节。实测（keyword）：agent=planner、write_targets=[大纲]、plan=0，命中。"
+    },
+    {
+      "id": "pk-11-deslop-vs-writing",
+      "tags": ["邻近意图干扰", "只读"],
+      "input": "这几章的去 AI 味处理一下",
+      "expected_agent": "reviewer",
+      "expected_write_targets": [],
+      "forbidden_write_targets": ["章节", "设定", "大纲", "状态"],
+      "expected_plan_steps": 0,
+      "expectation": "「写作 vs 审稿/去AI味」易混：去 AI 味属审稿侧软审，不得落到 writer 去改正文。",
+      "notes": "输入含空格（「去 AI 味」）。实测（修正后关键词路径）：触发词与消息先做归一化（去空白、全角转半角、英文小写），「去 AI 味」→「去ai味」即子串命中 reviewer（source=keyword）、write_targets=[]、plan=0，命中。source=llm 时同为 reviewer；agent 允许取值集合 {reviewer, writing-assistant}，两者写域均为空数组。"
+    },
+    {
+      "id": "pk-12-fallback-unrelated",
+      "tags": ["兜底", "未声明写域"],
+      "input": "今天先不写了，帮我看看这书现在有多少字",
+      "expected_agent": "writing-assistant",
+      "expected_write_targets": [],
+      "forbidden_write_targets": ["章节", "设定", "大纲", "状态"],
+      "expected_plan_steps": 0,
+      "expectation": "与创作动作无关的请求交默认执行者兜底，且不预先授予任何写域。",
+      "notes": "关键词无任何命中 → source=fallback，agent=writing-assistant。判定口径：agent=writing-assistant 且 write_targets=[]（其主责材料为空数组），scope_unresolved=true 表示「无写域」而非「拒绝」，本用例不要求拒绝。实测：[], 命中。"
+    },
+    {
+      "id": "pk-13-outline-volume",
+      "tags": ["正例", "写域"],
+      "input": "把这卷的大纲细化成章纲",
+      "expected_agent": "planner",
+      "expected_write_targets": ["大纲"],
+      "forbidden_write_targets": ["设定", "状态", "章节"],
+      "expected_plan_steps": 0,
+      "expectation": "纯大纲类要求只写 大纲/，不得越界到设定、状态或正文。",
+      "notes": "关键词命中「大纲」「章纲」两条 → source=keyword。实测：write_targets=[大纲]、plan=0，命中。"
+    },
+    {
+      "id": "pk-14-setting-factions",
+      "tags": ["正例", "写域"],
+      "input": "把设定里的势力关系补一下",
+      "expected_agent": "setting-keeper",
+      "expected_write_targets": ["设定"],
+      "forbidden_write_targets": ["大纲", "状态", "章节"],
+      "expected_plan_steps": 0,
+      "expectation": "设定内部修订仍只写 设定/，不得顺手改 大纲/、状态/ 或正文。",
+      "notes": "关键词命中「设定」「势力」两条 → source=keyword。实测：write_targets=[设定]、plan=0，命中。"
+    },
+    {
+      "id": "pk-15-teardown-readonly",
+      "tags": ["正例", "只读", "写域为空"],
+      "input": "拆解一下这本书前三章的节奏",
+      "expected_agent": "teardown-analyst",
+      "expected_write_targets": [],
+      "forbidden_write_targets": ["章节", "设定", "大纲", "状态"],
+      "expected_plan_steps": 0,
+      "expectation": "拆书对标不写本书书稿：不得把 章节/、设定/、大纲/、状态/ 纳入写域。",
+      "notes": "关键词唯一命中「拆解」→ teardown-analyst（source=keyword）；其 materials 为空，write_targets=[]。实测：[], 命中。"
+    },
+    {
+      "id": "pk-16-foreshadow-check",
+      "tags": ["正例", "写域"],
+      "input": "伏笔检查一下，有哪些坑还没填",
+      "expected_agent": "context-keeper",
+      "expected_write_targets": ["状态"],
+      "forbidden_write_targets": ["章节", "大纲"],
+      "expected_plan_steps": 0,
+      "expectation": "伏笔检查交连续性 Agent，写域含 状态/（台账），不得写正文与大纲。",
+      "notes": "关键词命中「伏笔」「坑没填」两条 → context-keeper（source=keyword）；该 Agent 写域实际为 [设定,状态]。expected_plan_steps=0 依据 spec「单材料不产生多步计划」。实测（修正后关键词路径）：agent=context-keeper、write_targets=[设定,状态]、plan=0，命中——作者未点名多类产出材料，仅凭 Agent 自带材料不再自动分步。"
+    }
+  ]
+}

@@ -1,0 +1,1307 @@
+{
+  "schema_version": 1,
+  "origin": "全部为本轮自行编写的原创虚构中文场景，无第三方小说摘录；短场景仅用于文学读感比较，不替代正式章节硬门禁。",
+  "dimensions": {
+    "continuation": "继续阅读意愿：1完全不愿继续，5愿意马上读下一段。",
+    "character_voice": "人物声音：1所有人物同声，5说话与反应能区分且符合处境。",
+    "subtext": "潜台词与信息差：1直接解释全部动机，5行动和对白留下可理解的余地。",
+    "restraint": "叙述克制：1堆砌情绪、解释或升华，5信息够用且不替读者下结论。",
+    "scene_causality": "场景因果：1行动和结果脱节，5阻力、选择与代价清楚连贯。",
+    "rhythm": "语言与节奏：1模板反复或均匀拖沓，5句段节奏随场景变化、自然可读。"
+  },
+  "cases": [
+    {
+      "id": "pq-01",
+      "category": "冲突与潜台词",
+      "prompt": "沈禾应交十四枚铜钱房租，口袋只有六枚，到掌柜的布铺借缺少的八枚。她不愿说自己被催租，拿上个月帮铺子找回账册的事开口；掌柜要关门赶末班渡船。写一场借钱未成、但双方没有把话说透的对话。使用沈禾的有限视角。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "房租共十四枚铜钱，沈禾现有六枚，还缺八枚。"
+        },
+        {
+          "id": "F2",
+          "statement": "沈禾上个月帮布铺找回账册，掌柜没有许诺过报酬。"
+        },
+        {
+          "id": "F3",
+          "statement": "本场借钱未成，掌柜需要赶当晚末班渡船。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "沈禾",
+          "goal": "借到八枚铜钱",
+          "hidden_goal": "保住体面，不直接承认欠租"
+        },
+        {
+          "character": "掌柜",
+          "goal": "及时关门赶船",
+          "hidden_goal": "避免把旧人情变成固定债务"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "沈禾",
+          "knows": [
+            "欠租的金额",
+            "自己找回账册的经过"
+          ],
+          "does_not_know": [
+            "掌柜的妻子正在渡口等他"
+          ],
+          "believes": [
+            "掌柜记得那次帮忙"
+          ]
+        },
+        {
+          "character": "掌柜",
+          "knows": [
+            "账册找回一事",
+            "末班渡船将开"
+          ],
+          "does_not_know": [
+            "沈禾被房东催租"
+          ],
+          "believes": [
+            "沈禾借钱可能还有别的用途"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "character_voice",
+        "subtext",
+        "restraint",
+        "scene_causality"
+      ]
+    },
+    {
+      "id": "pq-02",
+      "category": "关系中的讨价还价",
+      "prompt": "小饭馆屋顶漏水，阿蓉端着接雨的盆找房东谈修缮。房东说上月已经补过，她知道补的是隔壁屋顶，证据是一张被雨水泡软的工单。房东年长而爱面子。写她递出证据、房东改变说法但尚未同意出钱的场景。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "漏水的是小饭馆，不是隔壁屋顶。"
+        },
+        {
+          "id": "F2",
+          "statement": "阿蓉持有一张被雨泡软的工单，工单能证明上月修的是隔壁。"
+        },
+        {
+          "id": "F3",
+          "statement": "场景结束时房东仍未同意承担修缮费。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "阿蓉",
+          "goal": "让房东承担修缮",
+          "hidden_goal": "继续租店，避免把关系彻底闹僵"
+        },
+        {
+          "character": "房东",
+          "goal": "少承担费用",
+          "hidden_goal": "维持自己办事可靠的面子"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "阿蓉",
+          "knows": [
+            "工单写的地址",
+            "饭馆正在漏雨"
+          ],
+          "does_not_know": [
+            "房东是否有存款"
+          ],
+          "believes": [
+            "证据能迫使房东松口"
+          ]
+        },
+        {
+          "character": "房东",
+          "knows": [
+            "上月安排过修屋顶"
+          ],
+          "does_not_know": [
+            "阿蓉保留了工单"
+          ],
+          "believes": [
+            "阿蓉只是借漏水讨价还价"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "subtext",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-03",
+      "category": "紧迫情境中的隐瞒",
+      "prompt": "摆渡人陆久只剩最后一趟船。他的女儿在城里等药，但他没向乘客提过。一个衣服干净的青年要求再等五分钟，说有个同伴未到。陆久只知道药铺关门的时辰，不知道对方同伴出了什么事。写双方围绕开船时间的争执，不能由叙述者说明青年真正的原因。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "陆久的女儿在城里等药，青年不知道此事。"
+        },
+        {
+          "id": "F2",
+          "statement": "青年请求再等五分钟，同伴尚未到渡口。"
+        },
+        {
+          "id": "F3",
+          "statement": "本场采用陆久有限视角，青年同伴未到的原因保持未知。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "陆久",
+          "goal": "立即开船以赶上药铺",
+          "hidden_goal": "不让陌生人知道家中急事"
+        },
+        {
+          "character": "青年",
+          "goal": "争取五分钟等待",
+          "hidden_goal": "避免独自离开同伴"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "陆久",
+          "knows": [
+            "药铺关门的时辰",
+            "青年要求等待"
+          ],
+          "does_not_know": [
+            "同伴未到的原因"
+          ],
+          "believes": [
+            "再等可能买不到药"
+          ]
+        },
+        {
+          "character": "青年",
+          "knows": [
+            "同伴尚未到"
+          ],
+          "does_not_know": [
+            "陆久女儿等药"
+          ],
+          "believes": [
+            "船夫只是嫌麻烦"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "character_voice",
+        "subtext",
+        "restraint",
+        "scene_causality"
+      ]
+    },
+    {
+      "id": "pq-04",
+      "category": "家庭对白",
+      "prompt": "十五岁的阿棠在灶房听见姨母称她的生母为旧名字。她一直以为母亲从未离开过村子；姨母知道母亲年轻时曾在外地学画，但答应不主动说。阿棠借切菜问起这个名字，姨母想转去问她考试。写双方都在试探的短场景，不揭出完整往事。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "阿棠十五岁，只知道母亲一直住在村里。"
+        },
+        {
+          "id": "F2",
+          "statement": "姨母知道母亲年轻时在外地学画，答应不主动说。"
+        },
+        {
+          "id": "F3",
+          "statement": "本场不能把母亲的完整往事直接揭出。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "阿棠",
+          "goal": "弄清旧名字的来历",
+          "hidden_goal": "不让姨母发现自己怀疑母亲"
+        },
+        {
+          "character": "姨母",
+          "goal": "守住对母亲的承诺",
+          "hidden_goal": "不要使阿棠觉得被所有人蒙在鼓里"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "阿棠",
+          "knows": [
+            "听见姨母使用旧名字"
+          ],
+          "does_not_know": [
+            "母亲曾在外地学画"
+          ],
+          "believes": [
+            "旧名字与一段隐瞒有关"
+          ]
+        },
+        {
+          "character": "姨母",
+          "knows": [
+            "母亲外地学画的经历"
+          ],
+          "does_not_know": [
+            "阿棠听见了多少"
+          ],
+          "believes": [
+            "换话题或许能暂时蒙混过去"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "subtext",
+        "restraint",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-05",
+      "category": "试探与误读",
+      "prompt": "驿车里，抄录员许苇带着一份尚未公开的撤职公文。对座男子认出了公文的红封皮，问县城天气。许苇以为他在打探文书；男子实际只担心儿子返城会淋雨。采用许苇有限视角写对话，只能写他观察到的细节，不可直接揭示男子内心。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "许苇带的是尚未公开的撤职公文，红封皮可见。"
+        },
+        {
+          "id": "F2",
+          "statement": "男子只担心返城的儿子淋雨，不知道公文内容。"
+        },
+        {
+          "id": "F3",
+          "statement": "叙述限定许苇视角，不可直接陈述男子的真实动机。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "许苇",
+          "goal": "保住未公开的公文内容",
+          "hidden_goal": "显得并未戒备"
+        },
+        {
+          "character": "男子",
+          "goal": "问清县城天气",
+          "hidden_goal": "确认儿子是否需要带伞"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "许苇",
+          "knows": [
+            "公文内容",
+            "红封皮被对方看见"
+          ],
+          "does_not_know": [
+            "男子儿子返城的安排"
+          ],
+          "believes": [
+            "天气问题可能是试探"
+          ]
+        },
+        {
+          "character": "男子",
+          "knows": [
+            "儿子今日返城"
+          ],
+          "does_not_know": [
+            "红封公文的内容"
+          ],
+          "believes": [
+            "同车的抄录员刚从县城来"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "subtext",
+        "restraint",
+        "scene_causality"
+      ]
+    },
+    {
+      "id": "pq-06",
+      "category": "利益冲突",
+      "prompt": "仓库交班时少了一箱纸。新来的搬运工迟放曾独自留在库内，老管事因此怀疑他。迟放知道那箱纸被管事的侄子提前送去账房，手上有一张没签名的借条。他还在试工，怕直接点名得罪人。写他拿出借条后两人的对话，缺箱原因最终被核实。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "少的是一箱纸，迟放没有拿走。"
+        },
+        {
+          "id": "F2",
+          "statement": "管事的侄子提前把纸送到账房，留下一张未签名借条。"
+        },
+        {
+          "id": "F3",
+          "statement": "迟放处于试工期；本场最终核实纸在账房。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "迟放",
+          "goal": "澄清嫌疑保住试工",
+          "hidden_goal": "不直接羞辱管事"
+        },
+        {
+          "character": "管事",
+          "goal": "查清缺箱",
+          "hidden_goal": "维护对库房的控制与侄子的面子"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "迟放",
+          "knows": [
+            "侄子搬箱和借条的经过"
+          ],
+          "does_not_know": [
+            "管事会不会借故辞退自己"
+          ],
+          "believes": [
+            "借条能让对方去核实"
+          ]
+        },
+        {
+          "character": "管事",
+          "knows": [
+            "缺了一箱纸",
+            "迟放独自留库"
+          ],
+          "does_not_know": [
+            "侄子提前送纸"
+          ],
+          "believes": [
+            "新人最有嫌疑"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "character_voice",
+        "subtext",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-07",
+      "category": "动作中的取舍",
+      "prompt": "护送人乔临在窄木桥上遭到两名持短棍者拦截。他右腕前日受伤，不能用力握剑；桥下水急，身后跟着不会游泳的书吏。写他借桥宽、绳栏与伤腕限制脱身的动作，书吏不能突然获得武艺，两名拦截者也不能无故退走。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "乔临右腕受伤，无法用力握剑。"
+        },
+        {
+          "id": "F2",
+          "statement": "桥窄，桥下水急；书吏不会游泳且不懂武艺。"
+        },
+        {
+          "id": "F3",
+          "statement": "拦截者两人使用短棍，必须有明确阻力和脱身代价。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "乔临",
+          "goal": "护住书吏并离开木桥",
+          "hidden_goal": "隐藏伤腕的严重程度"
+        },
+        {
+          "character": "书吏",
+          "goal": "跟上乔临活着离桥",
+          "hidden_goal": "不要成为累赘"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "乔临",
+          "knows": [
+            "自己的腕伤",
+            "书吏不会游泳"
+          ],
+          "does_not_know": [
+            "拦截者是否还有同伙"
+          ],
+          "believes": [
+            "桥窄可限制两人同时进攻"
+          ]
+        },
+        {
+          "character": "书吏",
+          "knows": [
+            "自己不会游泳",
+            "前面两人持棍"
+          ],
+          "does_not_know": [
+            "乔临伤腕的程度"
+          ],
+          "believes": [
+            "照着乔临指令行动较安全"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-08",
+      "category": "空间清楚的逃险",
+      "prompt": "夜里木工间起火。陈澄离后门最近，但后门外有一道从外侧扣住的门闩；学徒在工作台另一侧，烟遮住了视线。墙上唯一的高窗能出去，却必须先垫起工作台。写两人合作逃到院子，工具和空间不能凭空变出，动作顺序必须清楚。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "后门被外侧门闩扣住，不能从内直接打开。"
+        },
+        {
+          "id": "F2",
+          "statement": "唯一可用出口是高窗，需要垫工作台。"
+        },
+        {
+          "id": "F3",
+          "statement": "只有陈澄和学徒两人；两人最终逃到院子。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "陈澄",
+          "goal": "让两人离开火场",
+          "hidden_goal": "压住慌乱，给学徒可执行的指令"
+        },
+        {
+          "character": "学徒",
+          "goal": "找到陈澄并逃生",
+          "hidden_goal": "不承认自己已分不清方向"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "陈澄",
+          "knows": [
+            "后门打不开",
+            "高窗需要工作台垫脚"
+          ],
+          "does_not_know": [
+            "起火原因"
+          ],
+          "believes": [
+            "学徒仍能听见指令"
+          ]
+        },
+        {
+          "character": "学徒",
+          "knows": [
+            "烟很浓",
+            "陈澄在附近"
+          ],
+          "does_not_know": [
+            "后门门闩的位置"
+          ],
+          "believes": [
+            "靠墙可能更容易找到方向"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-09",
+      "category": "追逐与损失",
+      "prompt": "报童叶宁带着一封举报信穿过早市，发现两人追来。巷口有卖鱼的车堵路，右边是只容一人侧身的竹筐间隙。他不懂功夫，也没有同伴。写他摆脱追者但丢掉举报信的场景，不能让追者凭空消失。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "叶宁不会功夫，没有同伴接应。"
+        },
+        {
+          "id": "F2",
+          "statement": "巷口鱼车堵路，右侧竹筐间隙只容一人侧身。"
+        },
+        {
+          "id": "F3",
+          "statement": "叶宁最终脱身，但举报信丢失，追者的受阻过程需清楚。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "叶宁",
+          "goal": "保住自己与举报信",
+          "hidden_goal": "不暴露收信人的身份"
+        },
+        {
+          "character": "追者之一",
+          "goal": "截住叶宁拿到信",
+          "hidden_goal": "避免在早市闹大"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "叶宁",
+          "knows": [
+            "信的收件人",
+            "两人正在追自己"
+          ],
+          "does_not_know": [
+            "追者受谁指使"
+          ],
+          "believes": [
+            "拥挤早市有机会甩开他们"
+          ]
+        },
+        {
+          "character": "追者之一",
+          "knows": [
+            "叶宁携信穿早市"
+          ],
+          "does_not_know": [
+            "信的完整内容"
+          ],
+          "believes": [
+            "堵住路就能取到信"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-10",
+      "category": "克制的紧张",
+      "prompt": "钟表匠孟师傅第一次在徒弟面前修一只昂贵怀表。他左手颤抖的毛病已持续半年，徒弟只当师傅昨夜没睡好。怀表有一颗松脱的螺丝，不能用换整块机芯解决。写修理中一次险些失手以及他如何掩饰，不用旁白给情绪命名。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "孟师傅左手颤抖已持续半年，徒弟不知道病情。"
+        },
+        {
+          "id": "F2",
+          "statement": "怀表故障是一颗松脱螺丝，不能换整块机芯。"
+        },
+        {
+          "id": "F3",
+          "statement": "师傅险些失手但没有损坏怀表，本场保持徒弟未确知病情。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "孟师傅",
+          "goal": "修好怀表",
+          "hidden_goal": "保住徒弟眼中的可靠形象"
+        },
+        {
+          "character": "徒弟",
+          "goal": "学会处理松螺丝",
+          "hidden_goal": "得到师傅认可"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "孟师傅",
+          "knows": [
+            "自身手颤的情况",
+            "螺丝位置"
+          ],
+          "does_not_know": [
+            "徒弟有没有起疑"
+          ],
+          "believes": [
+            "放慢动作能遮住异常"
+          ]
+        },
+        {
+          "character": "徒弟",
+          "knows": [
+            "师傅昨夜店里亮灯",
+            "故障是螺丝松动"
+          ],
+          "does_not_know": [
+            "半年手颤"
+          ],
+          "believes": [
+            "师傅只是缺睡"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "subtext",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-11",
+      "category": "独处与丧失",
+      "prompt": "父亲葬礼后，阮遥独自收拾父亲的鞋。鞋底夹着两颗晒干的豆子，她记得父亲去年帮她晒过豆，之后两人因搬家吵过一架，没有和好。写她最终只收起一只鞋、另一只留在门边的过程。不要以人生道理或自我和解结束。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "父亲已去世，阮遥独自收鞋。"
+        },
+        {
+          "id": "F2",
+          "statement": "鞋底夹着两颗干豆；父亲去年帮她晒豆，两人后因搬家争吵且未和好。"
+        },
+        {
+          "id": "F3",
+          "statement": "她最终收起一只鞋，另一只留在门边，不能写已经完全释怀。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "阮遥",
+          "goal": "整理父亲留下的鞋",
+          "hidden_goal": "让收拾的动作暂时替代回想争吵"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "阮遥",
+          "knows": [
+            "晒豆与争吵的往事",
+            "父亲已去世"
+          ],
+          "does_not_know": [
+            "父亲生前最后如何看那次争吵"
+          ],
+          "believes": [
+            "先做完眼前的事会容易一些"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "subtext",
+        "restraint",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-12",
+      "category": "独处与羞耻",
+      "prompt": "工厂发薪后，罗水在空食堂核对工资条，比约定少了七十元。主管白天说是他记错了；他把旧合同夹在饭盒底，金额写得清楚。写他在无人时练习第二天如何开口，练了几次却仍把合同藏回饭盒。不要借独白让他突然完成成长。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "工资比合同约定少七十元，旧合同金额清楚。"
+        },
+        {
+          "id": "F2",
+          "statement": "主管白天说罗水记错了，食堂此时无人。"
+        },
+        {
+          "id": "F3",
+          "statement": "罗水练习后仍把合同藏回饭盒，本场未解决欠薪。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "罗水",
+          "goal": "准备第二天提出核对工资",
+          "hidden_goal": "不被主管当作闹事者"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "罗水",
+          "knows": [
+            "合同金额",
+            "工资条与合同差七十"
+          ],
+          "does_not_know": [
+            "主管是否有意少发"
+          ],
+          "believes": [
+            "措辞得体能减少冲突"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "subtext",
+        "restraint",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-13",
+      "category": "未说出的关系",
+      "prompt": "季圆整理抽屉，找到三年前写给姐姐却没寄出的信。姐姐如今在外地工作，每月寄一次简短问候；季圆从未告诉她那年自己失业。信封上地址已过时。写季圆读到一半停下，改写一句话，但最后没有决定是否寄出的场景。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "信写于三年前且从未寄出，信封地址已过时。"
+        },
+        {
+          "id": "F2",
+          "statement": "姐姐在外地工作，每月寄简短问候，不知道季圆当年失业。"
+        },
+        {
+          "id": "F3",
+          "statement": "季圆只改写一句，场景结束仍未决定寄信与否。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "季圆",
+          "goal": "处理旧信并重新考虑联系姐姐",
+          "hidden_goal": "既想被理解又怕被怜悯"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "季圆",
+          "knows": [
+            "当年的失业",
+            "地址已过时",
+            "姐姐持续来信"
+          ],
+          "does_not_know": [
+            "姐姐收到旧事后会如何反应"
+          ],
+          "believes": [
+            "旧信里的语气可能让姐姐难堪"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "subtext",
+        "restraint",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-14",
+      "category": "内心与责任",
+      "prompt": "乡医杜原在诊室等一位病人的家属来取旧病历。他曾把服药时间写错一天，病人因此耽误复诊但已经恢复；家属尚不知道这处错误，杜原知道旧病历能查到。他准备了更正单。写家属到门外时他没有把单子藏起来，却还未开口的片段。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "杜原写错一次服药时间，造成复诊延误；病人已恢复。"
+        },
+        {
+          "id": "F2",
+          "statement": "家属尚不知道错误，旧病历可查到，杜原备有更正单。"
+        },
+        {
+          "id": "F3",
+          "statement": "结束时家属在门外，杜原未藏单也尚未解释，不能改成无责或已获原谅。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "杜原",
+          "goal": "交付旧病历和更正单",
+          "hidden_goal": "承担责任又害怕失去信任"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "杜原",
+          "knows": [
+            "病历上的错误",
+            "病人已恢复",
+            "家属即将来取病历"
+          ],
+          "does_not_know": [
+            "家属会如何回应"
+          ],
+          "believes": [
+            "主动交出更正单是必须做的事"
+          ]
+        }
+      ],
+      "dimensions": [
+        "subtext",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-15",
+      "category": "时间连续的转场",
+      "prompt": "傍晚，修船匠闻生与雇主谈好次日检查船底；闻生没有收预付款。随后转到午夜，他独自到船坞看潮位，发现雇主的船被挪走。写从谈话结束到午夜发现的衔接，保留时间推进与他尚不知道移船者身份的状态。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "约定次日检查船底，闻生未收预付款。"
+        },
+        {
+          "id": "F2",
+          "statement": "午夜闻生去船坞看潮位，雇主的船已被挪走。"
+        },
+        {
+          "id": "F3",
+          "statement": "闻生不知道移船者身份；傍晚与午夜之间必须有清楚的时间推进。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "闻生",
+          "goal": "提前掌握潮位以准备明日检查",
+          "hidden_goal": "不愿第一次受雇就出差错"
+        },
+        {
+          "character": "雇主",
+          "goal": "约好次日检查",
+          "hidden_goal": "避免当晚久谈"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "闻生",
+          "knows": [
+            "次日检查的约定",
+            "未收预付款"
+          ],
+          "does_not_know": [
+            "午夜前谁挪走船"
+          ],
+          "believes": [
+            "船应当仍停在原泊位"
+          ]
+        },
+        {
+          "character": "雇主",
+          "knows": [
+            "检查约定"
+          ],
+          "does_not_know": [
+            "闻生午夜会来查看"
+          ],
+          "believes": [
+            "今晚安排已结束"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-16",
+      "category": "动作后的场景衔接",
+      "prompt": "宴席上，高竹为同伴挡住滚烫的汤，左手背烫伤；她仍装作不疼把话题转开。散席后她在廊下洗手，同伴追来，看见水盆中的手一直没拿起。写两段衔接到同伴递出干净布的过程，伤势不能自行消失，视角保持高竹。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "高竹左手背烫伤，宴席中掩饰疼痛。"
+        },
+        {
+          "id": "F2",
+          "statement": "散席后廊下洗手，同伴看到她迟迟不抬手。"
+        },
+        {
+          "id": "F3",
+          "statement": "同伴最终递出干净布；不能写伤势已自行好转或直接进入同伴内心。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "高竹",
+          "goal": "处理烫伤",
+          "hidden_goal": "不让同伴内疚"
+        },
+        {
+          "character": "同伴",
+          "goal": "确认高竹的伤并帮助她",
+          "hidden_goal": "不在众人面前使她难堪"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "高竹",
+          "knows": [
+            "左手背烫伤",
+            "自己替同伴挡汤"
+          ],
+          "does_not_know": [
+            "同伴追来的真实想法"
+          ],
+          "believes": [
+            "沉默能让事情过去"
+          ]
+        },
+        {
+          "character": "同伴",
+          "knows": [
+            "高竹挡过汤",
+            "高竹在水盆里不抬手"
+          ],
+          "does_not_know": [
+            "她忍痛的程度"
+          ],
+          "believes": [
+            "她可能需要处理伤口"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "subtext",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-17",
+      "category": "视角与谣言",
+      "prompt": "少年送信人陈雨在客栈听说桥封了，却只看见窗外一辆空马车绕路，未去桥边。他需要把信送到桥另一侧。店主说封桥是有人失踪，但他也是听客人说的。写陈雨决定先到桥口核实的对话，不能把传闻升级成已确认事实。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "陈雨未去桥边，只看到一辆空马车绕路。"
+        },
+        {
+          "id": "F2",
+          "statement": "店主听客人说有人失踪导致封桥，他没有亲眼核实。"
+        },
+        {
+          "id": "F3",
+          "statement": "陈雨决定到桥口核实，场景结束封桥与失踪仍是传闻。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "陈雨",
+          "goal": "确认能否过桥送信",
+          "hidden_goal": "不因传闻耽误交付"
+        },
+        {
+          "character": "店主",
+          "goal": "提醒少年别贸然过桥",
+          "hidden_goal": "显得自己熟悉当地消息"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "陈雨",
+          "knows": [
+            "需要过桥送信",
+            "见空车绕路"
+          ],
+          "does_not_know": [
+            "桥是否真封",
+            "是否有人失踪"
+          ],
+          "believes": [
+            "先看桥口比继续听说可靠"
+          ]
+        },
+        {
+          "character": "店主",
+          "knows": [
+            "客人转述的说法"
+          ],
+          "does_not_know": [
+            "封桥的实际情况"
+          ],
+          "believes": [
+            "消息大概是真的"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "subtext",
+        "restraint",
+        "scene_causality"
+      ]
+    },
+    {
+      "id": "pq-18",
+      "category": "年龄与人物声音",
+      "prompt": "九岁的温豆帮外婆整理旧布，想要一块红布做小旗；外婆想把它补在棉袄里，冬天已近。孩子知道冷但不理解家里布料稀缺，外婆没有解释全部家计。写两人争取红布、最终各分一小块的对话，孩子语言不能变成成人的哲理独白。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "温豆九岁，想用红布做小旗。"
+        },
+        {
+          "id": "F2",
+          "statement": "外婆要用红布补棉袄，冬天将至，家中布料不足。"
+        },
+        {
+          "id": "F3",
+          "statement": "最后两人各分一小块，外婆不完整解释家计，孩子声音符合年龄。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "温豆",
+          "goal": "得到做旗的红布",
+          "hidden_goal": "证明自己的小旗也有用"
+        },
+        {
+          "character": "外婆",
+          "goal": "留够补袄的布",
+          "hidden_goal": "让孩子仍有一点高兴的东西"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "温豆",
+          "knows": [
+            "红布能做小旗",
+            "冬天会冷"
+          ],
+          "does_not_know": [
+            "家中全部经济情况"
+          ],
+          "believes": [
+            "一块小布不会有太大影响"
+          ]
+        },
+        {
+          "character": "外婆",
+          "knows": [
+            "布料不足",
+            "棉袄需要补"
+          ],
+          "does_not_know": [
+            "孩子会如何想旗的用途"
+          ],
+          "believes": [
+            "可以给孩子留一点"
+          ]
+        }
+      ],
+      "dimensions": [
+        "character_voice",
+        "subtext",
+        "restraint",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-19",
+      "category": "日常误会与幽默",
+      "prompt": "书铺伙计陆芽听见客人说要买一本能压住门的书，认真推荐装订厚实的旧字典。客人原本说的是能压住梦，想找睡前读物，因嘴里含糖发音不清。写误会被一张门口楔子放大后得到澄清的场景，幽默来自理解错位，不靠羞辱人物。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "客人想找睡前读物，说话时含糖，梦被听成门。"
+        },
+        {
+          "id": "F2",
+          "statement": "陆芽先推荐厚旧字典，门口有一张可用的楔子。"
+        },
+        {
+          "id": "F3",
+          "statement": "本场误会最终澄清；不得将客人设定成认知障碍或借羞辱制造笑点。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "陆芽",
+          "goal": "给客人推荐合用的书",
+          "hidden_goal": "让自己显得能解决问题"
+        },
+        {
+          "character": "客人",
+          "goal": "找到睡前能安心读的书",
+          "hidden_goal": "不要被当成只想买便宜旧书"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "陆芽",
+          "knows": [
+            "听见的买书要求",
+            "字典厚重"
+          ],
+          "does_not_know": [
+            "客人说的其实是梦"
+          ],
+          "believes": [
+            "客人需要压门用的重物"
+          ]
+        },
+        {
+          "character": "客人",
+          "knows": [
+            "自己想要睡前读物"
+          ],
+          "does_not_know": [
+            "陆芽听成了门"
+          ],
+          "believes": [
+            "字典也许有特别的安神作用"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "character_voice",
+        "subtext",
+        "restraint",
+        "rhythm"
+      ]
+    },
+    {
+      "id": "pq-20",
+      "category": "具体的悬念收尾",
+      "prompt": "夜班档案员秦遥按清单封存三只木箱，第三只箱子账上写着六本账簿。他清点出五本，夹层里多出一张印有自己入职日期的渡船票。他从未去过那个渡口，不能直接推断票的主人。写他核对箱签、决定暂不封第三箱的场景，最后落在一个具体未解问题上。",
+      "word_budget": {
+        "min_han": 300,
+        "max_han": 650
+      },
+      "facts": [
+        {
+          "id": "F1",
+          "statement": "共有三只木箱，第三箱登记六本账簿，实际清点出五本。"
+        },
+        {
+          "id": "F2",
+          "statement": "第三箱夹层多出一张渡船票，日期与秦遥入职日期相同。"
+        },
+        {
+          "id": "F3",
+          "statement": "秦遥从未去该渡口，票主未知；他最终暂不封第三箱。"
+        }
+      ],
+      "character_goals": [
+        {
+          "character": "秦遥",
+          "goal": "准确封存木箱并查清缺本",
+          "hidden_goal": "避免未核实的异常被自己盖章确认"
+        }
+      ],
+      "knowledge_boundaries": [
+        {
+          "character": "秦遥",
+          "knows": [
+            "登记与清点数量不符",
+            "票日期与入职日相同",
+            "自己没去过该渡口"
+          ],
+          "does_not_know": [
+            "票主人",
+            "缺账簿的位置"
+          ],
+          "believes": [
+            "先保留原状便于核对"
+          ]
+        }
+      ],
+      "dimensions": [
+        "continuation",
+        "subtext",
+        "restraint",
+        "scene_causality",
+        "rhythm"
+      ]
+    }
+  ]
+}

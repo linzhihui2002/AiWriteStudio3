@@ -136,6 +136,9 @@ def test_error_normalization() -> None:
     assert code == "MODEL_NOT_FOUND"
     assert "no configured model" in message
     assert normalize_dsh_error("")[0] == "UNKNOWN"
+    assert normalize_dsh_error('503: {"message":"Service temporarily unavailable"}')[0] == "SERVER_ERROR"
+    assert normalize_dsh_error('dsh: HTTP 429: rate limited')[0] == "RATE_LIMIT"
+    assert normalize_dsh_error('HTTP 401: invalid credential')[0] == "AUTH_ERROR"
 
 
 def test_estimate_tokens_is_deterministic() -> None:
@@ -344,3 +347,55 @@ def test_run_task_records_task_and_usage(workspace: SimpleNamespace, monkeypatch
     summary = token_service.summary(project_id=project["id"])
     assert summary["totals"]["tokens"] == 12
     assert summary["totals"]["calls"] == 1
+
+
+@pytest.mark.parametrize("days", [1, 7, 30, 90])
+def test_usage_calendar_window_and_filtered_historical_cost(
+    workspace: SimpleNamespace, monkeypatch, days: int
+) -> None:
+    """The inclusive N-day window excludes older and future dated records."""
+    from datetime import date, timedelta
+    from workbench.backend.services import token_service
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 3)
+
+    monkeypatch.setattr(token_service, "date", FixedDate)
+    monkeypatch.setattr(token_service, "read_settings", lambda: {
+        "budget": {"daily_token_limit": 50, "alert_ratio": 0.8,
+                   "currency_per_1k_tokens": 0.0}
+    })
+    today = FixedDate.today()
+    start = today - timedelta(days=days - 1)
+    with db.get_conn() as conn:
+        conn.executemany(
+            "INSERT INTO token_usage (project_id, task_type, total_tokens,"
+            " cost_estimate, created_at) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, "章节正文", 100, 9.0, f"{start - timedelta(days=1)} 23:59:59"),
+                (1, "章节正文", 1000, 1.2, f"{start} 00:00:00"),
+                (1, "章节正文", 40, 0.5, f"{today} 12:00:00"),
+                (2, "审稿", 60, 0.6, f"{today} 12:00:00"),
+                (1, "章节正文", 9000, 8.0, f"{today + timedelta(days=1)} 00:00:00"),
+            ],
+        )
+
+    result = token_service.summary(project_id=1, days=days)
+    assert result["period"] == {"start": start.isoformat(), "end": today.isoformat()}
+    assert result["days"] == days
+    assert result["totals"] == {
+        "tokens": 1040, "cost": 1.7, "calls": 2,
+        "today_tokens": 1040 if days == 1 else 40,
+    }
+    assert result["by_day"][0]["day"] == start.isoformat()
+    assert result["by_day"][-1]["day"] == today.isoformat()
+    assert result["by_project"] == [
+        {"project_id": 1, "tokens": 1040, "cost": 1.7, "calls": 2}
+    ]
+    assert result["by_task_type"] == [
+        {"task_type": "章节正文", "tokens": 1040, "cost": 1.7, "calls": 2}
+    ]
+    assert result["budget"]["currency_per_1k_tokens"] == 0.0
+    assert result["budget"]["alert"] is True

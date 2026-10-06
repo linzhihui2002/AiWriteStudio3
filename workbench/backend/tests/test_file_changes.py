@@ -80,7 +80,7 @@ def test_new_chapter_real_gates_title_and_replay(book):
     replay = tools.execute("new_chapter", args, book.ctx)
     assert replay["ok"], replay
     assert len(changes.list_changes("run-one")) == 1
-    chapter = chapter_service.read_chapter(book.id, "章节/第0001章.md")
+    chapter = chapter_service.read_chapter(book.id, result["data"]["path"])
     assert chapter["title"] == "码头夜话"
     assert chapter["meta"]["状态"] == "草稿"
     assert chapter["hash"] == result["data"]["after_hash"]

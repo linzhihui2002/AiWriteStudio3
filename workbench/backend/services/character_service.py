@@ -86,31 +86,21 @@ def parse_characters(project_dir: Path) -> list[dict]:
         return []
     text = read_text(path)
 
-    characters: list[dict] = []
-    for title, block in _split_sections(text):
-        if not title:
-            continue
-        # 跳过明显的非角色节
-        if title in ("人物设定", "角色", "主要人物", "说明", "总览"):
-            continue
-        fields = _parse_fields(block)
-        if not fields and len(block) < 8:
-            continue
-        characters.append(
-            {
-                "name": title,
-                "raw": block,
-                "fields": fields,
-                "missing": [field for field in DEEP_FIELDS if field not in fields],
-                "source": "author",
-            }
-        )
-    return characters
+    from .material_parser import parse_entities
+    return [{**entry, "raw": entry["content"],
+             "missing": [field for field in DEEP_FIELDS if field not in entry["fields"]]}
+            for entry in parse_entities(text, "character")]
 
 
 def list_characters(project_id: int) -> list[dict]:
     _row, project_dir = get_project_dir(project_id)
     characters = parse_characters(project_dir)
+    if characters:
+        from .bible_service import read_sources
+        declared = read_sources(project_dir)
+        for character in characters:
+            override = declared.get("character:" + character["name"]) or {}
+            character["source"] = override.get("source", character["source"]) if isinstance(override, dict) else character["source"]
     if not characters:
         # 降级：读索引表（外部手工维护）
         with db.get_conn() as conn:
@@ -147,19 +137,81 @@ def parse_states(project_dir: Path) -> dict[str, dict[str, str]]:
         return {}
     text = read_text(path)
 
-    states: dict[str, dict[str, str]] = {}
-    for title, block in _split_sections(text):
-        if not title:
+    from .material_parser import parse_character_states
+    return {entry["name"]: entry["fields"] for entry in parse_character_states(text)}
+
+
+def compose_state_document(base_text: str, changes: list[dict]) -> str:
+    """Merge grounded fields into a complete candidate, preserving other prose.
+
+    Value offsets come from the shared material parser. New fields are inserted
+    into the uniquely owned role section; object-list tables cannot gain a
+    private column, so an unrepresented field in that format is a conflict.
+    """
+    from .material_parser import parse_character_states, table_rows
+    entries = parse_character_states(base_text)
+    grouped: dict[str, dict[str, str]] = {}
+    for change in changes:
+        name, field, value = (str(change.get(key) or "").strip() for key in ("角色", "字段", "新值"))
+        if (not name or not field or not value or any(c in name + field for c in "\r\n|#")
+                or any(c in value for c in "\r\n")):
+            raise InvalidOperationError("角色状态需要单行姓名、字段和新值")
+        previous = grouped.setdefault(name, {}).get(field)
+        if previous is not None and previous != value:
+            raise InvalidOperationError("同一角色字段有冲突值，请重新提取")
+        grouped[name][field] = value
+    edits: list[tuple[int, int, str]] = []
+    additions = []
+    for name, fields in grouped.items():
+        matching = [entry for entry in entries if entry["name"] == name]
+        if len(matching) > 1:
+            raise InvalidOperationError(f"角色状态有多个同名材料块，无法唯一修改：{name}")
+        if not matching:
+            # Do not append a second block when an existing freeform heading
+            # could not be independently parsed.
+            if re.search(r"(?m)^\s*#{1,6}\s+(?:主角[：:]\s*)?" + re.escape(name) + r"(?:\s|[（(]|$)", base_text):
+                raise InvalidOperationError(f"角色块无法独立定位，请先整理原材料：{name}")
+            additions.append("## " + name + "\n" + "\n".join(f"- {field}：{value}" for field, value in fields.items()))
             continue
-        fields = _parse_fields(block)
-        # 表格行：| 角色 | 字段 | 值 |
-        for line in block.splitlines():
-            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-            if len(cells) >= 3 and cells[0] and cells[1] and set(cells[0]) - set("- "):
-                fields.setdefault(cells[1], cells[2])
-        if fields:
-            states[title] = fields
-    return states
+        entry = matching[0]
+        missing = {}
+        for field, value in fields.items():
+            span = entry["field_spans"].get(field)
+            if span:
+                old = base_text[span[0]:span[1]]
+                if "|" in value and entry["format"] == "table":
+                    raise InvalidOperationError("状态表格值不能包含列分隔符")
+                if old != value:
+                    row_span = entry.get("row_spans", {}).get(field)
+                    property_row = bool(row_span and base_text[row_span[0]:row_span[1]].lstrip().startswith("|"))
+                    replacement = re.sub(r"(?<!\\)\|", r"\\|", value) if property_row else value
+                    edits.append((span[0], span[1], replacement))
+            else:
+                missing[field] = value
+        if missing:
+            if entry["format"] == "table":
+                raise InvalidOperationError(f"角色列表表格缺少字段列，请先补列：{name}")
+            end = entry["source_location"]["end"]
+            property_tables = [row for row in table_rows(base_text)
+                               if entry["source_location"]["start"] <= row["start"] < end
+                               and row["headers"][0] in {"项目", "字段", "字段名", "属性", "属性名"}]
+            if property_tables:
+                last = property_tables[-1]
+                at = last["start"] + len(last["raw"])
+                width = len(last["headers"])
+                new_rows = "".join("| " + " | ".join([field, value.replace("|", "\\|"), *([""] * (width - 2))]) + " |\n"
+                                   for field, value in missing.items())
+                edits.append((at, at, ("\n" if at and base_text[at - 1] != "\n" else "") + new_rows))
+            else:
+                at = end
+                while at > entry["source_location"]["start"] and base_text[at - 1] in "\r\n":
+                    at -= 1
+                edits.append((at, at, "\n" + "\n".join(f"- {field}：{value}" for field, value in missing.items()) + "\n"))
+    for start, end, value in sorted(edits, reverse=True):
+        base_text = base_text[:start] + value + base_text[end:]
+    if additions:
+        base_text = base_text.rstrip() + "\n\n" + "\n\n".join(additions) + "\n"
+    return base_text
 
 
 def list_states(project_id: int) -> dict:
@@ -270,6 +322,8 @@ def apply_state_change(
             lines.insert(insert_at, updated_line)
 
     atomic_write_text(path, compose_document(meta, "\n".join(lines).rstrip() + "\n"))
+    from .index_service import invalidate_knowledge
+    invalidate_knowledge(project_id, path.relative_to(project_dir).as_posix())
 
     with db.get_conn() as conn:
         conn.execute(
@@ -390,6 +444,8 @@ def _append_memory_line(project_id: int, character: str, know_what: str,
         lines.insert(insert_at, entry)
 
     atomic_write_text(path, compose_document(meta, "\n".join(lines).rstrip() + "\n"))
+    from .index_service import invalidate_knowledge
+    invalidate_knowledge(project_id, path.relative_to(project_dir).as_posix())
 
 
 def memory_digest(project_id: int, names: list[str], limit: int = 6) -> dict[str, list[str]]:
@@ -457,6 +513,8 @@ def update_character_field(
             lines.insert(insert_at, entry_line)
 
     atomic_write_text(path, compose_document(meta, "\n".join(lines).rstrip() + "\n"))
+    from .index_service import invalidate_knowledge
+    invalidate_knowledge(project_id, path.relative_to(project_dir).as_posix())
 
     with db.get_conn() as conn:
         conn.execute(

@@ -112,6 +112,8 @@ def resolve_keep_mine(project_id: int, rel_path: str, content: str) -> dict:
     snapshot_file(project_id, project_dir, row["name"], rel_path, reason="external-keep-mine")
     target = resolve_within(Path(project_dir), rel_path)
     atomic_write_text(target, content)
+    from .chapter_service import refresh_index
+    refresh_index(project_id, project_dir, rel_path)
     state = disk_state(project_dir, rel_path)
     return {"rel_path": rel_path, "mtime": state["mtime"], "hash": state["hash"],
             "resolution": "keep-mine"}
@@ -121,6 +123,8 @@ def resolve_take_external(project_id: int, rel_path: str) -> dict:
     """采用外部：返回磁盘内容与最新状态，编辑器以之刷新（磁盘不动）。"""
     _row, project_dir = get_project_dir(project_id)
     state = disk_state(project_dir, rel_path)
+    from .chapter_service import refresh_index
+    refresh_index(project_id, project_dir, rel_path)
     return {
         "rel_path": rel_path,
         "content": state["content"],

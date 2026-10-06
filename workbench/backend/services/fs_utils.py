@@ -246,6 +246,35 @@ def move_to_trash(project_name: str, project_dir: Path, rel_path: str) -> str:
     return f"{project_name}/{stamp}"
 
 
+def move_project_to_trash(project_name: str) -> str:
+    """把**整本书**目录移入回收站，返回条目 id ``{书名}/{时间戳}``。
+
+    与 :func:`move_to_trash` 的区别：这里移动的是 ``projects/{书名}/`` 项目根本身，
+    manifest 的 ``kind`` 固定为 ``"project"``、``rel_path`` 为空串，
+    供回收站列表区分「整本书」与「项目内文件/文件夹」条目。
+    """
+    source = Path(config.PROJECTS_DIR) / project_name
+    if not source.exists():
+        raise FileNotFoundError(f"项目目录不存在：{project_name}")
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    entry_dir = trash_root() / project_name / stamp
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(entry_dir / TRASH_PAYLOAD_NAME))
+
+    manifest = {
+        "project_name": project_name,
+        "rel_path": "",
+        "kind": "project",
+        "deleted_at": stamp,
+    }
+    atomic_write_text(
+        entry_dir / TRASH_MANIFEST_NAME,
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+    )
+    return f"{project_name}/{stamp}"
+
+
 def read_trash_manifest(entry_dir: Path) -> dict | None:
     """读取回收站条目的 entry.json；缺失或损坏时返回 None。"""
     manifest_path = Path(entry_dir) / TRASH_MANIFEST_NAME

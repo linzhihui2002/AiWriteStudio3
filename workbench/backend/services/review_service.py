@@ -10,18 +10,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from bisect import bisect_right
 from pathlib import Path
 
 from .. import db
-from ..gates import density_gate, language_gate, prose_gate
+from ..gates import density_gate, language_gate, novel_format, prose_gate, prose_quality
 from . import generation_service, operation_log, prompt_registry_service
 from .chapter_service import require_chapter_path
 from .contract_service import get_contract
 from .errors import InvalidOperationError, NodeNotFoundError
 from .fs_utils import count_words, read_text, split_frontmatter
 from .project_service import get_project_dir
+from .writing_preference_service import chapter_word_range
 
 MIN_CHAPTER_WORDS = 2000
 MAX_REVISE_ROUNDS = 2
@@ -58,12 +61,36 @@ def _loads(text: str | None, fallback: object = None):
         return fallback
 
 
+def _model_diagnostic(result: dict, *, label: str, invalid: bool = False) -> dict:
+    from .secret_store import redact
+    failed = not result.get("ok")
+    code = str(result.get("error_code") or "ENGINE_ERROR") if failed else \
+        "INVALID_MODEL_OUTPUT" if invalid else ""
+    message = str(result.get("error_message") or "模型引擎未完成执行") if failed else \
+        "模型返回的结构不符合要求，请重新运行" if invalid else ""
+    return {"ai_error_code": code, "ai_error": f"{label}：{redact(message)[:600]}" if message else "",
+            "task_id": result.get("task_id")}
+
+
+def contract_fingerprint(contract: dict | None) -> str:
+    """稳定序列化合同快照；无合同返回空值，调用方不能据此放行。"""
+    if contract is None:
+        return ""
+    serialized = json.dumps(contract, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 # ─────────────────────────── 硬门禁 ───────────────────────────
 
 
 def run_hard_gates(text: str, *, min_words: int = MIN_CHAPTER_WORDS,
+                   max_words: int | None = None,
                    project_dir: Path | None = None, rel_path: str | None = None) -> dict:
-    """确定性硬门禁：字数 / 语言 / 禁词密度 / 散文形状 / 记号泄漏。
+    """确定性硬门禁：字数 / 语言 / 禁词密度 / 散文形状 / 记号泄漏 / 正文格式。
+
+    ``min_words`` 为下限（调用方传入本书区间下限）；``max_words`` 为可选上限，
+    仅产出非阻断告警项，不影响 ``passed``。
 
     :return: ``{"passed", "gates": [...], "locations": [...]}``
     """
@@ -87,7 +114,7 @@ def run_hard_gates(text: str, *, min_words: int = MIN_CHAPTER_WORDS,
     if project_dir is not None:
         # Never use language_gate.load_whitelist: it walks beyond this book.
         root = Path(project_dir).resolve()
-        directory = (root / (rel_path or "章节/正文.md")).resolve().parent
+        directory = (root / (rel_path or "章节/正文.txt")).resolve().parent
         if directory != root and root not in directory.parents:
             raise InvalidOperationError("白名单读取路径越出本书")
         while True:
@@ -179,6 +206,42 @@ def run_hard_gates(text: str, *, min_words: int = MIN_CHAPTER_WORDS,
     for item in leaks[:20]:
         locations.append({"gate": "记号泄漏", **item})
 
+    # 6) 正文格式门（番茄纯文本规范：Markdown 标记泄漏 / 重复标题行 / 引号配对 / 标点混用）
+    #    规划记号词表仍以本模块 MARKER_PATTERNS 为唯一事实源（上面的「记号泄漏」门），
+    #    格式门不重抄一份，两门并列执行。
+    fmt = novel_format.run(body)
+    gates.append(
+        {
+            "key": "格式门",
+            "passed": fmt.passed,
+            "detail": fmt.report(),
+            "blocking": not fmt.passed,
+            "findings": [
+                {"line": item.line, "column": item.column, "reason": item.reason,
+                 "text": item.text}
+                for item in fmt.findings[:20]
+            ],
+            "warnings": [
+                {"line": item.line, "reason": item.reason, "text": item.text}
+                for item in fmt.warnings[:20]
+            ],
+        }
+    )
+    for item in fmt.findings[:20]:
+        locations.append({"gate": "格式门", "line": item.line, "text": item.text,
+                          "reason": item.reason})
+
+    # 7) 字数上限（非阻断：超出本书区间上限只告警，不拒绝落盘）
+    if max_words is not None:
+        gates.append(
+            {
+                "key": "字数上限",
+                "passed": words <= max_words,
+                "detail": f"正文 {words} 汉字（上限 {max_words} 汉字）",
+                "blocking": False,
+            }
+        )
+
     blocking = [gate for gate in gates if gate.get("blocking")]
     return {
         "passed": not blocking,
@@ -193,53 +256,71 @@ def run_hard_gates(text: str, *, min_words: int = MIN_CHAPTER_WORDS,
 
 
 def check_ledger_arithmetic(project_dir: Path) -> list[dict]:
-    """数值算术（确定性）：检查 ``状态/资源账本.md`` 的收支与前值是否自洽。"""
+    """Validate actual ledger tables; incomplete rows remain explicitly unverified."""
     path = Path(project_dir) / "状态" / "资源账本.md"
     if not path.is_file():
         return []
     text = split_frontmatter(read_text(path))[1]
     problems: list[dict] = []
     balances: dict[str, float] = {}
-
-    row_re = re.compile(r"^\s*\|([^|]+)\|([^|]*)\|([^|]*)\|([^|]*)\|")
+    header: dict[str, int] | None = None
+    aliases = {"item": {"物品", "资源", "名称", "资产"},
+               "chapter": {"章节", "章号", "来源章节"},
+               "delta": {"增减", "变动", "本次变动", "变化"},
+               "balance": {"结余", "余额", "剩余", "当前余额"},
+               "before": {"前值", "上期结余", "之前余额"}}
     for line_no, line in enumerate(text.splitlines(), start=1):
-        match = row_re.match(line)
-        if not match:
+        if not line.lstrip().startswith("|"):
+            if line.lstrip().startswith("#"):
+                header = None
             continue
-        item = match.group(1).strip()
-        if not item or item in ("物品", "资源", "名称") or set(item) <= {"-", " "}:
+        cells = [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+        if not cells or all(re.fullmatch(r":?-+:?", cell.replace(" ", "")) for cell in cells):
             continue
-        chapter = match.group(2).strip()
-        delta_text = match.group(3).strip()
-        balance_text = match.group(4).strip()
-
-        delta = _to_number(delta_text)
-        balance = _to_number(balance_text)
-        if delta is None or balance is None:
+        mapped = {key: index for key, names in aliases.items()
+                  for index, cell in enumerate(cells) if cell in names}
+        if "item" in mapped:
+            header = mapped if "delta" in mapped and "balance" in mapped else None
             continue
-        previous = balances.get(item)
-        if previous is not None and abs(previous + delta - balance) > 1e-6:
-            problems.append(
-                {
-                    "类型": "数值算术",
-                    "说明": f"「{item}」在 {chapter} 的收支不自洽：前值 {previous} + 变动 {delta} ≠ {balance}",
-                    "依据": line.strip(),
-                    "line": line_no,
-                }
-            )
-        balances[item] = balance
+        current = header
+        if current is None:
+            # Old ingestion rows had no header but a canonical chapter and signed change.
+            if (len(cells) >= 4 and re.fullmatch(r"第\d+章", cells[1])
+                    and re.fullmatch(r"[+-]\d+(?:\.\d+)?", cells[2])):
+                current = {"item": 0, "chapter": 1, "delta": 2, "balance": 3}
+            else:
+                continue
+        def value(key):
+            index = current.get(key)
+            return cells[index] if index is not None and index < len(cells) else ""
+        item, chapter = value("item"), value("chapter")
+        if not item:
+            continue
+        delta, balance = _to_number(value("delta")), _to_number(value("balance"))
+        previous = _to_number(value("before")) if "before" in current else balances.get(item)
+        if delta is None or balance is None or previous is None:
+            missing = "、".join(name for name, amount in (("前值", previous), ("变动", delta), ("结余", balance)) if amount is None)
+            problems.append({"类型": "数值算术", "判定": ITEM_UNVERIFIED,
+                             "说明": f"「{item}」在 {chapter} 的{missing}待核实，尚不能验证收支守恒",
+                             "依据": line.strip(), "line": line_no})
+        elif abs(previous + delta - balance) > 1e-6:
+            problems.append({"类型": "数值算术", "说明": f"「{item}」在 {chapter} 的收支不自洽：前值 {previous} + 变动 {delta} ≠ {balance}",
+                             "依据": line.strip(), "line": line_no})
+        if balance is not None:
+            balances[item] = balance
+        else:
+            balances.pop(item, None)
     return problems
 
 
 def _to_number(text: str) -> float | None:
-    if not text:
-        return None
-    cleaned = text.replace(",", "").replace("+", "").strip()
-    match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
-    if not match:
+    import math
+    cleaned = str(text or "").replace(",", "").strip()
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", cleaned):
         return None
     try:
-        return float(match.group(0))
+        value = float(cleaned)
+        return value if math.isfinite(value) else None
     except ValueError:
         return None
 
@@ -318,13 +399,45 @@ def check_entity_coverage(project_dir: Path, text: str) -> list[dict]:
 # ─────────────────────────── 逐项审稿 ───────────────────────────
 
 
-def _ai_review(project_id: int, chapter_rel: str, text: str) -> dict | None:
+def _ai_review(project_id: int, chapter_rel: str, text: str, *,
+               should_cancel=None, contract: dict | None = None,
+               quality: dict | None = None, history: dict | None = None) -> dict | None:
     prompt = prompt_registry_service.get_prompt("novel.review.contract")
     from .context_service import assemble, to_messages
 
-    context = assemble(project_id, chapter_rel=chapter_rel, query="")
+    context = assemble(project_id, chapter_rel=chapter_rel, query="", retrieval_profile="review",
+                       document={"rel_path": chapter_rel, "text": split_frontmatter(text)[1]})
     _system, messages = to_messages(context, system=prompt["body"])
-    messages.append({"role": "user", "content": f"【待审正文】\n{split_frontmatter(text)[1]}"})
+    contract_input = ""
+    if contract is not None:
+        contract_input = (
+            "【本轮章节合同（本次逐项验收依据）】\n" + _json(contract) + "\n"
+            "逐项覆盖 plot_points 和 must_connect，每条的「项」照录合同原文。"
+            "「证据」只填待审正文中的连续原文，不附解释或省略号；证据位置放在单独字段。\n"
+        )
+    quality = quality if quality is not None else prose_quality.diagnose_prose(split_frontmatter(text)[1])
+    expression_input = ""
+    if quality.get("findings"):
+        expression_input = (
+            "【表达线索，仅供判断，不影响合同判定】\n"
+            + "\n".join(f"第{item['line']}行：{item['reason']}；原文：{item['text'][:160]}"
+                        for item in quality["findings"][:6])
+            + "\n有意复沓可以保留；仅将有依据的表达意见放入「表达建议」，不得作为合同失败。\n"
+        )
+    from . import prose_history_service
+    history = history if history is not None else prose_history_service.diagnose_for_chapter(
+        project_id, chapter_rel, split_frontmatter(text)[1])
+    history_input = ""
+    if history.get("sources"):
+        history_input = (
+            "【近期正文的跨章表达线索，仅供判断，不影响合同判定】\n"
+            + _json({"status": history["status"], "sources": history["sources"],
+                     "reference_hash": history["reference_hash"],
+                     "findings": history.get("findings", [])[:6]})
+            + "\n必要的回声可以保留；不得仅因跨章复读阻断本章或要求自动改稿。\n"
+        )
+    messages.append({"role": "user", "content": contract_input + expression_input + history_input
+                     + f"【待审正文】\n{split_frontmatter(text)[1]}"})
 
     result = generation_service.run_task(
         project_id=project_id,
@@ -333,12 +446,18 @@ def _ai_review(project_id: int, chapter_rel: str, text: str) -> dict | None:
         messages=messages,
         prompt_id=prompt["prompt_id"],
         prompt_version=prompt["version"],
-        context_snapshot={"chapter": chapter_rel, "tokens": context["total_tokens"]},
+        context_snapshot={"chapter": chapter_rel, "tokens": context["total_tokens"],
+                          "candidate_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                          "contract_hash": contract_fingerprint(contract),
+                          "prose_diagnostics_version": quality["version"],
+                          "prose_history": {key: history[key] for key in
+                              ("status", "sources", "reference_hash", "truncated")}},
         temperature=0.1,
+        should_cancel=should_cancel,
     )
-    if not result["ok"]:
-        return None
-    return _parse_json(result["text"])
+    parsed = _parse_json(str(result.get("text") or "")) if result.get("ok") else None
+    diagnostic = _model_diagnostic(result, label="AI 审稿未完成", invalid=parsed is None)
+    return {**(parsed or {}), "_diagnostic": diagnostic}
 
 
 def _parse_json(text: str) -> dict | None:
@@ -366,55 +485,226 @@ def review_chapter(
     register_debt: bool = True,
 ) -> dict:
     """对单章执行完整审稿（硬门禁 + 逐项验收 + 一致性），结果落 ``reviews`` 表。"""
-    row, project_dir = get_project_dir(project_id)
     path = require_chapter_path(project_id, chapter_rel)
     text = read_text(path)
+    result = review_text(project_id, chapter_rel, text, use_ai=use_ai,
+                         register_debt=register_debt)
+    from .errors import ServiceError
+    try:
+        result["source_changed"] = hashlib.sha256(read_text(require_chapter_path(
+            project_id, chapter_rel)).encode("utf-8")).hexdigest() != result["source_hash"]
+    except (OSError, UnicodeError, ServiceError):
+        result["source_changed"] = True
+    return result
+
+
+def _checked_review_item(entry: dict, body: str) -> dict:
+    """完成项必须附正文原文；不接受模型编造、解释或省略后的引用。"""
+    verdict = str(entry.get("判定") or ITEM_UNVERIFIED)
+    if verdict not in (ITEM_DONE, ITEM_TODO, ITEM_UNVERIFIED):
+        verdict = ITEM_UNVERIFIED
+    evidence = str(entry.get("证据") or "").strip()
+    item = {"项": str(entry.get("项") or "").strip(),
+            "判定": verdict, "证据": evidence}
+    if verdict == ITEM_DONE:
+        # The prompt requests plain excerpts, but accept an outer quotation pair.
+        # Do not normalize punctuation/whitespace within a quote: its source must
+        # actually exist in the candidate being reviewed.
+        quote = evidence
+        if quote not in body:
+            for left, right in (("“", "”"), ("「", "」"), ("『", "』"), ('"', '"'), ("'", "'")):
+                if quote.startswith(left) and quote.endswith(right) and len(quote) > 2:
+                    quote = quote[1:-1]
+                    break
+        position = body.find(quote) if quote else -1
+        if position < 0:
+            item["判定"] = ITEM_UNVERIFIED
+            item["核验说明"] = "完成项缺少候选正文中可定位的原文证据"
+        else:
+            item["证据"] = quote
+            item["证据行"] = body.count("\n", 0, position) + 1
+            item["证据列"] = position - body.rfind("\n", 0, position)
+    return item
+
+
+def _complete_contract_items(items: list[dict], contract: dict | None) -> list[dict]:
+    """补齐合同情节点与承上项；模型少列一项也不能获得通过结论。"""
+    if contract is None:
+        return items + [{"项": "章节合同", "判定": ITEM_UNVERIFIED, "证据": "",
+                         "核验说明": "未找到章节合同，无法逐项验收"}]
+    expected: list[dict] = []
+    matched_names: set[str] = set()
+    for field in ("plot_points", "must_connect"):
+        for point in contract.get(field) or []:
+            name = str(point).strip()
+            if not name:
+                continue
+            matching = [item for item in items if item["项"] == name]
+            # Conflicting duplicate verdicts cannot be resolved by accepting the
+            # first successful entry. Preserve the least certain/failing one.
+            item = next((item for item in matching if item["判定"] != ITEM_DONE),
+                        matching[0] if matching else None)
+            expected.append({**(item or {
+                "项": name, "判定": ITEM_UNVERIFIED, "证据": "",
+                "核验说明": "AI 审稿遗漏合同项，需重新核实",
+            }), "合同字段": field})
+            matched_names.add(name)
+    return expected + [item for item in items if item["项"] not in matched_names]
+
+
+EXPRESSION_KINDS = frozenset({"重复解释", "人物同声", "模板表达", "机械转场"})
+MAX_EXPRESSION_SUGGESTIONS = 12
+
+
+def _checked_expression_suggestions(entries: object, body: str) -> tuple[list[dict], int]:
+    """表达意见只保留可定位原文；不参与合同判定，也不转成自动修改。"""
+    if entries is None:
+        return [], 0
+    if not isinstance(entries, list):
+        return [], 1
+    checked: list[dict] = []
+    rejected = max(0, len(entries) - MAX_EXPRESSION_SUGGESTIONS)
+    seen: set[tuple[str, int, str]] = set()
+    line_starts = [0, *(match.end() for match in re.finditer(r"\r\n|\r|\n", body))]
+    for entry in entries[:MAX_EXPRESSION_SUGGESTIONS]:
+        if not isinstance(entry, dict):
+            rejected += 1
+            continue
+        kind, evidence, reason, suggestion = (entry.get(key) for key in ("类型", "证据", "问题", "建议"))
+        if (not all(isinstance(value, str) and value.strip() for value in (kind, evidence, reason, suggestion))
+                or kind not in EXPRESSION_KINDS or len(evidence) > 500
+                or len(reason) > 1000 or len(suggestion) > 1000):
+            rejected += 1
+            continue
+        quote = evidence.strip()
+        if quote not in body and len(quote) > 2 and (quote[0], quote[-1]) in (("“", "”"), ("「", "」"), ("『", "』"), ('"', '"')):
+            quote = quote[1:-1]
+        # An ambiguous excerpt cannot identify which passage the opinion means.
+        position = body.find(quote)
+        if len(quote) < 4 or position < 0 or body.find(quote, position + 1) >= 0:
+            rejected += 1
+            continue
+        key = (kind, position, suggestion.strip())
+        if key in seen:
+            rejected += 1
+            continue
+        seen.add(key)
+        line_index = bisect_right(line_starts, position) - 1
+        checked.append({"kind": kind, "evidence": quote,
+                        "line": line_index + 1, "column": position - line_starts[line_index] + 1,
+                        "reason": reason.strip(), "suggestion": suggestion.strip()})
+    return checked, rejected
+
+
+def review_text(
+    project_id: int,
+    chapter_rel: str,
+    text: str,
+    *,
+    use_ai: bool = True,
+    register_debt: bool = False,
+    candidate_hash: str = "",
+    should_cancel=None,
+) -> dict:
+    """审给定的候选全文，无需先把新稿写入章节；空的已建章节也会执行 AI 审稿。
+
+    路径仍须是本书现有章节，正文只取 ``text``。``candidate_hash`` 如提供，
+    必须等于原始 ``text`` 的 UTF-8 SHA256（不剥 frontmatter、不规范换行）。
+    审稿与合同快照摘要落入 payload，供管线确认结论所针对的版本。
+    """
+    _row, project_dir = get_project_dir(project_id)
+    require_chapter_path(project_id, chapter_rel)
+    if not isinstance(text, str):
+        raise InvalidOperationError("候选正文必须为文本")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if candidate_hash and candidate_hash != digest:
+        raise InvalidOperationError("候选正文 hash 不匹配，拒绝审稿")
     body = split_frontmatter(text)[1]
 
-    hard = run_hard_gates(body, project_dir=project_dir, rel_path=chapter_rel)
+    contract = None
+    try:
+        contract = get_contract(project_id, chapter_rel)
+    except NodeNotFoundError:
+        pass
+    contract_hash = contract_fingerprint(contract)
+
+    word_min, word_max = chapter_word_range(project_id)
+    hard = run_hard_gates(body, project_dir=project_dir, rel_path=chapter_rel,
+                          min_words=word_min, max_words=word_max)
+    quality = prose_quality.diagnose_prose(body)
+    from . import prose_history_service
+    history = prose_history_service.diagnose_for_chapter(project_id, chapter_rel, body)
+    expression_suggestions: list[dict] = []
+    rejected_expression_suggestions = 0
     items: list[dict] = []
     consistency: list[dict] = []
     revise_instructions: list[str] = []
     ai_used = False
+    ai_error = ""
+    ai_error_code = ""
+    task_id = None
 
     if use_ai:
-        ai = _ai_review(project_id, chapter_rel, text)
-        if ai:
-            ai_used = True
-            for entry in ai.get("逐项") or []:
-                verdict = str(entry.get("判定") or ITEM_UNVERIFIED)
-                if verdict not in (ITEM_DONE, ITEM_TODO, ITEM_UNVERIFIED):
-                    verdict = ITEM_UNVERIFIED
-                items.append(
-                    {
-                        "项": str(entry.get("项") or ""),
-                        "判定": verdict,
-                        "证据": str(entry.get("证据") or ""),
-                    }
-                )
+        try:
+            ai = _ai_review(project_id, chapter_rel, text,
+                            should_cancel=should_cancel, contract=contract, quality=quality, history=history)
+        except Exception as exc:  # Model/context failures must never become acceptance.
+            ai = None
+            ai_error = f"AI 审稿异常：{type(exc).__name__}"
+            ai_error_code = "REVIEW_EXCEPTION"
+        if isinstance(ai, dict):
+            diagnostic = ai.get("_diagnostic") or {}
+            ai_error = diagnostic.get("ai_error", ai_error)
+            ai_error_code = diagnostic.get("ai_error_code", ai_error_code)
+            task_id = diagnostic.get("task_id")
+        if (isinstance(ai, dict) and isinstance(ai.get("逐项"), list)
+                and isinstance(ai.get("一致性", []), list)
+                and isinstance(ai.get("修改指令", []), list)):
+            entries = [entry for entry in ai["逐项"]
+                       if isinstance(entry, dict) and str(entry.get("项") or "").strip()]
+            ai_used = bool(entries)
+            items.extend(_checked_review_item(entry, body) for entry in entries)
             consistency.extend(
                 {"类型": str(item.get("类型") or "设定口径"),
                  "说明": str(item.get("问题") or item.get("说明") or ""),
                  "证据": str(item.get("证据") or "")}
-                for item in (ai.get("一致性") or [])
+                for item in (ai.get("一致性") or []) if isinstance(item, dict)
             )
-            revise_instructions.extend(str(item) for item in (ai.get("修改指令") or []))
+            instructions = ai.get("修改指令") or []
+            if isinstance(instructions, list):
+                revise_instructions.extend(str(item) for item in instructions)
+            expression_suggestions, rejected_expression_suggestions = _checked_expression_suggestions(
+                ai.get("表达建议"), body)
+            if ai.get("结论") == STATUS_FAIL and items and all(
+                    item["判定"] == ITEM_DONE for item in items) and not consistency:
+                items.append({"项": "审稿结论", "判定": ITEM_UNVERIFIED, "证据": "",
+                              "核验说明": "AI 总结不通过，但逐项未说明原因，需重新核实"})
+        if not ai_used:
+            ai_error = ai_error or "AI 审稿失败或未返回可核验的逐项结果"
+            ai_error_code = ai_error_code or "INVALID_MODEL_OUTPUT"
+            items.append({"项": "AI 逐项验收", "判定": ITEM_UNVERIFIED, "证据": "",
+                          "核验说明": ai_error})
 
     # 确定性一致性检查（无论 AI 是否可用都要跑）
     consistency.extend(check_ledger_arithmetic(project_dir))
     consistency.extend(check_entity_coverage(project_dir, text))
 
-    # 合同项兜底：无 AI 时按合同情节点逐项列「待核实」（待核实不算通过）
-    contract = None
+    items = _complete_contract_items(items, contract)
+    if not items:
+        items.append({"项": "逐项验收", "判定": ITEM_UNVERIFIED, "证据": "",
+                      "核验说明": "合同没有可核验条目且未获得 AI 逐项结果"})
+
+    # Do not certify an old contract when the author changed it while a model
+    # was reviewing. Proposal application checks it again under the book lock.
+    current_contract = None
     try:
-        contract = get_contract(project_id, chapter_rel)
+        current_contract = get_contract(project_id, chapter_rel)
     except NodeNotFoundError:
-        contract = None
-    if not items and contract:
-        items = [
-            {"项": str(point), "判定": ITEM_UNVERIFIED, "证据": ""}
-            for point in contract.get("plot_points") or []
-        ]
+        pass
+    contract_changed = contract_fingerprint(current_contract) != contract_hash
+    if contract_changed:
+        items.append({"项": "章节合同版本", "判定": ITEM_UNVERIFIED, "证据": "",
+                      "核验说明": "审稿期间合同已变更，需按当前合同重新审稿"})
 
     unfinished = [item for item in items if item["判定"] != ITEM_DONE]
     verdict = STATUS_PASS if (hard["passed"] and not unfinished and not consistency) \
@@ -426,7 +716,18 @@ def review_chapter(
         "items": items,
         "consistency": consistency,
         "revise_instructions": revise_instructions,
+        "prose_quality": quality,
+        "prose_history": history,
+        "prose_review": expression_suggestions,
+        "rejected_expression_suggestions": rejected_expression_suggestions,
         "ai_used": ai_used,
+        "ai_error": ai_error,
+        "ai_error_code": ai_error_code,
+        "task_id": task_id,
+        "source_hash": digest,
+        "candidate_hash": digest,
+        "contract_hash": contract_hash,
+        "contract_changed": contract_changed,
         "words": hard["words"],
         "contract_present": contract is not None,
         "counts": {
@@ -448,7 +749,8 @@ def review_chapter(
         register_quality_debt(project_id, chapter_rel, payload)
 
     operation_log.log(project_id, "review", chapter_rel,
-                      {"review_id": review_id, "verdict": verdict})
+                      {"review_id": review_id, "verdict": verdict,
+                       "candidate_hash": digest, "contract_hash": contract_hash})
     return {"review_id": review_id, "rel_path": chapter_rel, "verdict": verdict, **payload}
 
 
@@ -467,68 +769,137 @@ def soft_deslop(
     同时给出**文风指纹比对**（候选文本 vs 作者认可样本），供人工参照（不阻断）。
     """
     from . import style_service
+    from .context_service import assemble, to_messages
+    from .file_change_service import content_hash, project_lock
 
     row, project_dir = get_project_dir(project_id)
-    path = require_chapter_path(project_id, chapter_rel)
-    text = read_text(path)
+    with project_lock(project_id):
+        path = require_chapter_path(project_id, chapter_rel)
+        text = read_text(path)
+    digest = content_hash(text)
     body = split_frontmatter(text)[1]
 
     comparison = style_service.compare(project_id, text)
     suggestions: list[dict] = []
+    rejected_suggestions: list[dict] = []
+    ai_used = False
+    ai_error = ""
+    ai_error_code = ""
+    task_id = None
+    source_changed = False
+    context_snapshot: dict = {"chapter": chapter_rel, "candidate_hash": digest}
+
+    def source_has_changed() -> bool:
+        # Resolve again: the file may have disappeared or become an unsafe link
+        # while the model was running. Such a source cannot receive a proposal.
+        from .errors import ServiceError
+        try:
+            return content_hash(read_text(require_chapter_path(project_id, chapter_rel))) != digest
+        except (ServiceError, OSError, UnicodeError):
+            return True
 
     if use_ai:
         prompt = prompt_registry_service.get_prompt("novel.deslop.soft")
-        result = generation_service.run_task(
-            project_id=project_id,
-            task_type="去AI味软审",
-            system=prompt["body"],
-            messages=[
-                {
-                    "role": "user",
-                    "content": "【待检正文（带行号）】\n"
-                    + "\n".join(f"{index}: {line}"
-                                for index, line in enumerate(body.splitlines(), start=1)),
-                }
-            ],
-            prompt_id=prompt["prompt_id"],
-            prompt_version=prompt["version"],
-            temperature=0.2,
-        )
-        if result["ok"]:
-            parsed = _parse_json(result["text"]) or {}
-            for item in parsed.get("建议") or []:
-                if not isinstance(item, dict):
-                    continue
-                suggestions.append(
-                    {
-                        "line": int(item.get("行") or 0),
-                        "issue": str(item.get("问题") or ""),
-                        "original": str(item.get("原文") or ""),
-                        "replacement": str(item.get("建议") or ""),
-                    }
-                )
+        try:
+            context = assemble(project_id, chapter_rel=chapter_rel, query="",
+                               retrieval_profile="review", include_style=True,
+                               document={"rel_path": chapter_rel, "text": body})
+            _system, messages = to_messages(context, system=prompt["body"])
+            messages.append({"role": "user", "content": "【待检正文（带行号）】\n"
+                             + "\n".join(f"{index}: {line}"
+                                         for index, line in enumerate(body.splitlines(), start=1))})
+            context_snapshot.update(tokens=context["total_tokens"],
+                                    style_reference=context.get("style_reference", {}))
+            result = generation_service.run_task(
+                project_id=project_id, task_type="去AI味软审", system=prompt["body"],
+                messages=messages, prompt_id=prompt["prompt_id"], prompt_version=prompt["version"],
+                context_snapshot=context_snapshot, temperature=0.2,
+            )
+            parsed = _parse_json(str(result.get("text") or "")) if result.get("ok") else None
+            task_id = result.get("task_id")
+            if isinstance(parsed, dict) and isinstance(parsed.get("建议"), list):
+                ai_used = True  # A valid empty array means the model found no suggestions.
+                lines = body.splitlines()
+                occupied: dict[int, list[tuple[int, int]]] = {}
+                entries = parsed["建议"]
+                for index, item in enumerate(entries[:50]):
+                    reason = ""
+                    if not isinstance(item, dict):
+                        reason = "建议格式无效"
+                    else:
+                        line = item.get("行")
+                        if isinstance(line, str) and re.fullmatch(r"[0-9]+", line) and len(line) <= 8:
+                            line = int(line)
+                        original, replacement, issue = (item.get(key) for key in ("原文", "建议", "问题"))
+                        if not isinstance(line, int) or isinstance(line, bool) or not 1 <= line <= len(lines):
+                            reason = "行号无效或越出正文"
+                        elif (not isinstance(original, str) or not original.strip()
+                              or not isinstance(replacement, str) or not replacement.strip()
+                              or not isinstance(issue, str) or not issue.strip()):
+                            reason = "缺少原文、替换正文或问题说明"
+                        elif any(char in original or char in replacement for char in ("\n", "\r", "\u2028", "\u2029")):
+                            reason = "行级建议不能跨行"
+                        elif original == replacement:
+                            reason = "建议未产生变化"
+                        else:
+                            target = lines[line - 1]
+                            start = target.find(original)
+                            if start < 0 or target.find(original, start + 1) >= 0:
+                                reason = "原文未在指定正文行唯一出现"
+                            elif text.find(original, text.find(original) + 1) >= 0:
+                                reason = "原文在全文出现多次，无法唯一应用精确替换"
+                            else:
+                                end = start + len(original)
+                                if any(start < right and end > left for left, right in occupied.get(line, [])):
+                                    reason = "原文与已有建议重复或重叠"
+                                else:
+                                    occupied.setdefault(line, []).append((start, end))
+                                    suggestions.append({"line": line, "issue": issue.strip(),
+                                                        "original": original, "replacement": replacement})
+                    if reason:
+                        rejected_suggestions.append({"index": index, "reason": reason})
+                if len(entries) > 50:
+                    rejected_suggestions.append({"index": 50, "reason": "建议超过 50 条处理上限",
+                                                 "count": len(entries) - 50})
+            else:
+                diagnostic = _model_diagnostic(result, label="AI 软审未完成", invalid=True)
+                ai_error, ai_error_code = diagnostic["ai_error"], diagnostic["ai_error_code"]
+        except Exception as exc:
+            ai_error = f"AI 软审异常：{type(exc).__name__}，尚未完成表达审查"
+            ai_error_code = "REVIEW_EXCEPTION"
 
     proposal_ids: list[int] = []
     if create_proposals:
         from . import proposal_service
 
-        for item in suggestions:
-            if not item["replacement"] or item["line"] < 1:
-                continue
-            proposal = proposal_service.create_proposal(
-                project_id=project_id,
-                kind="deslop",
-                title=f"第 {item['line']} 行：{item['issue'][:20] or '去AI味建议'}",
-                target_path=chapter_rel,
-                content=item["replacement"],
-                meta={"patch": item, "issue": item["issue"]},
-            )
-            proposal_ids.append(proposal["id"])
+        with project_lock(project_id):
+            source_changed = source_has_changed()
+            if not source_changed:
+                for item in suggestions:
+                    proposal = proposal_service.create_proposal(
+                        project_id=project_id, kind="deslop",
+                        title=f"第 {item['line']} 行：{item['issue'][:20] or '去AI味建议'}",
+                        target_path=chapter_rel, content=item["replacement"],
+                        meta={"patch": item, "issue": item["issue"], "candidate_hash": digest,
+                              "style_reference": context_snapshot.get("style_reference", {})},
+                    )
+                    proposal_ids.append(proposal["id"])
+    else:
+        with project_lock(project_id):
+            source_changed = source_has_changed()
 
     return {
         "project_id": project_id,
         "chapter_rel": chapter_rel,
         "suggestions": suggestions,
+        "rejected_suggestions": rejected_suggestions,
+        "candidate_hash": digest,
+        "source_hash": digest,
+        "source_changed": source_changed,
+        "ai_used": ai_used,
+        "ai_error": ai_error,
+        "ai_error_code": ai_error_code,
+        "task_id": task_id,
         "proposal_ids": proposal_ids,
         "style_comparison": comparison,
         "project_name": row["name"],
@@ -640,6 +1011,7 @@ def quality_matrix(project_id: int) -> dict:
         debts.setdefault(item["rel_path"], []).append(dict(item))
 
     # 逐章硬门禁（确定性，实时跑；字数/空章快速判断）
+    word_min, word_max = chapter_word_range(project_id)
     matrix: list[dict] = []
     for chapter in chapters:
         rel_path = chapter["rel_path"]
@@ -650,17 +1022,30 @@ def quality_matrix(project_id: int) -> dict:
         except (OSError, UnicodeDecodeError):
             text = ""
         if text.strip():
-            hard = run_hard_gates(text, project_dir=project_dir, rel_path=rel_path)
-            cells = {
-                "字数门": _cell(hard["gates"][0]["passed"]),
-                "语言门": _cell(hard["gates"][1]["passed"]),
-                "禁词门": _cell(hard["gates"][2]["passed"]),
-                "去AI味": _cell(hard["gates"][3]["passed"]),
-            }
+            hard = run_hard_gates(text, project_dir=project_dir, rel_path=rel_path,
+                                  min_words=word_min, max_words=word_max)
+            by_key = {gate["key"]: gate for gate in hard["gates"]}
+            cells = {label: _cell(bool(by_key.get(key, {}).get("passed")))
+                     for label, key in (("字数门", "字数门"), ("语言门", "语言门"),
+                                       ("禁词门", "禁词门"), ("去AI味", "去AI味门"),
+                                       ("格式门", "格式门"))}
+            cells["硬门禁总状态"] = _cell(hard["passed"])
         else:
-            cells = {"字数门": "未跑", "语言门": "未跑", "禁词门": "未跑", "去AI味": "未跑"}
+            cells = {name: "未跑" for name in ("字数门", "语言门", "禁词门", "去AI味", "格式门", "硬门禁总状态")}
 
         review = latest_reviews.get(rel_path)
+        if review and review.get("candidate_hash") and review["candidate_hash"] != \
+                hashlib.sha256(text.encode("utf-8")).hexdigest():
+            # A candidate-only review is not an acceptance of the on-disk draft.
+            review = None
+        if review and review.get("contract_hash"):
+            current_contract = None
+            try:
+                current_contract = get_contract(project_id, rel_path)
+            except NodeNotFoundError:
+                pass
+            if contract_fingerprint(current_contract) != review["contract_hash"]:
+                review = None
         if review:
             counts = review.get("counts") or {}
             cells["逐项审稿"] = _cell(
@@ -696,7 +1081,7 @@ def quality_matrix(project_id: int) -> dict:
         "project_name": row["name"],
         "chapters": matrix,
         "summary": summary,
-        "columns": ["字数门", "语言门", "禁词门", "去AI味", "一致性", "逐项审稿"],
+        "columns": ["字数门", "语言门", "禁词门", "去AI味", "格式门", "硬门禁总状态", "一致性", "逐项审稿"],
     }
 
 
@@ -734,12 +1119,14 @@ __all__ = [
     "classify_debt",
     "check_entity_coverage",
     "check_ledger_arithmetic",
+    "contract_fingerprint",
     "list_debts",
     "list_reviews",
     "quality_matrix",
     "register_quality_debt",
     "resolve_debt",
     "review_chapter",
+    "review_text",
     "run_hard_gates",
     "soft_deslop",
     "verify_state_changes",

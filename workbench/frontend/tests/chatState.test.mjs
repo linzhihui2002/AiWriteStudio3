@@ -93,10 +93,10 @@ test('removing the open file as a reference retains an independent chapter targe
 })
 
 test('approval explanation reflects the running permission and dangerous operation', () => {
-  const interaction = { payload: { operation: 'rewrite', path: '章节/第0001章.md' } }
-  assert.match(approvalReason(interaction, 'auto'), /整篇覆盖/)
-  assert.match(approvalReason(interaction, 'ask'), /逐次批准/)
-  assert.equal(approvalReason({ payload: { ...interaction.payload, reason: '检测到版本冲突' } }, 'full'), '检测到版本冲突')
+  const destructive = { payload: { operation: 'delete', path: '章节/第0001章.md' } }
+  assert.match(approvalReason(destructive, 'auto'), /删除或移动/)
+  assert.match(approvalReason({ payload: { operation: 'rewrite', path: '章节/第0001章.md' } }, 'ask'), /逐次批准/)
+  assert.equal(approvalReason({ payload: { ...destructive.payload, reason: '检测到版本冲突' } }, 'full'), '检测到版本冲突')
 })
 
 test('a late response snapshot cannot remove newer streamed text or restore an answered question', () => {
@@ -182,6 +182,14 @@ test('interaction, memory and title API calls use the agreed structured bodies',
   assert.equal(calls[2].options.method, 'PATCH')
   assert.deepEqual(JSON.parse(calls[2].options.body), { content: '主角务实' })
   assert.equal(calls[3].url, '/api/chat/sessions/12/title/regenerate')
+})
+
+test('task-scoped approval is sent as one structured decision body', async (context) => {
+  const calls = []
+  context.mock.method(globalThis, 'fetch', async (url, options) => { calls.push({ url, options }); return new Response('{}', { headers: { 'Content-Type': 'application/json' } }) })
+  await respondChatInteraction('run-a', 'approval-2', { decision: 'approve', scope: 'task' })
+  assert.equal(calls[0].url, '/api/chat/runs/run-a/interactions/approval-2/respond')
+  assert.deepEqual(JSON.parse(calls[0].options.body), { response: { decision: 'approve', scope: 'task' } })
 })
 
 test('project chat defaults and explicit continuation use the agreed API bodies', async (context) => {

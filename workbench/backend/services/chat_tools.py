@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import chapter_service, operation_log, proposal_service, review_service
+from . import chapter_service, chat_preference_service, operation_log, proposal_service, review_service, scope_guard
 from .asset_card_service import BASE_CATEGORIES
 from .errors import InvalidOperationError, NodeNotFoundError
 from .fs_utils import read_text, resolve_within
@@ -34,6 +34,8 @@ WRITE_DIRS: tuple[str, ...] = (chapter_service.CHAPTER_DIR, "设定", "大纲", 
 STATE_FILE = "状态/角色状态.md"
 FORESHADOW_FILE = "设定/伏笔管理.md"
 OUTLINE_FILES: dict[str, str] = {"大纲": "大纲/大纲.md", "章纲": "大纲/章纲.md"}
+#: ``check_tracking`` 的默认目标文件（设定分类映射见 ``gates.setting_gate.CATEGORY_FILES``）
+CHECK_TRACKING_FILES: dict[str, str] = {"账本": "状态/资源账本.md", "大纲": "大纲/章纲.md"}
 
 
 @dataclass
@@ -46,6 +48,10 @@ class ToolContext:
     auto_apply: bool = False
     task_id: int | None = None
     proposals: list[int] = field(default_factory=list)
+    #: 本轮写域（由路由声明的可写材料；None = 本轮未接入写域判定）
+    scope: dict | None = None
+    #: 越界授权与留痕的键（run_id，无 run_id 时建议传 ``session:<id>``）
+    scope_key: str = ""
 
 
 # ─────────────────────────── 结果与校验 ───────────────────────────
@@ -81,6 +87,16 @@ def _read_rel(ctx: ToolContext, rel: str) -> str:
     if not path.is_file():
         raise NodeNotFoundError(f"文件不存在：{rel}")
     return read_text(path)
+
+
+def _read_history_rel(ctx: ToolContext, rel: str) -> str:
+    """Specialized fact tools share the automatic context's history rules."""
+    from . import ingestion_records, knowledge_lifecycle
+    text = _read_rel(ctx, rel)
+    number = chapter_service.parse_chapter_number(Path(ctx.chapter_rel).name) if ctx.chapter_rel else None
+    text = ingestion_records.project_text(ctx.project_id, text, preserve_offsets=False, chapter_before=number)
+    return knowledge_lifecycle.project_text(text, profile="history", chapter_before=number,
+        at_chapter=(number - 1) if number and rel == STATE_FILE else None, preserve_offsets=False)
 
 
 def _validate_content(content: object, *, limit: int = MAX_WRITE_CHARS) -> str:
@@ -159,12 +175,12 @@ def tool_read_setting(args: dict, ctx: ToolContext) -> dict:
         raise InvalidOperationError(
             f"未知设定分类：{category}（可用：{'、'.join(BASE_CATEGORIES)}）"
         )
-    content = _read_rel(ctx, rel).strip()
+    content = _read_history_rel(ctx, rel).strip()
     return _ok(f"已读取 {rel}", _clip(content) or "（文件为空）")
 
 
 def tool_read_character_state(args: dict, ctx: ToolContext) -> dict:
-    content = _read_rel(ctx, STATE_FILE).strip()
+    content = _read_history_rel(ctx, STATE_FILE).strip()
     names = [str(name).strip() for name in (args.get("names") or []) if str(name).strip()]
     if names and content:
         blocks = _split_sections(content)
@@ -190,7 +206,7 @@ def _split_sections(text: str) -> list[str]:
 
 
 def tool_list_foreshadows(args: dict, ctx: ToolContext) -> dict:
-    content = _read_rel(ctx, FORESHADOW_FILE).strip()
+    content = _read_history_rel(ctx, FORESHADOW_FILE).strip()
     if not content:
         return _ok("伏笔台账为空", "（文件为空）")
     status = str(args.get("status") or "").strip()
@@ -246,6 +262,42 @@ def tool_run_gates(args: dict, ctx: ToolContext) -> dict:
     )
 
 
+def tool_check_tracking(args: dict, ctx: ToolContext) -> dict:
+    """确定性校验（账本算术 / 章纲 / 设定字段）：只报告不改写，不改动任何文件。"""
+    from workbench.backend.gates import outline_gate, setting_gate, tracking_gate
+
+    target = str(args.get("target") or "").strip()
+    rel = str(args.get("rel_path") or "").strip()
+    category = str(args.get("category") or "").strip()
+    if target not in CHECK_TRACKING_FILES and target != "设定":
+        raise InvalidOperationError("target 只支持：账本 / 大纲 / 设定")
+    if target == "设定":
+        options = "、".join(setting_gate.REQUIRED_FIELDS)
+        if not rel and not category:
+            raise InvalidOperationError(f"target=设定 需要给出 category（{options}）或 rel_path")
+        if not rel:
+            rel = setting_gate.CATEGORY_FILES.get(category, "")
+            if not rel:
+                result = {**setting_gate.run("", category=category), "path": None}
+                return _ok("设定分类不可用：" + category,
+                           _clip(json.dumps(result, ensure_ascii=False, indent=2)), data=result)
+        elif not category:
+            category = setting_gate.category_from_path(rel)
+    else:
+        rel = rel or CHECK_TRACKING_FILES[target]
+
+    text = _read_rel(ctx, rel)
+    if target == "账本":
+        result = tracking_gate.run(text)
+    elif target == "大纲":
+        result = outline_gate.run(text)
+    else:
+        result = setting_gate.run(text, category=category)
+    payload = {**result, "path": rel}
+    summary = f"{rel} 校验{'通过' if result['passed'] else '未通过'}：{result['detail']}"
+    return _ok(summary, _clip(json.dumps(payload, ensure_ascii=False, indent=2)), data=payload)
+
+
 def tool_list_teardown(args: dict, ctx: ToolContext) -> dict:
     from . import teardown_service
 
@@ -272,7 +324,36 @@ def tool_list_teardown(args: dict, ctx: ToolContext) -> dict:
     return _ok("拆书资产召回", _clip(str(block)))
 
 
+def tool_read_skill_reference(args: dict, ctx: ToolContext) -> dict:
+    """读取技能 ``references/`` 下的明细清单（只读，与本书目录无关）。"""
+    from . import skill_service
+
+    skill = str(args.get("skill") or "").strip()
+    rel = str(args.get("path") or "").strip()
+    if not skill or not rel:
+        raise InvalidOperationError("需要同时提供 skill 与 path")
+    reference = skill_service.read_reference(skill, rel)
+    return _ok(f"已读取技能 {reference['skill']} 的 {reference['path']}",
+               reference["content"], estimated_tokens=reference["estimated_tokens"], truncated=False)
+
+
 # ─────────────────────────── 写工具 ───────────────────────────
+
+
+def _scope_key(ctx: ToolContext) -> str:
+    return ctx.scope_key or (f"session:{ctx.session_id}" if ctx.session_id else "")
+
+
+def _scope_decision(ctx: ToolContext, rel_path: str) -> tuple[dict, dict]:
+    """写域判定 + 写进提案 meta 的中文说明（判定顺序：只读 → 写域 → auto_apply）。"""
+    key = _scope_key(ctx)
+    scope = {**ctx.scope, "key": key} if isinstance(ctx.scope, dict) and key else ctx.scope
+    decision = scope_guard.evaluate(scope, rel_path)
+    meta = {"out_of_scope": not decision["allowed"],
+            "material": str(decision.get("material") or ""),
+            "reason": str(decision.get("reason") or ""),
+            "label": scope_guard.describe(scope)}
+    return decision, meta
 
 
 def _create_write_proposal(
@@ -284,6 +365,17 @@ def _create_write_proposal(
     content: str,
     meta: dict | None = None,
 ) -> dict:
+    decision, scope_meta = _scope_decision(ctx, target_path)
+    out_of_scope = not decision["allowed"]
+    if out_of_scope and ctx.auto_apply:
+        if chat_preference_service.get_scope_prefs()["scope_strictness"] == "reject":
+            scope_guard.trace(_scope_key(ctx), action="chat-scope-reject",
+                              message=f"越界写入已拒绝：{target_path}（{scope_guard.describe(ctx.scope)}）",
+                              rel_path=target_path, project_id=ctx.project_id)
+            return {"ok": False, "applied": False, "code": "out_of_scope",
+                    "summary": f"越界：{decision['reason']}；严格模式已拒绝写入",
+                    "text": f"越界：{decision['reason']}。本轮不写 {target_path}，文件保持原样。",
+                    "scope": scope_meta}
     proposal = proposal_service.create_proposal(
         project_id=ctx.project_id,
         kind=kind,
@@ -291,12 +383,13 @@ def _create_write_proposal(
         target_path=target_path,
         content=content,
         task_id=ctx.task_id,
-        meta={"from": "chat-tool", "session_id": ctx.session_id, **(meta or {})},
+        meta={"from": "chat-tool", "session_id": ctx.session_id, "scope": scope_meta,
+              **(meta or {})},
     )
     added = sum(1 for item in proposal.get("diff", []) if item["type"] == "add")
     removed = sum(1 for item in proposal.get("diff", []) if item["type"] == "remove")
     ctx.proposals.append(int(proposal["id"]))
-    if ctx.auto_apply:
+    if ctx.auto_apply and not out_of_scope:
         applied = proposal_service.apply_proposal(int(proposal["id"]))
         detail = applied.get("meta") or {}
         extra = f"，{detail['word_count']} 字" if detail.get("word_count") else ""
@@ -308,11 +401,13 @@ def _create_write_proposal(
             proposal_ids=[int(proposal["id"])],
             applied=True,
         )
+    note = f"；{decision['reason']}，需作者在收件箱确认" if out_of_scope else ""
     return _ok(
-        f"已生成待确认草稿 → {target_path}（+{added}/-{removed} 行），请在收件箱确认",
+        f"已生成待确认草稿 → {target_path}（+{added}/-{removed} 行）{note}，请在收件箱确认",
         f"提案 #{proposal['id']} 待处理：应用前会展示差异，未落盘。",
         proposal_ids=[int(proposal["id"])],
         applied=False,
+        scope=scope_meta,
     )
 
 
@@ -447,11 +542,29 @@ TOOLS: tuple[dict, ...] = (
         "run": tool_run_gates,
     },
     {
+        "name": "check_tracking",
+        "label": "校验账本与大纲",
+        "write": False,
+        "desc": "确定性校验：账本算术与条目ID、章纲章号唯一/连续与卷末钩子、设定卡必填字段与来源分级。只报告不改写，不改动任何文件。",
+        "args": {"target": "账本 | 大纲 | 设定",
+                 "rel_path": "本书相对路径（可选，默认用该目标的默认文件）",
+                 "category": "target=设定 时的分类：人物 | 世界 | 势力 | 物品 | 技能 | 场景 | 伏笔 | 状态"},
+        "run": tool_check_tracking,
+    },
+    {
         "name": "list_teardown",
         "label": "召回拆书资产",
         "write": False,
         "args": {"target": "对标书名（可选）", "genre": "题材（可选）", "limit": "条数（默认 3）"},
         "run": tool_list_teardown,
+    },
+    {
+        "name": "read_skill_reference",
+        "label": "读技能引用",
+        "write": False,
+        "args": {"skill": "技能名（kebab-case），如 novel-setting",
+                 "path": "该技能 references/ 下的相对路径，如 references/设定字段规范.md"},
+        "run": tool_read_skill_reference,
     },
     {
         "name": "propose_chapter_edit",
@@ -515,7 +628,10 @@ def describe_for_prompt() -> str:
     for item in TOOLS:
         args = ", ".join(f"{key}: {desc}" for key, desc in item["args"].items())
         tag = "写" if item["write"] else "读"
-        lines.append(f"- {item['name']}({args})　[{tag}] {item['label']}")
+        note = f"　{item['desc']}" if item.get("desc") else ""
+        if item["write"]:
+            note += "　写域由本轮路由决定，越界需作者批准。"
+        lines.append(f"- {item['name']}({args})　[{tag}] {item['label']}{note}")
     return "\n".join(lines)
 
 

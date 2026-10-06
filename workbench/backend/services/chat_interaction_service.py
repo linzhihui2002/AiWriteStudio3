@@ -124,6 +124,23 @@ def list_interactions(run_id: str) -> list[dict]:
     return items
 
 
+def has_task_approval(run_id: str) -> bool:
+    """本次运行内作者是否已选择「本任务内不再询问」。
+
+    任务级批准只存在于当前 run 的交互记录里，任务结束即自然失效；
+    不写持久表，也不影响其他会话或后续轮次。
+    """
+    try:
+        identity = str(uuid.UUID(str(run_id)))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    ensure_schema()
+    return any(item["kind"] == "approval" and item["status"] == "answered"
+               and (item.get("response") or {}).get("decision") == "approve"
+               and (item.get("response") or {}).get("scope") == "task"
+               for item in _disk_items(identity))
+
+
 def _waiting_state(run_id: str) -> str | None:
     """Only change an active run; a cancellation can never be revived by an answer."""
     pending = any(item["status"] == "pending" for item in _disk_items(run_id))
@@ -198,7 +215,13 @@ def _validate_response(item: dict, response: dict) -> dict:
     if item["kind"] == "approval":
         if response.get("decision") not in {"approve", "reject"}:
             raise InvalidOperationError("请选择批准或拒绝")
-        return {"decision": response["decision"]}
+        normalized = {"decision": response["decision"]}
+        # scope=task 表示作者选择「本任务内不再询问」；scope=material 表示「本任务内允许
+        # 改这类材料」（写域越界授权，不纳入免询范围）；scope=once 表示「仅此次批准」。
+        # 三者都只在批准时生效。
+        if response["decision"] == "approve" and response.get("scope") in {"task", "material", "once"}:
+            normalized["scope"] = response["scope"]
+        return normalized
     answers = response.get("answers")
     questions = item["payload"]["questions"]
     if not isinstance(answers, list) or len(answers) != len(questions):

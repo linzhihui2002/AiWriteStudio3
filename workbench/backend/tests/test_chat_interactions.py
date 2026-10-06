@@ -14,7 +14,8 @@ import pytest
 from workbench.backend import config, db
 from workbench.backend.services import (
     chat_interaction_service as interactions, chat_service,
-    chat_workspace_tools as tools, file_change_service as changes, project_service,
+    chat_workspace_tools as tools, file_change_service as changes, operation_log,
+    project_service, scope_guard, settings_service,
 )
 from workbench.backend.services.errors import InvalidOperationError, NodeNotFoundError
 from workbench.backend.tests.test_file_changes import BODY
@@ -65,9 +66,13 @@ def book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def pending(book, kind=None):
+    return pending_in(book, book.run_id, kind)
+
+
+def pending_in(book, run_id, kind=None):
     until = time.monotonic() + 5
     while time.monotonic() < until:
-        rows = interactions.list_interactions(book.run_id)
+        rows = interactions.list_interactions(run_id)
         match = next((item for item in rows if item["status"] == "pending" and (kind is None or item["kind"] == kind)), None)
         if match and book.control.waiting:
             return match
@@ -159,21 +164,114 @@ def test_approval_exact_preview_and_apply_once(book):
 
 @pytest.mark.parametrize("operation,args", [
     ("delete_file", {}), ("move_file", {"destination": "备忘录/改名.md"}),
-    ("write_file", {"content": "整篇新内容"}),
-    ("replace_text", {"old_text": "原文。\n保留这一行。\n", "new_text": "整篇替换"}),
 ])
-def test_auto_high_impact_operations_require_approval_and_reject(book, operation, args):
+def test_auto_destructive_operations_still_require_approval_and_reject(book, operation, args):
     book.ctx["permission_mode"] = "auto"
     rel, target = seed(book)
     before = target.read_text(encoding="utf-8")
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(tools.execute, operation, {"rel_path": rel, **args}, book.ctx)
         item = pending(book, "approval")
+        assert "删除或移动" in item["payload"]["reason"]
         approve(book, item, "reject")
         result = future.result(timeout=3)
     assert not result["ok"] and result["code"] == "approval_rejected"
     assert target.read_text(encoding="utf-8") == before
     assert changes.list_changes(book.run_id) == []
+
+
+@pytest.mark.parametrize("operation,args", [
+    ("write_file", {"content": "整篇新内容"}),
+    ("replace_text", {"old_text": "原文。\n保留这一行。\n", "new_text": "整篇替换"}),
+    ("replace_text", {"old_text": "原文。", "new_text": "局部修订。"}),
+])
+def test_auto_rewrite_of_existing_body_skips_approval(book, operation, args):
+    book.ctx["permission_mode"] = "auto"
+    rel, _target = seed(book)
+    result = tools.execute(operation, {"rel_path": rel, **args}, book.ctx)
+    assert result["ok"] and result["applied"], result
+    # 自动模式下改写已有正文不再产生审批卡，但仍写入门禁校验过的写前预览。
+    assert interactions.list_interactions(book.run_id) == []
+    assert len(changes.list_changes(book.run_id)) == 1
+
+
+def test_auto_chapter_rewrite_and_whole_replace_skip_approval(book):
+    book.ctx["permission_mode"] = "auto"
+    rel = "章节/第0001章.txt"
+    assert tools.execute("create_file", {"rel_path": rel, "content": BODY}, book.ctx)["ok"]
+    original = changes.file_state(book.id, rel)["content"]
+    book.ctx["tool_call_id"] = "chapter-rewrite"
+    assert tools.execute("write_file", {"rel_path": rel, "content": original + "\n他数了数手里的铜钱，又放了回去。"},
+                         book.ctx)["ok"]
+    # 整章替换（old_text 覆盖已有正文）同样不弹卡
+    book.ctx["tool_call_id"] = "chapter-whole-replace"
+    replaced = tools.execute("replace_text", {"rel_path": rel, "old_text": changes.file_state(book.id, rel)["content"],
+                                              "new_text": original}, book.ctx)
+    assert replaced["ok"] and replaced["applied"], replaced
+    assert changes.file_state(book.id, rel)["content"] == original
+    assert interactions.list_interactions(book.run_id) == []
+
+
+def test_auto_write_reuses_gate_checked_preview_without_approval(book, monkeypatch):
+    """auto 模式无需审批时仍要把写前预览传给落盘，避免重复计算与绕过门禁。"""
+    book.ctx["permission_mode"] = "auto"
+    rel, target = seed(book)
+    seen = {}
+    original = changes.apply_change
+
+    def spy(project_id, **kwargs):
+        seen.update(kwargs)
+        return original(project_id, **kwargs)
+
+    monkeypatch.setattr(changes, "apply_change", spy)
+    assert tools.execute("replace_text", {"rel_path": rel, "old_text": "原文。", "new_text": "修订。"}, book.ctx)["ok"]
+    preview = seen.get("approved_preview")
+    assert preview and preview["after_content"] == "修订。\n保留这一行。\n"
+    assert target.read_text(encoding="utf-8") == "修订。\n保留这一行。\n"
+    assert interactions.list_interactions(book.run_id) == []
+
+
+def test_ask_task_approval_releases_later_writes_in_same_run(book):
+    rel, target = seed(book)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "replace_text",
+                             {"rel_path": rel, "old_text": "原文。", "new_text": "第一次修订。"}, book.ctx)
+        item = pending(book, "approval")
+        responded = interactions.respond(book.run_id, item["id"], {"decision": "approve", "scope": "task"})
+        assert responded["response"] == {"decision": "approve", "scope": "task"}
+        assert future.result(timeout=3)["ok"]
+    book.ctx["tool_call_id"] = "write-two"
+    second = tools.execute("write_file", {"rel_path": rel, "content": "第二次整体改写。"}, book.ctx)
+    assert second["ok"] and second["applied"]
+    assert target.read_text(encoding="utf-8") == "第二次整体改写。"
+    # 同一 run 内不再弹卡，任务级批准不落持久表。
+    assert [item["kind"] for item in interactions.list_interactions(book.run_id)] == ["approval"]
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chat_interactions").fetchone()[0] == 1
+
+
+def test_reject_and_other_runs_do_not_inherit_task_approval(book):
+    rel, _target = seed(book)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "replace_text",
+                             {"rel_path": rel, "old_text": "原文。", "new_text": "被打回。"}, book.ctx)
+        item = pending(book, "approval")
+        approve(book, item, "reject")
+        assert future.result(timeout=3)["code"] == "approval_rejected"
+    assert interactions.has_task_approval(book.run_id) is False
+    # 任务级批准不跨 run：另一个 run 的写操作仍然弹卡。
+    other_run = str(uuid.uuid4())
+    with db.get_conn() as conn:
+        conn.execute("UPDATE chat_runs SET status='completed' WHERE id=?", (book.run_id,))
+        conn.execute("INSERT INTO chat_runs(id,session_id,project_id,client_request_id,request,status)"
+                     " VALUES (?,?,?,?,?,'running')", (other_run, book.session, book.id, "other", "{}"))
+    other_ctx = {**book.ctx, "run_id": other_run, "tool_call_id": "other-run-write"}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file", {"rel_path": rel, "content": "另一轮改写。"}, other_ctx)
+        card = pending_in(book, other_run, "approval")
+        interactions.respond(other_run, card["id"], {"decision": "approve"})
+        assert future.result(timeout=3)["ok"]
+    assert interactions.has_task_approval(other_run) is False
 
 
 def test_auto_new_and_local_replace_skip_approval(book):
@@ -268,11 +366,12 @@ def test_disk_records_rebuild_cache_and_cross_run_answer_is_rejected(book):
 
 
 def test_preview_is_pure_and_applies_identical_normalized_chapter(book):
-    rel = "章节/第0001章.md"
+    rel = "章节/第0001章.txt"
     kwargs = {"operation": "create", "rel_path": rel, "content": BODY, "title": "规范化标题"}
     preview = changes.preview_change(book.id, **kwargs)
     assert preview["gates"]["passed"]
-    assert preview["after_content"].startswith("---\n标题: 规范化标题\n")
+    # 章节正文为规范化的纯正文；预览内容必须与实际写入完全一致。
+    assert preview["after_content"].endswith(BODY)
     assert not (book.root / rel).exists()
     assert changes.list_changes(book.run_id) == []
     result = changes.apply_change(book.id, run_id=book.run_id, session_id=book.session,
@@ -414,11 +513,11 @@ def test_cancel_after_approval_during_snapshot_never_writes_manuscript(book, mon
 
 
 def test_approval_never_disables_chapter_gates(book):
-    preview = changes.preview_change(book.id, operation="create", rel_path="章节/第0001章.md", content="短稿")
+    preview = changes.preview_change(book.id, operation="create", rel_path="章节/第0001章.txt", content="短稿")
     with pytest.raises(changes.GateRejectedError):
         changes.apply_change(book.id, run_id=book.run_id, session_id=book.session, tool_call_id="gates-preview",
-            operation="create", rel_path="章节/第0001章.md", content="短稿", approved_preview=preview, validate_gates=False)
-    assert not (book.root / "章节/第0001章.md").exists()
+            operation="create", rel_path="章节/第0001章.txt", content="短稿", approved_preview=preview, validate_gates=False)
+    assert not (book.root / "章节/第0001章.txt").exists()
 
 
 def test_pending_creation_is_atomic_with_waiting_run_snapshot(book, monkeypatch):
@@ -469,3 +568,211 @@ def test_concurrent_duplicate_approvals_commit_only_once(book):
         assert waiting.result(timeout=3)["ok"]
     assert target.read_text(encoding="utf-8") == "批准后的内容。\n保留这一行。\n"
     assert len(changes.list_changes(book.run_id)) == 1
+
+
+# ───────────────────── 写域（两维判定）：只读 → 写域 → 批准强度 ─────────────────────
+
+
+def _scoped_ctx(book, *, permission="auto", targets=("设定",), call="scope-write"):
+    """带本轮写域的工具上下文（写域由路由声明的材料集合归一而来）。"""
+    scope = scope_guard.build_scope(project_id=book.id, write_targets=list(targets))
+    return {**book.ctx, "tool_call_id": call, "permission_mode": permission, "scope": scope}
+
+
+def _seed_file(book, ctx, rel, content):
+    target = book.root / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    assert tools.execute("read_file", {"rel_path": rel}, ctx)["ok"]
+    return target
+
+
+@pytest.mark.parametrize("permission,expects_card", [("ask", True), ("auto", False), ("full", False)])
+def test_in_scope_write_keeps_each_permission_mode_intact(book, permission, expects_card):
+    ctx = _scoped_ctx(book, permission=permission, call=f"in-scope-{permission}")
+    target = _seed_file(book, ctx, "设定/人物设定.md", "旧设定。\n")
+    args = {"rel_path": "设定/人物设定.md", "old_text": "旧设定。", "new_text": "新设定。"}
+    if not expects_card:
+        result = tools.execute("replace_text", args, ctx)
+        assert interactions.list_interactions(book.run_id) == []
+    else:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(tools.execute, "replace_text", args, ctx)
+            item = pending(book, "approval")
+            assert "scope" not in item["payload"]      # 范围内不标越界
+            approve(book, item)
+            result = future.result(timeout=3)
+    assert result["ok"] and result["applied"], result
+    assert target.read_text(encoding="utf-8") == "新设定。\n"
+
+
+def test_out_of_scope_in_auto_degrades_to_single_approval(book):
+    ctx = _scoped_ctx(book, permission="auto", call="oos-auto")
+    target = _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file",
+                             {"rel_path": "大纲/大纲.md", "content": "新大纲。"}, ctx)
+        item = pending(book, "approval")
+        payload = item["payload"]
+        assert payload["scope"]["out_of_scope"] is True
+        assert payload["scope"]["material"] == "大纲"
+        assert payload["scope"]["label"] == "本轮范围：设定/"
+        assert payload["reason"] == "越界：本轮范围是 设定/，此操作会改 大纲/"
+        assert [option["id"] for option in payload["scope"]["options"]] == ["once", "material"]
+        assert target.read_text(encoding="utf-8") == "旧大纲。\n"    # 弹卡期间不落盘
+        assert changes.list_changes(book.run_id) == []
+        approve(book, item)
+        result = future.result(timeout=3)
+    assert result["ok"] and result["applied"], result
+    assert target.read_text(encoding="utf-8") == "新大纲。"
+
+
+def test_out_of_scope_rejection_keeps_file_and_explains_reason(book):
+    ctx = _scoped_ctx(book, permission="auto", call="oos-reject")
+    target = _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file",
+                             {"rel_path": "大纲/大纲.md", "content": "不该写入。"}, ctx)
+        item = pending(book, "approval")
+        approve(book, item, "reject")
+        result = future.result(timeout=3)
+    assert result["ok"] is False and result["code"] == "approval_rejected"
+    assert "越界" in result["summary"] and "大纲" in result["summary"]
+    assert result["scope"]["out_of_scope"] is True
+    assert target.read_text(encoding="utf-8") == "旧大纲。\n"
+    assert changes.list_changes(book.run_id) == []
+
+
+def test_out_of_scope_full_allows_with_trace_then_limit_forces_approval(book):
+    ctx = _scoped_ctx(book, permission="full", call="oos-full")
+    target = _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    result = tools.execute("write_file", {"rel_path": "大纲/大纲.md", "content": "完全访问新大纲。"}, ctx)
+    assert result["ok"] and result["applied"], result
+    assert result["scope"]["out_of_scope"] is True
+    assert result["scope"]["resolved"] == "full_allow"
+    assert target.read_text(encoding="utf-8") == "完全访问新大纲。"
+    assert interactions.list_interactions(book.run_id) == []
+    with db.get_conn() as conn:
+        events = [json.loads(row[0]) for row in conn.execute(
+            "SELECT payload FROM chat_run_events WHERE run_id=?", (book.run_id,))]
+    assert any("越界写入已按完全访问放行" in str(event.get("message") or "") for event in events)
+    assert any(entry["action"] == "chat-scope-full-allow" for entry in operation_log.recent(book.id))
+
+    # 开启「完全访问也受写域限制」后，同一越界写改为请求批准。
+    settings_service.update_settings({"chat": {"scope_limit_full": True}})
+    ctx["tool_call_id"] = "oos-full-limited"
+    _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file",
+                             {"rel_path": "大纲/大纲.md", "content": "受限后重写。"}, ctx)
+        item = pending(book, "approval")
+        assert item["payload"]["scope"]["out_of_scope"] is True
+        approve(book, item)
+        assert future.result(timeout=3)["ok"]
+
+
+def test_strict_mode_rejects_out_of_scope_without_card(book):
+    settings_service.update_settings({"chat": {"scope_strictness": "reject"}})
+    ctx = _scoped_ctx(book, permission="auto", call="oos-strict")
+    target = _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    result = tools.execute("write_file", {"rel_path": "大纲/大纲.md", "content": "不该写入。"}, ctx)
+    assert result["ok"] is False and result["code"] == "out_of_scope"
+    assert "越界" in result["summary"]
+    assert result["scope"]["out_of_scope"] is True
+    assert target.read_text(encoding="utf-8") == "旧大纲。\n"
+    assert interactions.list_interactions(book.run_id) == []
+    assert changes.list_changes(book.run_id) == []
+
+
+@pytest.mark.parametrize("permission", ["ask", "auto", "full"])
+def test_strict_reject_blocks_out_of_scope_in_every_permission_mode(book, permission):
+    """严格模式下档位不能绕过写域：三档的越界写都被直接拒绝。"""
+    settings_service.update_settings({"chat": {"scope_strictness": "reject"}})
+    ctx = _scoped_ctx(book, permission=permission, call=f"oos-strict-{permission}")
+    target = _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    result = tools.execute("write_file", {"rel_path": "大纲/大纲.md", "content": "不该写入。"}, ctx)
+    assert result["code"] == "out_of_scope" and target.read_text(encoding="utf-8") == "旧大纲。\n"
+
+
+@pytest.mark.parametrize("permission", ["ask", "auto", "full"])
+def test_read_only_rejects_even_in_scope_writes(book, permission):
+    ctx = _scoped_ctx(book, permission=permission, call=f"read-only-{permission}")
+    target = _seed_file(book, ctx, "设定/人物设定.md", "旧设定。\n")
+    ctx["read_only"] = True
+    result = tools.execute("replace_text", {"rel_path": "设定/人物设定.md",
+                                            "old_text": "旧设定。", "new_text": "不该写入。"}, ctx)
+    assert result["ok"] is False and "只读" in result["summary"]
+    assert target.read_text(encoding="utf-8") == "旧设定。\n"
+    assert changes.list_changes(book.run_id) == []
+
+
+def test_task_approval_does_not_exempt_out_of_scope(book):
+    interactions.ensure_schema()
+    interactions._save({"id": str(uuid.uuid4()), "run_id": book.run_id, "tool_call_id": "task-approve",
+                        "kind": "approval", "payload": {"operation": "delete"}, "payload_hash": "pre",
+                        "status": "answered", "response": {"decision": "approve", "scope": "task"},
+                        "created_at": "2026-01-01T00:00:00+00:00"})
+    assert interactions.has_task_approval(book.run_id) is True
+    # 范围内写入仍受既有「本任务内不再询问」豁免（语义未收紧）
+    in_scope = _scoped_ctx(book, permission="ask", call="in-scope-task-approval")
+    assert tools.execute("create_file", {"rel_path": "设定/新设定.md", "content": "新设定。"},
+                         in_scope)["ok"]
+    assert interactions.list_interactions(book.run_id)[-1]["kind"] == "approval"
+
+    ctx = _scoped_ctx(book, permission="auto", call="oos-task-approval")
+    _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file",
+                             {"rel_path": "大纲/大纲.md", "content": "越界重写。"}, ctx)
+        item = pending(book, "approval")           # 越界不被任务级批准免询
+        assert item["payload"]["scope"]["out_of_scope"] is True
+        approve(book, item)
+        assert future.result(timeout=3)["ok"]
+
+
+def test_material_grant_covers_rest_of_run(book):
+    ctx = _scoped_ctx(book, permission="auto", call="oos-grant-1")
+    _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    _seed_file(book, ctx, "状态/角色状态.md", "旧状态。\n")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file",
+                             {"rel_path": "大纲/大纲.md", "content": "一稿。"}, ctx)
+        item = pending(book, "approval")
+        interactions.respond(book.run_id, item["id"], {"decision": "approve", "scope": "material"})
+        assert future.result(timeout=3)["ok"]
+    assert scope_guard.grants(book.run_id) == {"大纲"}
+    # 同类材料在 run 内不再弹卡
+    ctx["tool_call_id"] = "oos-grant-2"
+    second = tools.execute("write_file", {"rel_path": "大纲/大纲.md", "content": "二稿。"}, ctx)
+    assert second["ok"] and second["applied"], second
+    # 其他材料仍需批准
+    ctx["tool_call_id"] = "oos-grant-3"
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file",
+                             {"rel_path": "状态/角色状态.md", "content": "新状态。"}, ctx)
+        card = pending(book, "approval")
+        assert card["payload"]["scope"]["material"] == "状态"
+        approve(book, card)
+        assert future.result(timeout=3)["ok"]
+    assert (book.root / "状态/角色状态.md").read_text(encoding="utf-8") == "新状态。"
+
+
+def test_once_approval_does_not_grant_material(book):
+    ctx = _scoped_ctx(book, permission="auto", call="oos-once-1")
+    _seed_file(book, ctx, "大纲/大纲.md", "旧大纲。\n")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file",
+                             {"rel_path": "大纲/大纲.md", "content": "一稿。"}, ctx)
+        item = pending(book, "approval")
+        interactions.respond(book.run_id, item["id"], {"decision": "approve", "scope": "once"})
+        assert future.result(timeout=3)["ok"]
+    assert scope_guard.grants(book.run_id) == set()
+    ctx["tool_call_id"] = "oos-once-2"
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tools.execute, "write_file",
+                             {"rel_path": "大纲/大纲.md", "content": "二稿。"}, ctx)
+        card = pending(book, "approval")
+        assert card["payload"]["scope"]["out_of_scope"] is True
+        approve(book, card)
+        assert future.result(timeout=3)["ok"]
+    assert (book.root / "大纲/大纲.md").read_text(encoding="utf-8") == "二稿。"

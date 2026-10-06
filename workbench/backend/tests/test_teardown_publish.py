@@ -130,7 +130,11 @@ def test_teardown_recall_by_genre_and_context_injection(workspace: SimpleNamespa
 
     # 上下文包第 4 级出现拆书对标块
     chapter = chapter_service.create_chapter(project_id, "第一章")
-    assembly = context_service.assemble(project_id, chapter_rel=chapter["rel_path"])
+    # 常规创作不自动引入参考作品；作者选择拆书场景后再注入。
+    normal = context_service.assemble(project_id, chapter_rel=chapter["rel_path"])
+    assert not any("拆书对标" in b["title"] for b in normal["blocks"])
+    assembly = context_service.assemble(project_id, chapter_rel=chapter["rel_path"],
+                                        retrieval_profile="teardown")
     teardown_blocks = [block for block in assembly["blocks"] if block["level"] == 4
                        and "拆书对标" in block["title"]]
     assert teardown_blocks, "同题材拆书事实应注入上下文第 4 级"
@@ -141,7 +145,7 @@ def test_teardown_recall_by_genre_and_context_injection(workspace: SimpleNamespa
     other = project_service.create_project(name="无关书", genre="言情")
     other_chapter = chapter_service.create_chapter(other["id"], "第一章")
     other_assembly = context_service.assemble(other["id"],
-                                             chapter_rel=other_chapter["rel_path"])
+                                             chapter_rel=other_chapter["rel_path"], retrieval_profile="teardown")
     assert not [block for block in other_assembly["blocks"]
                 if "拆书对标" in block.get("title", "")]
 
@@ -203,7 +207,7 @@ def test_publish_export_with_checklist(workspace: SimpleNamespace) -> None:
 
     checklist = {item["item"]: item for item in result["checklist"]}
     assert checklist["单章字数在建议区间"]["ok"] is False
-    assert checklist["章节状态均为「完成」"]["ok"] is False
+    assert checklist["章节均已定稿（完成 / 发表）"]["ok"] is False
     assert checklist["作品简介（一句话设定）"]["ok"] is True
     assert checklist["题材与标签"]["ok"] is True
 
@@ -214,6 +218,36 @@ def test_publish_export_with_checklist(workspace: SimpleNamespace) -> None:
 
     # 段落缩进：起点两格（正文非引号开头行）
     assert "　　正文内容。" in result["content"]
+
+
+@pytest.mark.parametrize("status", ["完成", "发表", "completed", "published"])
+def test_publish_final_states_are_exported_and_pass_status_check(
+    workspace: SimpleNamespace, status: str,
+) -> None:
+    project = project_service.create_project(name="已定稿书", genre="悬疑")
+    chapter = chapter_service.create_chapter(project["id"], "定稿章")
+    chapter_service.save_chapter(project["id"], chapter["rel_path"], "正文内容。" * 500)
+    # Existing metadata can contain the English legacy states consumed by the
+    # knowledge corpus; public metadata mutations still use the Chinese states.
+    with db.get_conn() as conn:
+        conn.execute("UPDATE chapters SET status=? WHERE project_id=? AND rel_path=?",
+                     (status, project["id"], chapter["rel_path"]))
+    draft = chapter_service.create_chapter(project["id"], "草稿章")
+    chapter_service.save_chapter(project["id"], draft["rel_path"], "草稿正文。" * 500)
+
+    result = publish_service.build_publish_export(project["id"], only_completed=True)
+
+    assert result["stats"]["chapters"] == 1
+    assert "定稿章" in result["content"] and "草稿章" not in result["content"]
+    assert not any(item["level"] == "未定稿" for item in result["warnings"])
+    status_check = next(item for item in result["checklist"]
+                        if item["item"] == "章节均已定稿（完成 / 发表）")
+    assert status_check["ok"] is True
+    assert status_check["basis"] == "全部为「完成 / 发表」"
+
+    all_chapters = publish_service.build_publish_export(project["id"])
+    drafts = [item for item in all_chapters["warnings"] if item["level"] == "未定稿"]
+    assert [item["rel_path"] for item in drafts] == [draft["rel_path"]]
 
 
 def test_publish_export_rejects_empty_and_unknown(workspace: SimpleNamespace) -> None:

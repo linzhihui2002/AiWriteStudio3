@@ -23,7 +23,11 @@ from workbench.backend.services import (
     transfer_service,
     tree_service,
 )
-from workbench.backend.services.errors import InvalidOperationError, NodeNotFoundError
+from workbench.backend.services.errors import (
+    InvalidNameError,
+    InvalidOperationError,
+    NodeNotFoundError,
+)
 from workbench.backend.services.fs_utils import (
     atomic_write_text,
     compose_document,
@@ -92,6 +96,108 @@ def test_save_as_template_and_open_book_with_it(workspace: SimpleNamespace) -> N
 
 def path_of(project: dict) -> Path:
     return Path(project["path"])
+
+
+def test_blank_template_and_file_tree_ops(workspace: SimpleNamespace) -> None:
+    created = template_service.create_blank_template("空骨架")
+    assert created["is_builtin"] is False
+    root = Path(created["path"])
+    assert (root / "设定" / "人物设定.md").is_file()
+
+    with pytest.raises(InvalidOperationError):
+        template_service.create_blank_template("空骨架")
+
+    node = template_service.create_template_node("空骨架", "设定", "势力", True)
+    assert node["type"] == "dir"
+    node = template_service.create_template_node("空骨架", "设定/势力", "势力设定", False)
+    assert node["rel_path"] == "设定/势力/势力设定.md"
+
+    written = template_service.write_template_file("空骨架", node["rel_path"], "正文内容")
+    assert written["is_empty"] is False
+    assert template_service.read_template_file("空骨架", node["rel_path"])["content"] == "正文内容"
+
+    tree = template_service.list_template_tree("空骨架")
+    assert any(item["name"] == "设定" for item in tree["nodes"])
+
+    renamed = template_service.rename_template_node("空骨架", "设定/势力/势力设定.md", "门派设定")
+    assert renamed["rel_path"] == "设定/势力/门派设定.md"
+    moved = template_service.move_template_node("空骨架", "设定/势力", "大纲")
+    assert moved["rel_path"] == "大纲/势力"
+    deleted = template_service.delete_template_node("空骨架", "大纲/势力/门派设定.md")
+    assert deleted["deleted"] is True and deleted["type"] == "file"
+
+
+def test_builtin_template_is_read_only(workspace: SimpleNamespace) -> None:
+    builtin = template_service.BUILTIN_TEMPLATE_NAME
+    assert template_service.list_template_tree(builtin)["exists"] is True
+    assert "设定/人物设定.md" in template_service.export_template(builtin)["files"]
+
+    with pytest.raises(InvalidOperationError):
+        template_service.write_template_file(builtin, "设定/人物设定.md", "x")
+    with pytest.raises(InvalidOperationError):
+        template_service.create_template_node(builtin, "设定", "新文件", False)
+    with pytest.raises(InvalidOperationError):
+        template_service.delete_template_node(builtin, "设定/人物设定.md")
+    with pytest.raises(InvalidOperationError):
+        template_service.rename_template(builtin, "改个名")
+
+    # 复制内置模板得到可编辑副本
+    copy = template_service.duplicate_template(builtin, "内置副本")
+    assert copy["is_builtin"] is False
+    assert template_service.write_template_file("内置副本", "设定/人物设定.md", "内容")["is_empty"] is False
+
+
+def test_rename_template_and_default_follows(workspace: SimpleNamespace) -> None:
+    template_service.create_blank_template("待改名")
+    template_service.update_template_prefs(default="待改名")
+
+    renamed = template_service.rename_template("待改名", "改名后")
+    assert Path(renamed["path"]).is_dir()
+    assert not (workspace.templates / "待改名").exists()
+
+    names = {item["name"] for item in template_service.list_templates()}
+    assert "改名后" in names and "待改名" not in names
+    assert template_service.get_template_prefs()["default"] == "改名后"
+
+
+def test_resolve_open_template_priority(workspace: SimpleNamespace) -> None:
+    template_service.create_blank_template("通用骨架")
+    template_service.create_blank_template("修仙骨架")
+    template_service.create_blank_template("番茄骨架")
+
+    # 无任何偏好 -> 内置默认模板
+    assert template_service.resolve_open_template(None, "修仙", "番茄") == (
+        template_service.BUILTIN_TEMPLATE_NAME
+    )
+
+    template_service.update_template_prefs(by_platform={"番茄": "番茄骨架"})
+    assert template_service.resolve_open_template(None, "修仙", "番茄") == "番茄骨架"
+
+    template_service.update_template_prefs(by_genre={"修仙": "修仙骨架"})
+    assert template_service.resolve_open_template(None, "修仙", "番茄") == "修仙骨架"
+
+    template_service.update_template_prefs(default="通用骨架")
+    assert template_service.resolve_open_template("修仙骨架", "修仙", "番茄") == "修仙骨架"
+    assert template_service.resolve_open_template(None, "未知", "未知") == "通用骨架"
+
+    with pytest.raises(InvalidOperationError):
+        template_service.update_template_prefs(by_genre={"仙侠": "不存在模板"})
+
+
+def test_export_import_template_roundtrip(workspace: SimpleNamespace) -> None:
+    template_service.create_blank_template("原模板")
+    template_service.write_template_file("原模板", "设定/人物设定.md", "主角设定")
+    package = template_service.export_template("原模板")
+    assert package["files"]["设定/人物设定.md"] == "主角设定"
+
+    imported = template_service.import_template(package, new_name="导入模板")
+    assert imported["is_builtin"] is False
+    assert template_service.read_template_file("导入模板", "设定/人物设定.md")["content"] == "主角设定"
+
+    with pytest.raises(InvalidOperationError):
+        template_service.import_template(package, new_name="导入模板")
+    with pytest.raises(InvalidNameError):
+        template_service.import_template({"name": "坏包", "files": {"../越界.md": "x"}})
 
 
 # ─────────────────────────── 索引与检索 ───────────────────────────
@@ -233,6 +339,10 @@ def test_conflict_detection_and_resolution(workspace: SimpleNamespace) -> None:
     kept = conflict_service.resolve_keep_mine(project["id"], rel_path, "我的版本")
     assert kept["resolution"] == "keep-mine"
     assert "我的版本" in read_text(workspace.projects / "冲突书" / rel_path)
+    with db.get_conn() as conn:
+        indexed = conn.execute("SELECT hash FROM index_docs WHERE project_id=? AND rel_path=?",
+                               (project["id"], rel_path)).fetchone()
+    assert indexed["hash"] == kept["hash"]
 
     # 保留我的要把外部版本先存快照
     snaps = snapshot_service.list_snapshots(project["id"], rel_path)
@@ -241,6 +351,10 @@ def test_conflict_detection_and_resolution(workspace: SimpleNamespace) -> None:
     atomic_write_text(workspace.projects / "冲突书" / rel_path, "外部版本二")
     taken = conflict_service.resolve_take_external(project["id"], rel_path)
     assert taken["content"].strip() == "外部版本二"
+    with db.get_conn() as conn:
+        indexed = conn.execute("SELECT hash FROM index_docs WHERE project_id=? AND rel_path=?",
+                               (project["id"], rel_path)).fetchone()
+    assert indexed["hash"] == taken["hash"]
 
     with pytest.raises(NodeNotFoundError):
         conflict_service.disk_state(workspace.projects / "冲突书", "章节/不存在.md")

@@ -12,7 +12,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, StrictBool
 
-from ..services import chat_preference_service, chapter_service, project_service, tree_service
+from ..services import (chat_preference_service, chapter_service, project_service,
+                        tree_service, writing_preference_service)
 
 router = APIRouter(prefix="/api", tags=["projects"])
 
@@ -44,6 +45,11 @@ class ArchiveIn(BaseModel):
 class ChatDefaultsIn(BaseModel):
     permission_mode: Literal["ask", "auto", "full"]
     discussion_only: StrictBool
+
+
+class WritingPrefsIn(BaseModel):
+    chapter_min_words: int = Field(description="每章正文汉字数下限；须为正整数且小于上限")
+    chapter_max_words: int = Field(description="每章正文汉字数上限；不超过 50000")
 
 
 class NodeCreateIn(BaseModel):
@@ -101,7 +107,18 @@ class CoverStateOut(BaseModel):
     has_cover: bool
 
 
+class ProjectDeleteOut(BaseModel):
+    id: int
+    name: str
+    deleted: bool = False
+    purged: bool = False
+
+
 class ChatDefaultsOut(ChatDefaultsIn):
+    source: Literal["book", "global"]
+
+
+class WritingPrefsOut(WritingPrefsIn):
     source: Literal["book", "global"]
 
 
@@ -183,6 +200,7 @@ class DeleteResultOut(BaseModel):
 class TrashEntryOut(BaseModel):
     trash_rel: str
     project_name: str
+    project_id: int | None = None
     rel_path: str | None = None
     kind: str | None = None
     deleted_at: str | None = None
@@ -191,6 +209,13 @@ class TrashEntryOut(BaseModel):
 class RestoreResultOut(BaseModel):
     rel_path: str
     restored_from: str
+
+
+class ChapterMigrationOut(BaseModel):
+    project_id: int
+    migrated: list[str] = Field(default_factory=list, description="本次迁移为 .txt 的章节")
+    skipped: list[str] = Field(default_factory=list, description="无需迁移（已是 .txt 或已存在同名 .txt）")
+    errors: list[dict] = Field(default_factory=list, description="逐条失败项（不阻断其它文件）")
 
 
 # ─────────────────────────── 项目 ───────────────────────────
@@ -217,7 +242,28 @@ def create_project(payload: ProjectCreateIn) -> dict:
 
 @router.get("/projects/{project_id}", response_model=ProjectOut)
 def get_project(project_id: int) -> dict:
-    return project_service.get_project(project_id)
+    """项目详情：打开本书时顺带执行一次章节 ``.md`` → ``.txt`` 幂等迁移。"""
+    _migrate_chapters_once(project_id)
+    detail = project_service.get_project(project_id)
+    # An external editor can change fact files while the workbench is closed.
+    # Reconcile basic knowledge on open; live source checks hide stale hits
+    # until the background projection catches up.
+    try:
+        from ..services import knowledge_service
+        knowledge_service.enqueue(project_id)
+    except Exception as exc:
+        from ..services import operation_log
+        operation_log.log(project_id, "knowledge-sync-warning", None,
+                          {"reason": str(exc)})
+    return detail
+
+
+def _migrate_chapters_once(project_id: int) -> None:
+    """打开项目时的章节迁移入口：失败不阻断打开（可手动重试）。"""
+    try:
+        chapter_service.migrate_chapter_files(project_id)
+    except Exception:  # noqa: BLE001 - 迁移失败不影响打开项目
+        pass
 
 
 @router.get("/projects/{project_id}/chat-defaults", response_model=ChatDefaultsOut)
@@ -230,6 +276,22 @@ def put_chat_defaults(project_id: int, payload: ChatDefaultsIn) -> dict:
     return chat_preference_service.update_chat_defaults(
         project_id, permission_mode=payload.permission_mode,
         discussion_only=payload.discussion_only,
+    )
+
+
+@router.get("/projects/{project_id}/writing-prefs", response_model=WritingPrefsOut)
+def get_writing_prefs(project_id: int) -> dict:
+    """本书每章字数区间：书级覆盖落盘 ``.meta/writing-prefs.json``，缺省回落全局 ``settings.writing``。"""
+    return writing_preference_service.get_writing_prefs(project_id)
+
+
+@router.put("/projects/{project_id}/writing-prefs", response_model=WritingPrefsOut)
+def put_writing_prefs(project_id: int, payload: WritingPrefsIn) -> dict:
+    """写入本书字数区间（下限小于上限、上限不超过 50000）；非法值返回 400。"""
+    return writing_preference_service.update_writing_prefs(
+        project_id,
+        chapter_min_words=payload.chapter_min_words,
+        chapter_max_words=payload.chapter_max_words,
     )
 
 
@@ -289,6 +351,20 @@ def unarchive_project(project_id: int) -> dict:
     return project_service.unarchive_project(project_id)
 
 
+@router.delete("/projects/{project_id}", response_model=ProjectDeleteOut)
+def delete_project(project_id: int, permanent: bool = False) -> dict:
+    """删除整本书：默认移入回收站（软删除，可恢复）；``permanent=true`` 彻底删除。"""
+    if permanent:
+        return project_service.purge_project(project_id)
+    return project_service.delete_project(project_id)
+
+
+@router.post("/projects/{project_id}/restore", response_model=RestoreResultOut)
+def restore_project(project_id: int) -> dict:
+    """从回收站恢复整本书（目录搬回 ``projects/{书名}/``）。"""
+    return project_service.restore_project(project_id)
+
+
 # ─────────────────────────── 文档树 ───────────────────────────
 
 
@@ -337,7 +413,7 @@ def list_chapters(project_id: int) -> list[dict]:
 
 @router.post("/projects/{project_id}/chapters", response_model=ChapterDetailOut, status_code=201)
 def create_chapter(project_id: int, payload: ChapterCreateIn | None = None) -> dict:
-    """新建章节：自动取下一个可用编号（``章节/第NNNN章.md``）。"""
+    """新建章节：自动取下一个可用编号（``章节/第NNNN章.txt``），标题写入 chapters 表。"""
     title = payload.title if payload is not None else None
     return chapter_service.create_chapter(project_id, title)
 
@@ -349,7 +425,7 @@ def read_chapter(project_id: int, rel_path: str = Query(...)) -> dict:
 
 @router.put("/projects/{project_id}/chapters/content", response_model=ChapterDetailOut)
 def save_chapter(project_id: int, payload: ChapterSaveIn) -> dict:
-    """保存章节正文（自动重算字数并回写 frontmatter）。"""
+    """保存章节正文（纯正文落盘，自动重算字数并同步 chapters 表）。"""
     return chapter_service.save_chapter(
         project_id, payload.rel_path, payload.content, payload.status,
         expected_hash=payload.expected_hash,
@@ -371,6 +447,12 @@ def delete_chapter(project_id: int, rel_path: str = Query(...)) -> dict:
     return chapter_service.delete_chapter(project_id, rel_path)
 
 
+@router.post("/projects/{project_id}/chapters/migrate", response_model=ChapterMigrationOut)
+def migrate_chapters(project_id: int) -> dict:
+    """把存量 ``章节/第NNNN章.md`` 幂等迁移为 ``第NNNN章.txt``（元数据入库，可重复执行）。"""
+    return {"project_id": project_id, **chapter_service.migrate_chapter_files(project_id)}
+
+
 # ─────────────────────────── 回收站 ───────────────────────────
 
 
@@ -382,3 +464,30 @@ def list_trash(project_id: int) -> list[dict]:
 @router.post("/projects/{project_id}/trash/restore", response_model=RestoreResultOut)
 def restore_from_trash(project_id: int, payload: TrashRestoreIn) -> dict:
     return chapter_service.restore_from_trash(project_id, payload.trash_rel)
+
+
+@router.get("/trash", response_model=list[TrashEntryOut])
+def list_all_trash() -> list[dict]:
+    """回收站总表：整本书（软删除）+ 各项目的文件/文件夹条目，按删除时间倒序。"""
+    entries: list[dict] = [
+        {
+            "trash_rel": "",
+            "project_name": item["name"],
+            "project_id": item["id"],
+            "rel_path": None,
+            "kind": "project",
+            "deleted_at": item["deleted_at"],
+        }
+        for item in project_service.list_deleted_projects()
+    ]
+    for entry in chapter_service.list_trash(None):
+        if entry.get("kind") in ("file", "dir"):
+            entries.append({**entry, "project_id": None})
+    entries.sort(key=lambda item: item.get("deleted_at") or "", reverse=True)
+    return entries
+
+
+@router.post("/trash/restore", response_model=RestoreResultOut)
+def restore_any_from_trash(payload: TrashRestoreIn) -> dict:
+    """恢复回收站中的文件/文件夹条目（跨项目；按 entry.json 的书名定位在架项目）。"""
+    return chapter_service.restore_from_trash_any(payload.trash_rel)

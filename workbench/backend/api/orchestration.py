@@ -62,6 +62,10 @@ class AgentIn(BaseModel):
     model_id: str = ""
     tools: list[str] = Field(default_factory=list)
     params: dict = Field(default_factory=dict)
+    materials: list[str] = Field(default_factory=list)
+    capabilities: list[dict] = Field(default_factory=list)
+    boundaries: str = ""
+    retrieval_profile: str = "history"
 
 
 class AgentPatchIn(BaseModel):
@@ -95,6 +99,9 @@ class RouteIn(BaseModel):
     text: str
     project_id: int | None = None
     agent: str = ""
+    active_file: str = ""
+    target_chapter: str = ""
+    context_hint: str = Field(default="", max_length=4000)
 
 
 class WorkflowIn(BaseModel):
@@ -163,8 +170,16 @@ class ChatMemoryIn(BaseModel):
 
 @router.get("/skills")
 def list_skills() -> dict:
-    return {"skills": skill_service.list_skills(),
-            "budget_bytes": skill_service.SKILL_BUDGET_BYTES,
+    """技能列表、正文 token 估算与绑定关系；不自动改写任何 Agent 定义。"""
+    items = skill_service.list_skills()
+    report = skill_service.binding_report()
+    for item in items:
+        binding = report.get(item["name"], {})
+        item["agents"] = list(binding.get("agents", []))
+        item["suggested_agents"] = list(binding.get("suggested_agents", []))
+        item["missing_references"] = list(binding.get("missing_references", []))
+    return {"skills": items,
+            "estimated_tokens": sum(item["estimated_tokens"] for item in items),
             "target_root": str(skill_service.dsh_skills_root())}
 
 
@@ -226,6 +241,7 @@ def list_agents(include_builtin: bool = False) -> dict:
         "agents": agent_service.list_agents(include_builtin=include_builtin),
         "builtin_count": len(agent_service.BUILTIN_AGENTS),
         "tool_whitelist": list(agent_service.TOOL_WHITELIST),
+        "material_dirs": list(agent_service.MATERIAL_DIRS),
     }
 
 
@@ -241,6 +257,8 @@ def create_agent(payload: AgentIn) -> dict:
         system_prompt=payload.system_prompt, skills=payload.skills,
         provider_id=payload.provider_id, model_id=payload.model_id,
         tools=payload.tools, params=payload.params,
+        materials=payload.materials, capabilities=payload.capabilities,
+        boundaries=payload.boundaries, retrieval_profile=payload.retrieval_profile,
     )
 
 
@@ -320,9 +338,17 @@ def routing_intents() -> dict:
 
 @router.post("/routing/route")
 def routing_route(payload: RouteIn) -> dict:
-    """只看路由决策（不执行、不落盘）。"""
+    """只看路由决策（不执行、不落盘）。
+
+    返回既有字段（``matched``/``intent``/``agent``/``skill``/``task_type``/
+    ``confidence``/``candidates``/``basis``）并附加本轮写域与计划：
+    ``write_targets``（产出材料）、``read_only_refs``（只读依据）、``plan``（多步协作，
+    每步含 agent / write_targets / read_only_refs）、``source``（override/keyword/llm/fallback）、
+    ``skills``、``scope_unresolved``、``reason``。
+    """
     return routing_service.route(payload.project_id, payload.text,
-                                 override_agent=payload.agent, record=False)
+        override_agent=payload.agent, active_file=payload.active_file,
+        target_chapter=payload.target_chapter, context_hint=payload.context_hint, record=False)
 
 
 # ─────────────────────────── 工作流 ───────────────────────────

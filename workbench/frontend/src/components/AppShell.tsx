@@ -1,201 +1,138 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { NavLink, Outlet, useLocation, useParams } from 'react-router-dom'
+import { Suspense, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { NavLink, Outlet, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { listProjects, listProposals } from '../api/client'
+import type { Project } from '../api/types'
 import PanelResizer from './PanelResizer'
 import ThemeSwitcher from './ThemeSwitcher'
-import { proposalCount } from '../api/client'
+import Icon, { type IconName } from './Icon'
 import { usePanelWidth } from '../state/usePanelWidth'
+import { useOverlayFocus } from '../state/useOverlayFocus'
 
-/** 项目内的六个工作区（均需项目上下文）。 */
-const PROJECT_SECTIONS = [
-  { key: 'editor', label: '正文编辑器' },
-  { key: 'outline', label: '大纲规划' },
-  { key: 'bible', label: 'Story Bible' },
-  { key: 'cards', label: '设定卡片' },
-  { key: 'teardown', label: '拆书资产库' },
-  { key: 'review', label: '审稿中心' },
-] as const
-
-/** 全局区（无需项目上下文）。 */
-const GLOBAL_SECTIONS = [
-  { key: 'bookshelf', label: '书架', to: '/', end: true },
-  { key: 'workflows', label: '工作流', to: '/workflows', end: false },
-  { key: 'inbox', label: '收件箱', to: '/inbox', end: false },
-  { key: 'dashboard', label: '仪表盘', to: '/dashboard', end: false },
-  { key: 'images', label: '生图工坊', to: '/images', end: false },
-  { key: 'settings', label: '设置', to: '/settings', end: false },
-] as const
-
-function resolveTitle(pathname: string): string {
-  if (pathname === '/') return '书架'
-  if (pathname.startsWith('/settings')) return '设置'
-  if (pathname.startsWith('/workflows')) return '工作流'
-  if (pathname.startsWith('/inbox')) return '收件箱'
-  if (pathname.startsWith('/dashboard')) return '仪表盘'
-  if (pathname.startsWith('/images')) return '生图工坊'
-  const matched = /^\/project\/[^/]+\/([^/]+)/.exec(pathname)
-  if (matched) {
-    const section = PROJECT_SECTIONS.find((item) => item.key === matched[1])
-    if (section) return section.label
-  }
-  return '未找到页面'
+const PROJECT_SECTIONS: { key: string; label: string; group: string; icon: IconName }[] = [
+  { key: 'chat', label: '创作对话', group: '创作', icon: 'chat' },
+  { key: 'editor', label: '正文编辑器', group: '创作', icon: 'file' },
+  { key: 'outline', label: '大纲规划', group: '创作', icon: 'outline' },
+  { key: 'bible', label: '设定总览', group: '资料', icon: 'book' },
+  { key: 'cards', label: '设定卡片', group: '资料', icon: 'cards' },
+  { key: 'knowledge', label: '知识库与图谱', group: '资料', icon: 'search' },
+  { key: 'teardown', label: '拆书资产库', group: '资料', icon: 'outline' },
+  { key: 'review', label: '审稿中心', group: '检查', icon: 'review' },
+  { key: 'settings', label: '项目设置', group: '检查', icon: 'settings' },
+]
+const GLOBAL_SECTIONS: { key: string; label: string; to: string; icon: IconName }[] = [
+  { key: 'bookshelf', label: '书架', to: '/', icon: 'book' },
+  { key: 'inbox', label: '收件箱', to: '/inbox', icon: 'inbox' },
+  { key: 'workflows', label: '工作流', to: '/workflows', icon: 'workflow' },
+  { key: 'dashboard', label: '仪表盘', to: '/dashboard', icon: 'chart' },
+  { key: 'images', label: '生图工坊', to: '/images', icon: 'image' },
+  { key: 'settings', label: '设置', to: '/settings', icon: 'settings' },
+]
+const CURRENT_PROJECT_KEY = 'aiw.currentProjectId'
+function storedValue(key: string) { try { return localStorage.getItem(key) } catch { return null } }
+function resolveTitle(pathname: string) {
+  const global = GLOBAL_SECTIONS.find(section => section.to === '/' ? pathname === '/' : pathname.startsWith(section.to))
+  if (global) return global.label
+  const section = /^\/project\/[^/]+\/([^/]+)/.exec(pathname)?.[1]
+  return PROJECT_SECTIONS.find(item => item.key === section)?.label ?? '工作台'
 }
+/** Kept for existing consumers; automatic navigation now applies to every workspace. */
+export function knowledgeNavigationOverlay(pathname: string, width: number): boolean {
+  return width < 920 && /^\/project\/[^/]+\/knowledge\/?$/.test(pathname)
+}
+export function workspaceNavigationOverlay(width: number): boolean { return width < 920 }
 
-/**
- * 布局壳：左侧可收起/可拖宽的导航 + 右侧主内容区（顶栏 + 路由出口）。
- * 顶栏含：收件箱待处理数、主题切换、侧栏收起/展开（纯 UI 偏好，localStorage 记忆）。
- */
 export default function AppShell() {
   const { pathname } = useLocation()
-  const { id: projectId } = useParams<{ id: string }>()
-  const [pending, setPending] = useState(0)
+  const navigate = useNavigate()
+  const { id: routeProjectId } = useParams<{ id: string }>()
+  const [storedProjectId, setStoredProjectId] = useState(() => storedValue(CURRENT_PROJECT_KEY))
+  const [projects, setProjects] = useState<Project[]>([])
+  const [projectsError, setProjectsError] = useState('')
+  const [reload, setReload] = useState(0)
+  const [pendingCount, setPendingCount] = useState<number | null>(null)
+  const [windowWidth, setWindowWidth] = useState(() => window.innerWidth)
+  const [navigationOpen, setNavigationOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => storedValue('aiw.shell.sidebarCollapsed') === '1')
+  const [sidebarWidth, setSidebarWidth] = usePanelWidth('aiw.shell.sidebarWidth', 232, 200, 360)
   const shellRef = useRef<HTMLDivElement>(null)
-
-  // 侧栏折叠 + 宽度（纯 UI 偏好，localStorage 记忆；原「专注模式」已移除）
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(
-    () => localStorage.getItem('aiw.shell.sidebarCollapsed') === '1',
-  )
-  const [sidebarWidth, setSidebarWidth] = usePanelWidth('aiw.shell.sidebarWidth', 208, 180, 360)
+  const navigationRef = useRef<HTMLElement>(null)
+  const projectId = routeProjectId ?? storedProjectId ?? undefined
+  const currentProject = projects.find(project => String(project.id) === projectId)
+  const temporaryNavigation = workspaceNavigationOverlay(windowWidth)
+  useOverlayFocus(navigationRef, temporaryNavigation && navigationOpen, () => setNavigationOpen(false))
 
   useEffect(() => {
-    localStorage.setItem('aiw.shell.sidebarCollapsed', sidebarCollapsed ? '1' : '0')
+    let current = true
+    listProjects().then(items => { if (current) { setProjects(items); setProjectsError('') } }).catch(error => {
+      if (current) setProjectsError(error instanceof Error ? error.message : '读取书籍失败')
+    })
+    listProposals(undefined, 'pending').then(items => { if (current) setPendingCount(items.length) }).catch(() => { if (current) setPendingCount(null) })
+    return () => { current = false }
+  }, [reload, pathname === '/'])
+  useEffect(() => {
+    const resize = () => setWindowWidth(window.innerWidth)
+    window.addEventListener('resize', resize)
+    return () => window.removeEventListener('resize', resize)
+  }, [])
+  useEffect(() => { setNavigationOpen(false) }, [pathname, temporaryNavigation])
+  useEffect(() => {
+    if (!routeProjectId) return
+    setStoredProjectId(routeProjectId)
+    try { localStorage.setItem(CURRENT_PROJECT_KEY, routeProjectId) } catch { /* Optional UI preference. */ }
+  }, [routeProjectId])
+  useEffect(() => {
+    try { localStorage.setItem('aiw.shell.sidebarCollapsed', sidebarCollapsed ? '1' : '0') } catch { /* Optional UI preference. */ }
   }, [sidebarCollapsed])
-
   useEffect(() => {
-    let alive = true
-    const load = async () => {
-      try {
-        const data = await proposalCount(projectId ? Number(projectId) : undefined)
-        if (alive) setPending(data.pending)
-      } catch {
-        if (alive) setPending(0)
-      }
-    }
-    void load()
-    const timer = window.setInterval(load, 15000)
-    return () => {
-      alive = false
-      window.clearInterval(timer)
-    }
-  }, [projectId, pathname])
-
-  // 键盘可达：Ctrl+Shift+F 切换侧栏（沿用原专注模式快捷键）
+    if (navigationRef.current) navigationRef.current.inert = temporaryNavigation && !navigationOpen
+  }, [temporaryNavigation, navigationOpen])
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
+    const keydown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'f') {
         event.preventDefault()
-        setSidebarCollapsed((collapsed) => !collapsed)
+        if (temporaryNavigation) setNavigationOpen(open => !open)
+        else setSidebarCollapsed(collapsed => !collapsed)
       }
     }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [])
+    window.addEventListener('keydown', keydown)
+    return () => window.removeEventListener('keydown', keydown)
+  }, [temporaryNavigation])
 
-  return (
-    <div
-      ref={shellRef}
-      className={`app-shell${sidebarCollapsed ? ' app-shell--no-sidebar' : ''}`}
-      style={{ '--app-sidebar-w': `${sidebarWidth}px` } as CSSProperties}
-    >
-      <aside className="app-sidebar">
-        <div className="app-brand">
-          <span className="app-brand__name">AI 小说创作工作台</span>
-          <span className="app-brand__meta">v0.1 · 本地优先</span>
-        </div>
+  const navItem = (section: typeof PROJECT_SECTIONS[number]) => projectId ? (
+    <NavLink key={section.key} to={`/project/${projectId}/${section.key}`} className={({ isActive }) => `nav-item${isActive ? ' is-active' : ''}`}>
+      <Icon name={section.icon} /><span>{section.label}</span>
+    </NavLink>
+  ) : <span key={section.key} className="nav-item is-disabled" aria-disabled="true"><Icon name={section.icon} /><span>{section.label}</span></span>
 
-        <nav className="app-nav">
-          <div className="app-nav__group">
-            <span className="app-nav__label">全局</span>
-            {GLOBAL_SECTIONS.map((section) => (
-              <NavLink
-                key={section.key}
-                to={section.to}
-                end={section.end}
-                className={({ isActive }) => (isActive ? 'nav-item is-active' : 'nav-item')}
-              >
-                {section.label}
-                {section.key === 'inbox' && pending > 0 ? (
-                  <span className="tag tag--warn" style={{ marginLeft: 'auto' }}>
-                    {pending}
-                  </span>
-                ) : null}
-              </NavLink>
-            ))}
-          </div>
-
-          <div className="app-nav__group">
-            <span className="app-nav__label">项目</span>
-            {projectId ? (
-              <>
-                <span className="app-nav__project" title={projectId}>
-                  #{projectId}
-                </span>
-                {PROJECT_SECTIONS.map((section) => (
-                  <NavLink
-                    key={section.key}
-                    to={`/project/${projectId}/${section.key}`}
-                    className={({ isActive }) => (isActive ? 'nav-item is-active' : 'nav-item')}
-                  >
-                    {section.label}
-                  </NavLink>
-                ))}
-              </>
-            ) : (
-              <>
-                {PROJECT_SECTIONS.map((section) => (
-                  <span
-                    key={section.key}
-                    className="nav-item is-disabled"
-                    aria-disabled="true"
-                    title="请先从书架进入一个项目"
-                  >
-                    {section.label}
-                  </span>
-                ))}
-                <span className="app-nav__hint">请先从书架进入一个项目。</span>
-              </>
-            )}
-          </div>
-        </nav>
-      </aside>
-
-      {sidebarCollapsed ? null : (
-        <PanelResizer
-          className="panel-resizer--sidebar"
-          side="left"
-          value={sidebarWidth}
-          min={180}
-          max={360}
-          label="调整主导航宽度"
-          onChange={setSidebarWidth}
-          onPreview={(next) => shellRef.current?.style.setProperty('--app-sidebar-w', `${next}px`)}
-          onToggle={() => setSidebarCollapsed(true)}
-        />
-      )}
-
-      <div className="app-main">
-        <header className="app-topbar">
-          <div className="app-topbar__title">
-            {resolveTitle(pathname)}
-            {projectId ? <span className="app-topbar__crumb"> / #{projectId}</span> : null}
-          </div>
-          <div className="app-topbar__actions">
-            <button
-              className="btn btn--ghost btn--sm"
-              type="button"
-              aria-pressed={sidebarCollapsed}
-              onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
-              title={sidebarCollapsed ? '展开侧栏（Ctrl+Shift+F）' : '收起侧栏（Ctrl+Shift+F）'}
-            >
-              {sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
-            </button>
-            <ThemeSwitcher />
-          </div>
-        </header>
-
-        <main className="app-content">
-          <Outlet />
-        </main>
+  return <div ref={shellRef} className={`app-shell${sidebarCollapsed || temporaryNavigation ? ' app-shell--no-sidebar' : ''}${temporaryNavigation ? ' app-shell--navigation-overlay' : ''}${navigationOpen ? ' is-navigation-open' : ''}`} style={{ '--app-sidebar-w': `${sidebarWidth}px` } as CSSProperties}>
+    {temporaryNavigation && navigationOpen && <button className="app-navigation-backdrop" type="button" aria-label="关闭导航" onClick={() => setNavigationOpen(false)} />}
+    <aside ref={navigationRef} tabIndex={-1} className="app-sidebar" role={temporaryNavigation ? 'dialog' : undefined} aria-modal={temporaryNavigation && navigationOpen ? true : undefined} aria-label="工作台导航">
+      <div className="app-brand"><Icon name="book" size={24} /><div><span className="app-brand__name">小说创作工作台</span><span className="app-brand__meta">本地优先 · 专注创作</span></div>
+        {temporaryNavigation && <button className="btn btn--ghost btn--sm app-navigation-close" type="button" data-autofocus aria-label="关闭导航" onClick={() => setNavigationOpen(false)}><Icon name="close" /></button>}
       </div>
+      <div className="app-book-switcher">
+        <label htmlFor="workspace-book">当前创作</label>
+        <select id="workspace-book" className="input" value={currentProject ? String(currentProject.id) : ''} onChange={event => { if (event.target.value) navigate(`/project/${event.target.value}/chat`) }}>
+          <option value="" disabled>{projectId ? '正在读取书名…' : '从书架选择一本书'}</option>
+          {projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
+        </select>
+        {projectsError && <div className="app-nav__error" role="status">书籍列表读取失败<button type="button" className="btn btn--ghost btn--sm" onClick={() => setReload(value => value + 1)}>重试</button></div>}
+      </div>
+      <nav className="app-nav" aria-label="工作区">
+        {['创作', '资料', '检查'].map(group => <div key={group} className="app-nav__group"><span className="app-nav__label">{group}</span>{PROJECT_SECTIONS.filter(item => item.group === group).map(navItem)}</div>)}
+        <div className="app-nav__group app-nav__group--global"><span className="app-nav__label">全局工具</span>
+          {GLOBAL_SECTIONS.map(section => <NavLink key={section.key} to={section.to} end={section.to === '/'} className={({ isActive }) => `nav-item${isActive ? ' is-active' : ''}`}><Icon name={section.icon} /><span>{section.label}</span>{section.key === 'inbox' && pendingCount !== null && pendingCount > 0 && <span className="app-nav__count" aria-label={`${pendingCount} 项待处理`}>{pendingCount}</span>}</NavLink>)}
+        </div>
+      </nav>
+    </aside>
+    {!sidebarCollapsed && !temporaryNavigation && <PanelResizer className="panel-resizer--sidebar" side="left" value={sidebarWidth} min={200} max={360} label="调整主导航宽度" onChange={setSidebarWidth} onPreview={next => shellRef.current?.style.setProperty('--app-sidebar-w', `${next}px`)} onToggle={() => setSidebarCollapsed(true)} />}
+    <div className="app-main">
+      <header className="app-topbar">
+        <button className="btn btn--ghost btn--sm app-navigation-toggle" type="button" aria-label={temporaryNavigation ? '打开工作台导航' : sidebarCollapsed ? '展开工作台导航' : '收起工作台导航'} aria-expanded={temporaryNavigation ? navigationOpen : !sidebarCollapsed} onClick={() => temporaryNavigation ? setNavigationOpen(open => !open) : setSidebarCollapsed(value => !value)} title="工作台导航（Ctrl+Shift+F）"><Icon name="menu" /></button>
+        <div className="app-topbar__title">{currentProject && routeProjectId && <span className="app-topbar__book" title={currentProject.name}>{currentProject.name}<Icon name="chevron" size={14} /></span>}<span>{resolveTitle(pathname)}</span></div>
+        <div className="app-topbar__actions"><ThemeSwitcher /></div>
+      </header>
+      <main className="app-content"><Suspense fallback={<div className="workspace-route-loading" role="status">正在打开工作区…</div>}><Outlet /></Suspense></main>
     </div>
-  )
+  </div>
 }

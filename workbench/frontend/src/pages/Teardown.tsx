@@ -1,3 +1,6 @@
+import { usePageChatContext } from '../state/usePageChatContext'
+import { useScopedAction } from '../state/useScopedAction'
+import WorkspacePage, { ResourceState, useResourceRequest } from '../components/WorkspacePage'
 /**
  * 拆书资产库（M4 / Task 44）—— 导入拆解目标 → 六维拆解 + 双时间线 + 事实卡 → 按题材召回。
  *
@@ -7,7 +10,7 @@
  */
 
 import { useCallback, useEffect, useState, type ChangeEvent } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
 import {
   analyzeTeardown,
   deleteTeardownTarget,
@@ -19,7 +22,7 @@ import {
 } from '../api/client'
 import type { TeardownFact, TeardownTarget } from '../api/client'
 import MarkdownView from '../components/MarkdownView'
-import Modal from '../components/Modal'
+import Drawer from '../components/Drawer'
 import { useConfirm } from '../components/ConfirmDialog'
 import { errorMessage, useToast } from '../state/useToast'
 import { NO_AUTOFILL } from '../lib/autofill'
@@ -96,42 +99,58 @@ export default function Teardown() {
 
   const [selectedTarget, setSelectedTarget] = useState('')
   const [dimensionFilter, setDimensionFilter] = useState('')
-  const [busy, setBusy] = useState('')
   const [analyzeInfo, setAnalyzeInfo] = useState<AnalyzeInfo | null>(null)
   const [confirm, confirmNode] = useConfirm()
 
   const [importOpen, setImportOpen] = useState(false)
+  const operation = useScopedAction(`${projectId}:${importOpen}`)
+  const busy = operation.pending
   const [importName, setImportName] = useState('')
   const [importGenre, setImportGenre] = useState('')
   const [importNote, setImportNote] = useState('')
   const [importContent, setImportContent] = useState('')
+  const [importDrag, setImportDrag] = useState(false)
 
   const [artifact, setArtifact] = useState<ArtifactState | null>(null)
   const [artifactKind, setArtifactKind] = useState<ArtifactKind>('source')
-  const [artifactBusy, setArtifactBusy] = useState(false)
+  const [artifactTarget, setArtifactTarget] = useState('')
+  const targetsResource = useResourceRequest(projectId)
+  const factsResource = useResourceRequest(`${projectId}:${selectedTarget}`)
+  const artifactResource = useResourceRequest(`${projectId}:${artifactTarget}:${artifactKind}`)
+  const artifactBusy = !!artifactTarget && artifactResource.loading
 
   const [recallGenre, setRecallGenre] = useState('')
   const [recallLimit, setRecallLimit] = useState(6)
   const [recall, setRecall] = useState<RecallState | null>(null)
+  const [recallRequestedScope, setRecallRequestedScope] = useState('')
+  const recallScope = `${projectId}:${recallGenre.trim()}:${recallLimit}`
+  const recallResource = useResourceRequest(recallScope)
+  useEffect(() => { setRecall(null) }, [recallScope])
 
   const loadTargets = useCallback(async () => {
+    const token = targetsResource.begin()
     try {
       const data = await listTeardownTargets(projectId)
+      if (!targetsResource.accept(token)) return
       setTargets(data.targets)
       setDimensions(data.dimensions)
+      targetsResource.finish(token)
     } catch (err) {
-      push(errorMessage(err), 'error')
+      targetsResource.fail(token, errorMessage(err))
     }
   }, [projectId, push])
 
   const loadFacts = useCallback(async () => {
+    const token = factsResource.begin()
     try {
       const data = await listTeardownFacts(projectId, selectedTarget || undefined)
+      if (!factsResource.accept(token)) return
       setFacts(data.facts)
       setFactCount(data.count)
       setMissingEvidence(data.missing_evidence)
+      factsResource.finish(token)
     } catch (err) {
-      push(errorMessage(err), 'error')
+      factsResource.fail(token, errorMessage(err))
     }
   }, [projectId, selectedTarget, push])
 
@@ -143,6 +162,10 @@ export default function Teardown() {
     void loadFacts()
   }, [loadFacts])
 
+  const selectedMaterial = artifactTarget || selectedTarget || targets[0]?.target
+  const artifactFilename = { source: '原文.md', analysis: '拆解.md', timeline: '双时间线.md', facts: '事实卡.md' }[artifactKind]
+  usePageChatContext({ projectId, activeFile: selectedMaterial ? `拆书/${selectedMaterial}/${artifactTarget ? artifactFilename : '原文.md'}` : null, onFilesChanged: async () => { await Promise.allSettled([loadTargets(), loadFacts()]) } })
+
   const resetImportForm = () => {
     setImportName('')
     setImportGenre('')
@@ -150,17 +173,25 @@ export default function Teardown() {
     setImportContent('')
   }
 
+  // 读取 .md/.txt 文本并回填：供文件选择与拖拽共用
+  const applyImportFile = async (file: File) => {
+    const token = operation.begin('read-import')
+    if (!token) return
+    try {
+      const text = await file.text()
+      if (!operation.accept(token)) return
+      setImportContent(text)
+      setImportName(fileNameOf(file.name))
+    } catch (err) {
+      if (operation.accept(token)) push(errorMessage(err), 'error')
+    } finally { operation.finish(token) }
+  }
+
   const handleImportFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
-    try {
-      const text = await file.text()
-      setImportContent(text)
-      setImportName(fileNameOf(file.name))
-    } catch (err) {
-      push(errorMessage(err), 'error')
-    }
+    await applyImportFile(file)
   }
 
   const submitImport = async () => {
@@ -172,7 +203,8 @@ export default function Teardown() {
       push('请粘贴文本或上传 .md/.txt 样章', 'error')
       return
     }
-    setBusy('import')
+    const token = operation.begin('import')
+    if (!token) return
     try {
       const result = await importTeardownTarget(projectId, {
         target_name: importName.trim(),
@@ -180,23 +212,26 @@ export default function Teardown() {
         genre: importGenre.trim(),
         source_note: importNote.trim(),
       })
+      if (!operation.accept(token)) return
       push(`已导入「${result.target}」（${result.chars} 字），落 ${result.path}`, 'success')
       setImportOpen(false)
       resetImportForm()
       await loadTargets()
       await loadFacts()
     } catch (err) {
-      push(errorMessage(err), 'error')
+      if (operation.accept(token)) push(errorMessage(err), 'error')
     } finally {
-      setBusy('')
+      operation.finish(token)
     }
   }
 
   const runAnalyze = async (target: string) => {
-    setBusy(`analyze:${target}`)
+    const token = operation.begin(`analyze:${target}`)
+    if (!token) return
     setAnalyzeInfo(null)
     try {
       const result = await analyzeTeardown(projectId, target, true)
+      if (!operation.accept(token)) return
       const sourceLabel = result.source === 'model' ? '模型 + 确定性统计' : '确定性统计（AI 不可用，已降级）'
       push(
         `「${result.target}」拆解完成：事实卡 ${result.fact_count} 条，依据缺失 ${result.missing_evidence} 条（${sourceLabel}）`,
@@ -211,75 +246,69 @@ export default function Teardown() {
       await loadTargets()
       await loadFacts()
     } catch (err) {
-      push(errorMessage(err), 'error')
+      if (operation.accept(token)) push(errorMessage(err), 'error')
     } finally {
-      setBusy('')
+      operation.finish(token)
     }
   }
 
   const loadArtifact = async (target: string, kind: ArtifactKind) => {
-    setArtifactBusy(true)
+    const token = artifactResource.begin()
     try {
       const result = await readTeardownArtifact(projectId, target, kind)
-      setArtifact({ target: result.target, kind, content: result.content, meta: result.meta })
-    } catch (err) {
-      push(errorMessage(err), 'error')
-      setArtifact(null)
-    } finally {
-      setArtifactBusy(false)
-    }
+      if (!artifactResource.accept(token)) return
+      setArtifact({ target: result.target, kind, content: result.content, meta: result.meta }); artifactResource.finish(token)
+    } catch (err) { artifactResource.fail(token, errorMessage(err)) }
   }
-
-  const openArtifact = (target: string) => {
-    setArtifactKind('source')
-    setArtifact(null)
-    void loadArtifact(target, 'source')
-  }
-
-  const switchArtifact = (kind: ArtifactKind) => {
-    setArtifactKind(kind)
-    if (!artifact) return
-    setArtifact(null)
-    void loadArtifact(artifact.target, kind)
-  }
+  useEffect(() => { if (artifactTarget) void loadArtifact(artifactTarget, artifactKind) }, [projectId, artifactTarget, artifactKind])
+  useEffect(() => { setTargets([]); setFacts([]); setSelectedTarget(''); setArtifact(null); setArtifactTarget(''); setAnalyzeInfo(null); setRecall(null); setImportOpen(false); resetImportForm() }, [projectId])
+  const openArtifact = (target: string) => { setArtifactKind('source'); setArtifactTarget(target) }
+  const switchArtifact = (kind: ArtifactKind) => setArtifactKind(kind)
 
   const handleDelete = async (target: TeardownTarget) => {
+    const token = operation.begin(`delete:${target.target}`)
+    if (!token) return
+    try {
     const confirmed = await confirm({
       title: '删除拆解目标',
       message: `确认删除拆解目标「${target.target}」？将同时删除 拆书/${target.target}/ 下的原文与全部拆解产物，且不可撤销。`,
       confirmText: '删除',
       danger: true,
     })
-    if (!confirmed) return
-    setBusy(`delete:${target.target}`)
-    try {
+    if (!confirmed || !operation.accept(token)) return
       await deleteTeardownTarget(projectId, target.target)
+      if (!operation.accept(token)) return
       push(`已删除「${target.target}」`, 'success')
       if (analyzeInfo?.target === target.target) setAnalyzeInfo(null)
-      if (artifact?.target === target.target) setArtifact(null)
+      if (artifactTarget === target.target) { setArtifact(null); setArtifactTarget('') }
       if (selectedTarget === target.target) setSelectedTarget('')
       else await loadFacts()
       await loadTargets()
     } catch (err) {
-      push(errorMessage(err), 'error')
+      if (operation.accept(token)) push(errorMessage(err), 'error')
     } finally {
-      setBusy('')
+      operation.finish(token)
     }
   }
 
   const runRecall = async () => {
-    setBusy('recall')
+    const actionToken = operation.begin('recall')
+    if (!actionToken) return
+    const token = recallResource.begin()
+    setRecallRequestedScope(recallScope)
     try {
       const result = await recallTeardown(projectId, recallGenre.trim(), recallLimit)
+      if (!operation.accept(actionToken) || !recallResource.accept(token)) return
       setRecall({ genre: result.genre, matched: result.matched, facts: result.facts })
+      recallResource.finish(token)
       push(
         result.matched > 0 ? `已召回 ${result.matched} 条同题材事实卡` : '没有可召回条目（依据缺失的条目不进上下文）',
         result.matched > 0 ? 'success' : 'info',
       )
     } catch (err) {
-      push(errorMessage(err), 'error')
+      if (operation.accept(actionToken)) recallResource.fail(token, errorMessage(err))
     } finally {
-      setBusy('')
+      operation.finish(actionToken)
     }
   }
 
@@ -290,7 +319,7 @@ export default function Teardown() {
     : facts
 
   return (
-    <div className="page page--wide stack">
+    <WorkspacePage className="stack">
       <header className="page-header">
         <div>
           <h1 className="page-header__title">拆书资产库</h1>
@@ -308,21 +337,6 @@ export default function Teardown() {
           >
             刷新
           </button>
-          <Link className="btn btn--sm" to={`/project/${projectId}/editor`}>
-            编辑器
-          </Link>
-          <Link className="btn btn--sm" to={`/project/${projectId}/outline`}>
-            大纲
-          </Link>
-          <Link className="btn btn--sm" to={`/project/${projectId}/bible`}>
-            Story Bible
-          </Link>
-          <Link className="btn btn--sm" to={`/project/${projectId}/cards`}>
-            设定卡片
-          </Link>
-          <Link className="btn btn--sm" to={`/project/${projectId}/review`}>
-            审稿中心
-          </Link>
         </div>
       </header>
 
@@ -348,6 +362,7 @@ export default function Teardown() {
           <span className="muted">共 {targets.length} 个</span>
         </div>
         <div className="panel__body stack">
+          <ResourceState {...targetsResource} hasData={targetsResource.loaded && targets.length > 0} onRetry={() => void loadTargets()}>
           {targets.length === 0 ? (
             <div className="empty-state">
               <p className="empty-state__title">尚未导入拆解目标</p>
@@ -356,8 +371,8 @@ export default function Teardown() {
               </p>
             </div>
           ) : (
-            <div className="stack">
-              {targets.map((target) => (
+            <div className="workspace-collection"><nav className="workspace-collection-nav" aria-label="拆解目标">{targets.map(target => <button key={target.target} className={target.target === (selectedTarget || targets[0]?.target) ? 'is-active' : ''} aria-pressed={target.target === (selectedTarget || targets[0]?.target)} onClick={() => setSelectedTarget(target.target)}>{target.target}<small>{target.genre || '未标题材'} · {target.fact_count} 条事实卡</small></button>)}</nav><div className="workspace-collection-detail">
+              {targets.filter(target => target.target === (selectedTarget || targets[0]?.target)).map((target) => (
                 <article className="asset-card" key={target.target}>
                   <div className="asset-card__head">
                     <span className="asset-card__name">{target.target}</span>
@@ -378,15 +393,7 @@ export default function Teardown() {
                       disabled={isBusy}
                       onClick={() => void runAnalyze(target.target)}
                     >
-                      {busy === `analyze:${target.target}` ? '拆解中…' : '拆解'}
-                    </button>
-                    <button
-                      className="btn btn--sm"
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => void runAnalyze(target.target)}
-                    >
-                      {busy === `analyze:${target.target}` ? '拆解中…' : '重新拆解'}
+                      {busy === `analyze:${target.target}` ? '拆解中…' : target.has_analysis ? '重新拆解' : '拆解'}
                     </button>
                     <button
                       className="btn btn--sm"
@@ -405,10 +412,11 @@ export default function Teardown() {
                     </button>
                   </div>
                 </article>
-              ))}
+              ))}</div>
             </div>
           )}
 
+          </ResourceState>
           {analyzeInfo ? (
             <div className="run-log">
               <div className="row row--between">
@@ -437,7 +445,7 @@ export default function Teardown() {
         </div>
       </section>
 
-      <section className="panel">
+      <ResourceState {...factsResource} hasData={factsResource.loaded} onRetry={() => void loadFacts()}><section className="panel">
         <div className="panel__header">
           <h2 className="panel__title">事实卡</h2>
           <span className="muted">
@@ -450,6 +458,7 @@ export default function Teardown() {
               <span className="field__label">目标</span>
               <select
                 className="select"
+                aria-label="事实卡目标"
                 value={selectedTarget}
                 onChange={(event) => setSelectedTarget(event.target.value)}
               >
@@ -465,6 +474,7 @@ export default function Teardown() {
               <span className="field__label">维度</span>
               <select
                 className="select"
+                aria-label="事实卡维度"
                 value={dimensionFilter}
                 onChange={(event) => setDimensionFilter(event.target.value)}
               >
@@ -480,10 +490,11 @@ export default function Teardown() {
 
           {visibleFacts.length === 0 ? (
             <div className="empty-state">
-              <p className="empty-state__title">暂无事实卡</p>
+              <p className="empty-state__title">{dimensionFilter || selectedTarget ? '当前筛选没有事实卡' : '暂无事实卡'}</p>
               <p className="empty-state__desc">
-                先导入拆解目标并执行「拆解」，事实卡会在此按维度列出；依据缺失的条目会显式标注。
+                {dimensionFilter || selectedTarget ? '清除目标或维度筛选，查看其他事实卡。' : '先导入拆解目标并执行「拆解」，事实卡会在此按维度列出；依据缺失的条目会显式标注。'}
               </p>
+              {dimensionFilter || selectedTarget ? <button className="btn btn--sm" onClick={() => { setSelectedTarget(''); setDimensionFilter('') }}>清除事实卡筛选</button> : null}
             </div>
           ) : (
             <table className="table">
@@ -522,6 +533,7 @@ export default function Teardown() {
         </div>
       </section>
 
+      </ResourceState>
       <section className="panel">
         <div className="panel__header">
           <h2 className="panel__title">按题材召回</h2>
@@ -533,6 +545,7 @@ export default function Teardown() {
               <input
                 autoComplete={NO_AUTOFILL}
                 className="input"
+                aria-label="召回题材"
                 value={recallGenre}
                 placeholder="留空 = 全部题材"
                 onChange={(event) => setRecallGenre(event.target.value)}
@@ -542,6 +555,7 @@ export default function Teardown() {
               <span className="field__label">条数</span>
               <input
                 className="input"
+                aria-label="召回条数"
                 type="number"
                 min={1}
                 max={50}
@@ -561,16 +575,16 @@ export default function Teardown() {
 
           <p className="muted">只召回带章节依据的条目。</p>
 
-          {recall === null ? (
+          {recallRequestedScope !== recallScope ? (
             <p className="muted">尚未召回：填写题材（可留空）与条数后点击「召回」。</p>
-          ) : recall.matched === 0 ? (
+          ) : <ResourceState {...recallResource} hasData={recallResource.loaded && !!recall} onRetry={() => void runRecall()}>{recall?.matched === 0 ? (
             <div className="empty-state">
               <p className="empty-state__title">无可召回条目</p>
               <p className="empty-state__desc">
                 先导入目标并完成拆解；若已拆解仍为空，说明该题材下暂无带章节依据的事实卡。
               </p>
             </div>
-          ) : (
+          ) : recall ? (
             <div className="stack stack--tight">
               <span className="muted">
                 题材 <span className="mono">{recall.genre || '全部'}</span> · 命中{' '}
@@ -588,14 +602,12 @@ export default function Teardown() {
                 ))}
               </ul>
             </div>
-          )}
+          ) : null}</ResourceState>}
         </div>
       </section>
 
-      <section className="panel">
-        <div className="panel__header">
-          <h2 className="panel__title">六维说明</h2>
-        </div>
+      <details className="workspace-disclosure">
+        <summary>六维拆解说明</summary>
         <div className="panel__body panel__body--tight stack stack--tight">
           <div className="chips">
             {SELF_DIMENSIONS.map((dimension) => (
@@ -613,16 +625,17 @@ export default function Teardown() {
             <li>可迁移手法：能直接用于本书的写法，附可复制的结构而非句子。</li>
           </ul>
         </div>
-      </section>
+      </details>
 
       <p className="page-footnote">
         事实卡必须附章节依据；无法取证的一律标「依据缺失」。
       </p>
 
-      <Modal
+      <Drawer
         title="导入拆解目标"
         open={importOpen}
         onClose={() => setImportOpen(false)}
+        width={720}
         footer={
           <>
             <button className="btn btn--ghost btn--sm" type="button" onClick={() => setImportOpen(false)}>
@@ -671,14 +684,23 @@ export default function Teardown() {
               onChange={(event) => setImportNote(event.target.value)}
             />
           </label>
-          <label className="field">
+          <label className={`field drop-zone${importDrag ? ' is-dragover' : ''}`}
+            onDragOver={(event) => { event.preventDefault(); setImportDrag(true) }}
+            onDragLeave={() => setImportDrag(false)}
+            onDrop={(event) => {
+              event.preventDefault()
+              setImportDrag(false)
+              const file = event.dataTransfer.files?.[0]
+              if (file) void applyImportFile(file)
+            }}
+          >
             <span className="field__label">文本内容</span>
             <textarea
               autoComplete={NO_AUTOFILL}
               className="textarea"
               style={{ minHeight: 240 }}
               value={importContent}
-              placeholder="粘贴样章文本（支持「第N章」分章标记）"
+              placeholder="粘贴样章文本（支持「第N章」分章标记），或直接把 .md/.txt 拖到这里"
               onChange={(event) => setImportContent(event.target.value)}
             />
           </label>
@@ -693,14 +715,15 @@ export default function Teardown() {
             <span className="field__hint">导入前请自行确认文本来源合规。</span>
           </label>
         </div>
-      </Modal>
+      </Drawer>
 
-      <Modal
-        title={artifact ? `拆解产物：${artifact.target}` : '拆解产物'}
-        open={artifact !== null}
-        onClose={() => setArtifact(null)}
+      <Drawer
+        title={artifactTarget ? `拆解产物：${artifactTarget}` : '拆解产物'}
+        open={!!artifactTarget}
+        onClose={() => setArtifactTarget('')}
+        width={860}
         footer={
-          <button className="btn btn--ghost btn--sm" type="button" onClick={() => setArtifact(null)}>
+          <button className="btn btn--ghost btn--sm" type="button" onClick={() => setArtifactTarget('')}>
             关闭
           </button>
         }
@@ -719,8 +742,7 @@ export default function Teardown() {
             ))}
           </nav>
 
-          {artifactBusy ? <p className="muted">读取中…</p> : null}
-
+          <ResourceState {...artifactResource} hasData={artifactResource.loaded && !!artifact} onRetry={() => void loadArtifact(artifactTarget, artifactKind)}>
           {artifact ? (
             <div className="stack stack--tight">
               <span className="muted mono">
@@ -742,10 +764,11 @@ export default function Teardown() {
           ) : artifactBusy ? null : (
             <p className="muted">选择上方标签读取对应产物。</p>
           )}
+          </ResourceState>
         </div>
-      </Modal>
+      </Drawer>
 
       {confirmNode}
-    </div>
+    </WorkspacePage>
   )
 }

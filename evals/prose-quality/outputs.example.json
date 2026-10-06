@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "experiment": {
+    "id": "replace-with-your-experiment-id",
+    "conditions": [
+      {
+        "id": "baseline",
+        "label": "当前流程",
+        "provider": "填写实际供应商",
+        "model": "填写实际模型",
+        "model_revision": "unknown",
+        "prompt_version": "填写提示版本",
+        "parameters": {
+          "temperature": 0.7,
+          "max_output_tokens": 1600
+        }
+      },
+      {
+        "id": "optimized",
+        "label": "优化流程",
+        "provider": "填写实际供应商",
+        "model": "填写实际模型",
+        "model_revision": "unknown",
+        "prompt_version": "填写提示版本",
+        "parameters": {
+          "temperature": 0.7,
+          "max_output_tokens": 1600
+        }
+      }
+    ],
+    "budget": {
+      "currency": "CNY",
+      "max_cost_per_case": 1,
+      "max_tokens_per_candidate": 1600
+    },
+    "notes": "本文件只是数据结构示例，示例文本和成本不是模型实测。请替换为真实输出。"
+  },
+  "outputs": [
+    {
+      "case_id": "pq-01",
+      "candidates": [
+        {
+          "condition_id": "baseline",
+          "text": "这里填写当前流程实际生成的完整场景正文，不要填方案名称、模型名称或作者评价。",
+          "usage": {
+            "cost_amount": null,
+            "currency": "CNY",
+            "prompt_tokens": null,
+            "completion_tokens": null,
+            "duration_ms": null
+          }
+        },
+        {
+          "condition_id": "optimized",
+          "text": "这里填写优化流程实际生成的完整场景正文，不要填方案名称、模型名称或作者评价。",
+          "usage": {
+            "cost_amount": null,
+            "currency": "CNY",
+            "prompt_tokens": null,
+            "completion_tokens": null,
+            "duration_ms": null
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import re
 import shutil
+import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -183,6 +185,18 @@ def create_project(
             f"目录 projects/{safe_name} 已存在，请换一个书名或先清理该目录"
         )
 
+    # 未显式指定模板时按「题材 → 平台 → 默认」解析；解析失败一律回退内置默认模板
+    if template is None:
+        from .template_service import (  # 延迟导入避免循环依赖
+            ensure_builtin_template,
+            resolve_open_template,
+        )
+
+        try:
+            template = resolve_open_template(None, genre, platform)
+        except Exception:  # noqa: BLE001 - 模板解析失败不阻断开书
+            template = ensure_builtin_template()["name"]
+
     created_at = _now_iso()
     target.mkdir(parents=True)
     try:
@@ -198,8 +212,8 @@ def create_project(
         )
         with db.get_conn() as conn:
             cursor = conn.execute(
-                "INSERT INTO projects (name, path, created_at, archived) VALUES (?, ?, ?, 0)",
-                (safe_name, str(target), created_at),
+                "INSERT INTO projects (name, path, created_at, archived, knowledge_key) VALUES (?, ?, ?, 0, ?)",
+                (safe_name, str(target), created_at, uuid.uuid4().hex),
             )
             project_id = int(cursor.lastrowid or 0)
             row = conn.execute(
@@ -209,6 +223,18 @@ def create_project(
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
         raise
+
+    # A newly registered book inherits an explicitly enabled global model.
+    # Template files are now durable, so the background projection can be
+    # scheduled without racing workspace initialization.
+    try:
+        from .embedding_service import settings_for
+        if settings_for().get("enabled"):
+            from . import knowledge_service
+            knowledge_service.enqueue(project_id)
+    except Exception as exc:  # A derived index must not prevent opening a book.
+        from . import operation_log
+        operation_log.log(project_id, "knowledge-sync-warning", None, {"reason": str(exc)})
 
     return _row_to_project(row, genre=genre, platform=platform,
                            protagonist=protagonist, one_liner=one_liner)
@@ -240,13 +266,13 @@ def _row_to_project(
     }
 
 
-def fetch_project_row(project_id: int):
-    """取项目行；不存在时抛 :class:`ProjectNotFoundError`。"""
+def fetch_project_row(project_id: int, *, include_deleted: bool = False):
+    """取项目行；不存在时抛 :class:`ProjectNotFoundError`。默认不含回收站中的项目。"""
+    sql = "SELECT id, name, path, created_at, archived, deleted_at, knowledge_key FROM projects WHERE id = ?"
+    if not include_deleted:
+        sql += " AND deleted_at IS NULL"
     with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT id, name, path, created_at, archived FROM projects WHERE id = ?",
-            (project_id,),
-        ).fetchone()
+        row = conn.execute(sql, (project_id,)).fetchone()
     if row is None:
         raise ProjectNotFoundError(f"项目不存在：id={project_id}")
     return row
@@ -272,11 +298,11 @@ def read_project_document(project_dir: Path) -> tuple[dict, str]:
 
 
 def list_projects(include_archived: bool = False) -> list[dict]:
-    """列出项目（默认过滤已归档）。"""
-    sql = "SELECT id, name, path, created_at, archived FROM projects"
+    """列出在架项目（默认过滤已归档；已移入回收站的项目不在其中）。"""
+    sql = "SELECT id, name, path, created_at, archived, deleted_at FROM projects WHERE deleted_at IS NULL"
     params: tuple = ()
     if not include_archived:
-        sql += " WHERE archived = 0"
+        sql += " AND archived = 0"
     sql += " ORDER BY archived ASC, created_at DESC, id DESC"
 
     with db.get_conn() as conn:
@@ -285,17 +311,37 @@ def list_projects(include_archived: bool = False) -> list[dict]:
     projects: list[dict] = []
     for row in rows:
         directory = project_dir_of(row["name"])
-        meta, _body = read_project_document(directory)
+        meta, body = read_project_document(directory)
+        match = _ONE_LINER_RE.search(body)
         projects.append(
             _row_to_project(
                 row,
                 genre=meta.get("题材"),
                 platform=meta.get("平台"),
                 protagonist=meta.get("主角"),
+                one_liner=(match.group(1).strip() if match else None),
                 has_cover=cover_path_of(directory) is not None,
             )
         )
     return projects
+
+
+def list_deleted_projects() -> list[dict]:
+    """列出回收站中的项目（按删除时间倒序），供书架回收站面板使用。"""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, path, created_at, archived, deleted_at FROM projects"
+            " WHERE deleted_at IS NOT NULL"
+            " ORDER BY deleted_at DESC, id DESC"
+        ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "name": row["name"],
+            "deleted_at": row["deleted_at"],
+        }
+        for row in rows
+    ]
 
 
 def get_project(project_id: int) -> dict:
@@ -333,6 +379,184 @@ def archive_project(project_id: int) -> dict:
 
 def unarchive_project(project_id: int) -> dict:
     return set_archived(project_id, False)
+
+
+# ─────────────────────────── 删除整本 ───────────────────────────
+
+# 直接按 project_id 清理的索引/流程表（chat_* 需按会话级联，单独处理）
+PROJECT_SCOPED_TABLES: tuple[str, ...] = (
+    "chapters",
+    "snapshots",
+    "proposals",
+    "tasks",
+    "chapter_contracts",
+    "token_usage",
+    "index_docs",
+    "embeddings",
+    "reviews",
+    "quality_debts",
+    "style_fingerprints",
+    "style_fingerprints_archive",
+    "ingestion_runs",
+    "rules",
+    "workflow_runs",
+    "operation_log",
+    "characters",
+    "character_states",
+    "character_memory",
+    "timeline_events",
+    "foreshadows",
+    "resource_ledger",
+    "assets",
+)
+
+
+def _purge_project_rows(conn, project_id: int) -> None:
+    """删除该项目在全部表中的行（含 chat_* 级联与 FTS 索引）。"""
+    for table in PROJECT_SCOPED_TABLES:
+        if table == "ingestion_runs" and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is None:
+            continue
+        conn.execute(f"DELETE FROM {table} WHERE project_id = ?", (project_id,))
+
+    session_rows = conn.execute(
+        "SELECT id FROM chat_sessions WHERE project_id = ?", (project_id,)
+    ).fetchall()
+    session_ids = [int(row["id"]) for row in session_rows]
+    if session_ids:
+        placeholders = ",".join("?" for _ in session_ids)
+        conn.execute(
+            f"DELETE FROM chat_run_events WHERE run_id IN "
+            f"(SELECT id FROM chat_runs WHERE session_id IN ({placeholders}))",
+            session_ids,
+        )
+        conn.execute(
+            f"DELETE FROM chat_messages WHERE session_id IN ({placeholders})", session_ids
+        )
+        conn.execute(
+            f"DELETE FROM chat_runs WHERE session_id IN ({placeholders})", session_ids
+        )
+        conn.execute(
+            f"DELETE FROM chat_sessions WHERE id IN ({placeholders})", session_ids
+        )
+
+    try:  # FTS 表可能不可用（降级为 LIKE），缺失时跳过
+        conn.execute("DELETE FROM docs_fts WHERE project_id = ?", (project_id,))
+    except sqlite3.Error:
+        pass
+
+    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+
+def _assert_inside_projects(directory: Path) -> None:
+    """校验目录严格位于 ``projects/`` 之下（防止越界删除）。"""
+    root = projects_dir().resolve()
+    target = Path(directory).resolve()
+    if target == root or root not in target.parents:
+        raise InvalidOperationError(f"拒绝操作项目目录之外的路径：{directory}")
+
+
+def delete_project(project_id: int) -> dict:
+    """删除整本书：把目录移入回收站并打软删除标记（可恢复）。"""
+    row = fetch_project_row(project_id)
+    from . import knowledge_service, knowledge_candidate_service
+    knowledge_candidate_service.cancel_project(project_id)
+    knowledge_service.cancel(project_id)
+    name = row["name"]
+    _assert_inside_projects(project_dir_of(name))
+
+    from .fs_utils import move_project_to_trash  # 延迟导入避免循环依赖
+
+    move_project_to_trash(name)
+
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE projects SET deleted_at = ?, archived = 0 WHERE id = ?",
+            (_now_iso(), project_id),
+        )
+    return {"id": project_id, "name": name, "deleted": True}
+
+
+def _find_project_trash_entry(name: str) -> Path | None:
+    """在 ``.workbench/trash/{书名}/`` 下找 ``kind == "project"`` 的条目目录。"""
+    from .fs_utils import read_trash_manifest, trash_root
+
+    project_trash = trash_root() / name
+    if not project_trash.is_dir():
+        return None
+    for entry_dir in sorted(project_trash.iterdir(), reverse=True):
+        if not entry_dir.is_dir():
+            continue
+        manifest = read_trash_manifest(entry_dir)
+        if manifest and manifest.get("kind") == "project":
+            return entry_dir
+    return None
+
+
+def restore_project(project_id: int) -> dict:
+    """从回收站恢复整本书：目录搬回 ``projects/{书名}/`` 并清除软删除标记。"""
+    row = fetch_project_row(project_id, include_deleted=True)
+    if row["deleted_at"] is None:
+        raise InvalidOperationError("项目不在回收站，无需恢复")
+
+    name = row["name"]
+    entry_dir = _find_project_trash_entry(name)
+    if entry_dir is None:
+        raise ProjectNotFoundError(f"回收站中找不到《{name}》的项目条目")
+
+    from .fs_utils import trash_entry_payload
+
+    payload = trash_entry_payload(entry_dir)
+    if not payload.exists():
+        raise ProjectNotFoundError(f"回收站条目内容缺失：{entry_dir.name}")
+
+    target = project_dir_of(name)
+    if target.exists():
+        raise ProjectExistsError(f"目录 projects/{name} 已存在，无法恢复")
+
+    trash_rel = f"{name}/{entry_dir.name}"
+    shutil.move(str(payload), str(target))
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE projects SET deleted_at = NULL, path = ? WHERE id = ?",
+            (str(target), project_id),
+        )
+    # 不重建索引：回收期间文件不可改动，既有 chapters/index_docs 行仍然有效；
+    # 且 rebuild_index 会把「空章节文件」的 chapters 行当陈旧记录清掉，反而丢标题。
+    shutil.rmtree(entry_dir, ignore_errors=True)
+    try:  # 顺手清掉空的 {书名}/ 目录
+        entry_dir.parent.rmdir()
+    except OSError:
+        pass
+    from . import knowledge_service
+    knowledge_service.invalidate(project_id)
+    knowledge_service.enqueue(project_id)
+    return {"rel_path": name, "restored_from": trash_rel}
+
+
+def purge_project(project_id: int) -> dict:
+    """彻底删除整本书（不可恢复）：目录 + 快照/回收站目录 + 全部索引记录。"""
+    row = fetch_project_row(project_id, include_deleted=True)
+    name = row["name"]
+    directory = project_dir_of(name)
+    _assert_inside_projects(directory)
+    from . import knowledge_service, knowledge_store, knowledge_candidate_service
+    knowledge_candidate_service.cancel_project(project_id)
+    knowledge_service.cancel(project_id, wait=True)
+    knowledge_store.purge(project_id)
+
+    if directory.is_dir():
+        shutil.rmtree(directory)
+    shutil.rmtree(config.snapshots_dir() / name, ignore_errors=True)
+
+    from .fs_utils import trash_root  # 延迟导入避免循环依赖
+
+    shutil.rmtree(trash_root() / name, ignore_errors=True)
+
+    with db.get_conn() as conn:
+        _purge_project_rows(conn, project_id)
+
+    return {"id": project_id, "name": name, "purged": True}
 
 
 # ─────────────────────────── 封面 ───────────────────────────

@@ -20,5 +20,10 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks: (id) => id.replace(/\\/g, '/').includes('/node_modules/cytoscape/') ? 'cytoscape' : undefined,
+      },
+    },
   },
 })

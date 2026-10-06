@@ -5,7 +5,7 @@
 - 平台清单是**工作台自定**的整理规则（不复制任何平台的官方文档文本）：
   章节标题格式、段落缩进、分隔方式、单章建议字数、命名规则；
 - 导出只使用项目内 Markdown 正文与标题（**不含任何凭据**）；
-- 同时产出**提交前自检**：未达建议字数的章、状态非「完成」的章、仍有质量债的章。
+- 同时产出**提交前自检**：未达建议字数的章、尚未定稿的章、仍有质量债的章。
 """
 
 from __future__ import annotations
@@ -75,6 +75,7 @@ PLATFORM_PROFILES: dict[str, dict] = {
 }
 
 DEFAULT_PLATFORM = "通用"
+FINAL_CHAPTER_STATUSES = frozenset({"完成", "发表", "completed", "published"})
 
 
 def list_platforms() -> list[dict]:
@@ -106,6 +107,20 @@ def _format_paragraphs(body: str, indent: int) -> str:
     return "\n".join(cleaned).strip("\n")
 
 
+def _effective_word_range(project_id: int, profile: dict) -> tuple[int, int]:
+    """导出的字数区间：优先取本书字数区间，缺省回落平台档案默认值。"""
+    default_min, default_max = (int(value) for value in profile["word_range"])
+    try:
+        from .writing_preference_service import get_writing_prefs
+
+        prefs = get_writing_prefs(project_id)
+    except Exception:  # noqa: BLE001 - 区间读取失败不阻断导出
+        return default_min, default_max
+    if prefs.get("source") == "book":
+        return int(prefs["chapter_min_words"]), int(prefs["chapter_max_words"])
+    return default_min, default_max
+
+
 def build_publish_export(
     project_id: int,
     *,
@@ -122,11 +137,11 @@ def build_publish_export(
 
     chapters = list_chapters(project_id)
     if only_completed:
-        chapters = [item for item in chapters if item["status"] == "完成"]
+        chapters = [item for item in chapters if item["status"] in FINAL_CHAPTER_STATUSES]
     if not chapters:
-        raise InvalidOperationError("没有可发布的章节（章节为空或没有「完成」状态的章节）")
+        raise InvalidOperationError("没有可发布的章节（章节为空或没有「完成 / 发表」状态的章节）")
 
-    min_words, max_words = profile["word_range"]
+    min_words, max_words = _effective_word_range(project_id, profile)
     blocks: list[str] = []
     warnings: list[dict] = []
     total_words = 0
@@ -134,7 +149,7 @@ def build_publish_export(
 
     for index, item in enumerate(chapters, start=1):
         detail = read_chapter(project_id, item["rel_path"])
-        body = split_frontmatter(detail["body"] if detail["body"] else detail["content"])[1]
+        body = detail["body"] if detail["body"] else detail["content"]
         words = count_words(body)
         if words == 0:
             warnings.append({"rel_path": item["rel_path"], "level": "跳过",
@@ -156,7 +171,7 @@ def build_publish_export(
         elif words > max_words:
             warnings.append({"rel_path": item["rel_path"], "level": "偏长",
                              "note": f"{words} 字，高于 {platform} 建议上限 {max_words} 字"})
-        if item["status"] != "完成":
+        if item["status"] not in FINAL_CHAPTER_STATUSES:
             warnings.append({"rel_path": item["rel_path"], "level": "未定稿",
                              "note": f"章节状态为「{item['status']}」，建议改为「完成」后再发布"})
 
@@ -220,7 +235,7 @@ def _checklist(project_id: int, project_name: str, stats: dict, warnings: list[d
         match = re.search(r"##\s*一句话设定\s*\n+(.*?)(?:\n#|\Z)", body, re.DOTALL)
         one_liner = (match.group(1).strip() if match else "")
 
-    min_words, max_words = profile["word_range"]
+    min_words, max_words = stats["word_range"]
     short = [item for item in warnings if item["level"] == "偏短"]
     debts = [item for item in warnings if item["level"] == "质量债"]
     drafts = [item for item in warnings if item["level"] == "未定稿"]
@@ -231,8 +246,8 @@ def _checklist(project_id: int, project_name: str, stats: dict, warnings: list[d
         {"item": "单章字数在建议区间", "ok": not short,
          "basis": f"{len(short)} 章低于 {min_words} 字" if short else
                   f"全部在 {min_words}-{max_words} 字区间内"},
-        {"item": "章节状态均为「完成」", "ok": not drafts,
-         "basis": f"{len(drafts)} 章仍是草稿/发表态" if drafts else "全部为「完成」"},
+        {"item": "章节均已定稿（完成 / 发表）", "ok": not drafts,
+         "basis": f"{len(drafts)} 章尚未定稿" if drafts else "全部为「完成 / 发表」"},
         {"item": "无未解决质量债", "ok": not debts,
          "basis": f"{len(debts)} 章存在未解决质量债" if debts else "无未解决质量债"},
         {"item": "无凭据泄漏", "ok": True,

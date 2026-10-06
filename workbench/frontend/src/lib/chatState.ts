@@ -1,13 +1,19 @@
 import type { ChatContext, ChatInteraction, ChatRun, ChatRunEvent, ChatSession, ChatStep, ChatPermissionMode, ChatQuestion, ChatInteractionResponse } from '../api/types'
 
 export const CHAT_PERMISSION_OPTIONS: Array<{ value: ChatPermissionMode; label: string; description: string }> = [
-  { value: 'ask', label: '请求批准', description: '读取和讨论可直接进行；修改文件前由你批准。' },
-  { value: 'auto', label: '帮我批准', description: '新建、局部修改自动批准；删除、移动和整篇覆盖仍请你确认。' },
+  { value: 'ask', label: '请求批准', description: '读取和讨论可直接进行；每次修改文件前由你批准，也可选择本任务内不再询问。' },
+  { value: 'auto', label: '帮我批准', description: '新建、改写、整章替换自动批准；删除、移动文件仍请你确认。' },
   { value: 'full', label: '完全访问', description: '允许本项目内的文件操作；仍受项目边界、冲突检查和写作门禁约束。' },
 ]
 
 export const TERMINAL_CHAT_STATUSES = new Set(['completed', 'succeeded', 'done', 'failed', 'error', 'cancelled', 'interrupted'])
 export const isChatRunTerminal = (run: ChatRun | null) => Boolean(run && TERMINAL_CHAT_STATUSES.has(run.status))
+
+/** User messages and pending assistant placeholders do not confirm a persisted result. */
+export function hasPersistedChatResult(messages: Array<{ role: string; meta: Record<string, unknown> }>, runId: string): boolean {
+  return messages.some(message => message.role === 'assistant' && String(message.meta.run_id) === runId
+    && TERMINAL_CHAT_STATUSES.has(String(message.meta.status || '')))
+}
 
 export function sessionPermission(session: ChatSession): ChatPermissionMode {
   return session.permission_mode || (session.mode === 'write' && session.auto_apply === 1 ? 'auto' : 'ask')
@@ -41,7 +47,6 @@ export function approvalReason(interaction: ChatInteraction, runPermission?: Cha
   if (permission === 'ask') return '本轮按「请求批准」运行，文件修改需要你逐次批准。'
   if (permission === 'auto') {
     const operation = interaction.payload.operation
-    if (operation === 'rewrite') return '本轮按「帮我批准」运行，整篇覆盖仍需你确认。'
     if (operation === 'delete' || operation === 'move' || operation === 'rename') return '本轮按「帮我批准」运行，删除或移动文件仍需你确认。'
     return '本轮按「帮我批准」运行，此操作需要你确认。'
   }
@@ -107,10 +112,62 @@ export function questionResponse(questions: ChatQuestion[], drafts: Record<strin
   return { answers }
 }
 
+export interface RoutingPlanStep {
+  step: number
+  agent: string
+  agent_title?: string
+  write_targets?: string[]
+  read_only_refs?: string[]
+  note?: string
+}
+
+/** 对话路由卡：处理者 / 本轮目标材料 / 协作步骤（计划可见、可改选执行角色）。 */
+export interface RoutingCard {
+  agent: string
+  agent_title: string
+  scope_label: string
+  write_targets: string[]
+  plan: RoutingPlanStep[]
+  skills: string[]
+}
+
+const routingText = (value: unknown) => typeof value === 'string' ? value : ''
+
+const routingList = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+
+export function routingPlan(value: unknown): RoutingPlanStep[] {
+  return (Array.isArray(value) ? value : [])
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .map((item, index) => ({
+      step: Number(item.step || index + 1),
+      agent: routingText(item.agent),
+      agent_title: routingText(item.agent_title),
+      write_targets: routingList(item.write_targets),
+      read_only_refs: routingList(item.read_only_refs),
+      note: routingText(item.note),
+    }))
+}
+
+/** 从 `routing` 事件或消息 meta.routing（同一结构）归并出路由卡；无内容时返回 null。 */
+export function routingCard(value: unknown): RoutingCard | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const card: RoutingCard = {
+    agent: routingText(raw.agent), agent_title: routingText(raw.agent_title),
+    scope_label: routingText(raw.scope_label), write_targets: routingList(raw.write_targets),
+    plan: routingPlan(raw.plan), skills: routingList(raw.skills),
+  }
+  return card.agent || card.scope_label || card.plan.length || card.write_targets.length ? card : null
+}
+
 /** Apply a durable event once, preserving rich step details from earlier events. */
 export function applyChatEvent(run: ChatRun, event: ChatRunEvent): ChatRun {
   if (String(event.run_id) !== run.id || Number(event.session_id) !== run.session_id || event.seq <= (run.last_seq || 0)) return run
   const next = { ...run, last_seq: event.seq }
+  for (const field of ['plan_state', 'completion', 'metrics'] as const) {
+    if (event[field] && typeof event[field] === 'object') Object.assign(next, { [field]: event[field] })
+  }
   if (event.event === 'delta') next.text = run.text + String(event.text || '')
   else if (event.event === 'step') next.steps = mergeChatStep(runSteps(run), event)
   else if (event.event === 'interaction' && event.interaction) {
@@ -128,6 +185,9 @@ export function applyChatEvent(run: ChatRun, event: ChatRunEvent): ChatRun {
   } else if (event.event === 'status' || event.event === 'started') {
     next.status = String(event.status || 'running')
     next.status_message = typeof event.message === 'string' ? event.message : ''
+    if (['ask', 'auto', 'full'].includes(String(event.permission_mode))) next.permission_mode = event.permission_mode as ChatPermissionMode
+    if (typeof event.discussion_only === 'boolean') next.discussion_only = event.discussion_only
+    if (typeof event.read_only === 'boolean') next.read_only = event.read_only
   } else if (event.event === 'error') {
     next.error_code = String(event.code || '')
     next.error_message = String(event.message || '本轮未完成')

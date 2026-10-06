@@ -29,6 +29,7 @@ from .dsh_paths import (
     DshNotInstalledError,
     build_dsh_env,
     get_dsh_binary,
+    get_dsh_cli_command,
     get_dsh_home,
     is_vendor_dsh_installed,
 )
@@ -209,10 +210,19 @@ class DshEngine(BaseEngine):
             )
 
         patch_path = self._patch_file(request, session)
-        command = [str(get_dsh_binary()), "--profile", self._profile()]
+        try:
+            node, entry = get_dsh_cli_command()
+        except DshNotInstalledError as exc:
+            return GenerationResult(
+                ok=False, engine=self.name, error_code="ENGINE_UNAVAILABLE",
+                error_message=str(exc), attempts=attempts,
+                duration_ms=int((time.time() - started) * 1000), session_id=session,
+            )
+        command = [node, str(Path(__file__).with_name("dsh_headless_stdin.mjs")),
+                   entry, "--profile", self._profile()]
         if patch_path is not None:
             command += ["--patch", str(patch_path)]
-        command.append(self._task_text(request))
+        task = self._task_text(request)
 
         env = build_dsh_env()
         env["NO_COLOR"] = "1"
@@ -227,11 +237,12 @@ class DshEngine(BaseEngine):
                     command,
                     cwd=str(cwd),
                     env=env,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+                    # Binary pipes avoid Windows TextIOWrapper translating LF
+                    # inside the manuscript into CRLF (or CRCRLF).
+                    text=False,
                     creationflags=_creation_flags(),
                 )
             except OSError as exc:
@@ -244,11 +255,13 @@ class DshEngine(BaseEngine):
             with self._lock:
                 self._procs[session] = proc
             try:
-                stdout, stderr = proc.communicate(timeout=timeout)
+                stdout, stderr = proc.communicate(input=task.encode("utf-8"), timeout=timeout)
+                stdout, stderr = _decode_output(stdout), _decode_output(stderr)
                 exit_code = proc.returncode
             except subprocess.TimeoutExpired:
                 self._kill_tree(proc)
                 stdout, stderr = proc.communicate()
+                stdout, stderr = _decode_output(stdout), _decode_output(stderr)
                 self._finish_checkpoint(checkpoint, "timeout")
                 return GenerationResult(
                     ok=False, engine=self.name, error_code="TIMEOUT",
@@ -369,7 +382,8 @@ class DshEngine(BaseEngine):
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "status": "running",
             "task_chars": len(self._task_text(request)),
-            "argv_tail": [command[0], *command[1:-1]],  # 不落 task 全文（可能含上下文）
+            "input_transport": "stdin-utf8",
+            "argv_tail": command,  # argv no longer contains the chapter or its context.
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
@@ -429,6 +443,10 @@ class DshEngine(BaseEngine):
             attempts=attempts, session_id=session_id or "",
             duration_ms=int((time.time() - started) * 1000),
         )
+
+
+def _decode_output(value: bytes | str | None) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
 
 
 def _creation_flags() -> int:

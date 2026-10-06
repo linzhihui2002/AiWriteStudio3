@@ -185,6 +185,22 @@ def get_session(session_id: int) -> dict:
     return {**dict(row), "discussion_only": bool(row["discussion_only"])}
 
 
+def get_session_permission(session_id: int) -> dict:
+    """实时读取会话权限，供任务执行期在每次工具调用前刷新。
+
+    作者改权限后，当前任务的下一个工具调用即按新值判定，不需要新开对话。
+    会话已被删除或读取失败时返回安全值（逐次批准 + 只讨论），绝不放宽写权限。
+    """
+    try:
+        session = get_session(session_id)
+    except (NodeNotFoundError, ValueError, TypeError):
+        return {"permission_mode": "ask", "discussion_only": True}
+    mode = session.get("permission_mode")
+    if mode not in {"ask", "auto", "full"}:
+        mode = "auto" if session.get("auto_apply") else "ask"
+    return {"permission_mode": mode, "discussion_only": bool(session.get("discussion_only"))}
+
+
 def list_sessions(project_id: int | None = None, limit: int = 50) -> list[dict]:
     sql = "SELECT * FROM chat_sessions"
     params: list = []
@@ -308,6 +324,42 @@ def _pick_agent(session: dict, agent_name: str, routing: dict) -> tuple[str, dic
         agent_service.ensure_builtin_agents()
         key = agent_service.DEFAULT_AGENT
         return key, agent_service.get_agent(key)
+
+
+def material_dirs(write_targets) -> list[str]:
+    """把写域条目归一到顶层材料目录（章节/设定/大纲/状态/备忘录），保持顺序去重。"""
+    dirs: list[str] = []
+    for item in write_targets or []:
+        top = str(item or "").replace("\\", "/").strip("/").split("/", 1)[0]
+        if top and top not in dirs:
+            dirs.append(top)
+    return dirs
+
+
+def round_scope(project_id: int, write_targets, *, target_chapter: str | None = None):
+    """本轮写域（旧同步路径与原生编排共用）：只允许写入声明范围内的材料。
+
+    写域守卫模块不可用时返回 ``None``，由工具层按既有权限语义处理，不阻断对话。
+    """
+    try:
+        from . import scope_guard
+    except ImportError:
+        return None
+    kwargs: dict = {"project_id": project_id, "write_targets": list(write_targets or [])}
+    if target_chapter:
+        kwargs["target_chapter"] = target_chapter
+    return scope_guard.build_scope(**kwargs)
+
+
+def scope_label(scope) -> str:
+    """写域的中文描述（如「设定/」）；守卫不可用或范围为空时返回空串。"""
+    if not scope:
+        return ""
+    try:
+        from . import scope_guard
+        return str(scope_guard.describe(scope) or "")
+    except Exception:  # noqa: BLE001 - 描述失败只影响展示
+        return str(scope.get("label") or "")
 
 
 TITLE_PROMPT = (

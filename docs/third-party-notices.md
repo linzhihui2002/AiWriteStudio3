@@ -50,8 +50,47 @@ MIT 许可全文（版权声明 + 许可声明）随副本一并保留在
 
 ## 三、禁止事项速查
 
+### 前端 Markdown 与正文编辑器依赖（2026-10-02）
+
+以下依赖仅使用 MIT npm 发行包，安装前登记；不复制 Trae 的代码或样式。上游 LICENSE 保留在发行包中，版本锁定于前端 package.json 与 package-lock.json。
+
+| 发行包 / 来源 | 锁定版本 | 许可证 | 用途 |
+|---|---|---|---|
+| [react-markdown](https://github.com/remarkjs/react-markdown) | 10.1.0 | MIT | 安全的 React Markdown 渲染 |
+| [remark-gfm](https://github.com/remarkjs/remark-gfm) | 4.0.1 | MIT | GFM 表格、任务列表、删除线 |
+| [@codemirror/state](https://github.com/codemirror/state) | 6.7.6 | MIT | 纯文本编辑状态与事务 |
+| [@codemirror/view](https://github.com/codemirror/view) | 6.43.13 | MIT | 行号、换行与显示装饰 |
+| [@codemirror/commands](https://github.com/codemirror/commands) | 6.11.1 | MIT | 编辑快捷键及撤销重做 |
+
 - 禁止把 `projects/` 下任何文件整体复制进 `workbench/` 或 `skills/`。
 - 禁止移植 `manhai934__novel-harness` 的 `.harness/**`、`skills/**`、`memory/**`、`rag/**` 文本。
 - 禁止引入 AGPL（`ExplosiveCoderflome__AI-Novel-Writing-Assistant`）任何内容。
 - 无 LICENSE 项目一律视为「保留全部权利」，只能读、不能抄。
 - Apache-2.0 项目引入时必须同时保留其 `NOTICE` 文件内容。
+
+## 四、知识库运行依赖与模型（2026-09-27）
+
+以下引入仅使用发行包/模型制品，不复制其他小说工具的实现或提示词。
+
+| 来源 | 许可 | 落点与用途 | 保留声明 |
+|---|---|---|---|
+| [Cytoscape.js](https://github.com/cytoscape/cytoscape.js) | MIT | 前端 npm 依赖，知识图谱 Canvas 与 CoSE 布局 | npm 包 LICENSE；版本锁入 package-lock.json |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | Python CPU 推理运行时 | 发行包 LICENSE/ThirdPartyNotices |
+| [Hugging Face Tokenizers](https://github.com/huggingface/tokenizers) | Apache-2.0 | 本地模型分词与长度/位置计算 | 发行包 LICENSE 与声明 |
+| [NumPy](https://numpy.org/) | BSD-3-Clause | 张量与向量运算 | 发行包 LICENSE |
+| [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5) / [Qdrant 转换制品](https://huggingface.co/Qdrant/bge-small-zh-v1.5) | MIT | 仅下载到 `.workbench/models/`，不写入任何 DSH Home；ONNX CPU，512 维 | 固定 revision `46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59`；manifest 保存制品 SHA-256/来源，模型包保留上游许可 |
+
+默认 ONNX 文件 `model_optimized.onnx`，94,781,076 字节，SHA-256
+`1294ea4b6331115a353d81f96b85e8c8d7fdcc284453d5b2fab5b016230aad38`。
+模型的查询前缀/CLS 池化遵循上游公开用法；推理与索引实现为本项目原创。
+
+## 五、PC 客户端安装器构建依赖（2026-10-06）
+
+以下依赖仅用于 `pc-client` 安装包的**构建期**（编译 / 签名），不随产品
+（PyInstaller 产物与安装包）分发其安装程序本体或源码。
+
+| 来源 | 许可证 | 用途 | 说明 |
+|---|---|---|---|
+| [Inno Setup 6](https://jrsoftware.org/)（jrsoftware.org，winget 包 `JRSoftware.InnoSetup`，6.7.3） | [Inno Setup License](https://jrsoftware.org/files/license.txt) | 构建安装包：ISCC 编译 `pc-client/installer/AiWriteStudioClient.iss` 生成 Setup.exe | 仅构建期使用，不随产品分发 |
+| [ChineseSimplified.isl](https://github.com/jrsoftware/issrc/blob/is-6_7_3/Files/Languages/Unofficial/ChineseSimplified.isl)（issrc 官方仓库 Unofficial 语言文件，取自 `is-6_7_3` tag） | Inno Setup License（随 issrc 分发） | 安装器中文向导文案，随构建产物**内嵌于安装器 UI** | 落点 `pc-client/installer/ChineseSimplified.isl`；文件头保留维护者声明 |
+| [Windows SDK signtool](https://developer.microsoft.com/windows/downloads/windows-sdk/)（Microsoft） | Microsoft 软件许可条款 | 构建期代码签名（Task 4 计划使用） | 仅构建期使用，不随产品分发 |

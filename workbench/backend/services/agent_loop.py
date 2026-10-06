@@ -37,7 +37,7 @@ TOOL_PROTOCOL = """【可用工具】
 {tools}
 
 【调用方式】需要工具时，只输出下面这一行（不要加任何其他内容）：
-<tool_call>{{"tool": "read_chapter", "args": {{"rel_path": "章节/第0012章.md"}}}}</tool_call>
+<tool_call>{{"tool": "read_chapter", "args": {{"rel_path": "章节/第0012章.txt"}}}}</tool_call>
 一次只调用一个工具；看到【工具结果】后再决定下一步。
 
 【结束方式】信息足够时不要再输出 <tool_call>，直接给出最终答复（中文，不要复述工具结果）。

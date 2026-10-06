@@ -2,7 +2,8 @@
 
 原则
 ----
-- **SQLite 只是索引**：随时可清空重建，事实源是项目内 Markdown；
+- **文档索引可重建**：随时可清空重建，事实源是项目内 Markdown / 纯文本正文文件；
+- **章节元数据例外**：``chapters`` 表的标题/状态/合同ID 是唯一事实源，索引刷新只更新字数与版本；
 - **空文件不入索引**（spec：剔除 frontmatter 后正文为空则跳过）；
 - 外部（如 dsh 会话）增删改文件后，调用 :func:`rebuild_index` 即可与磁盘一致；
 - FTS5 不可用时检索自动降级为 LIKE 关键词匹配（功能不中断）。
@@ -17,7 +18,7 @@ from pathlib import Path
 from .. import db
 from .chapter_service import (
     CHAPTER_DIR,
-    is_chapter_filename,
+    is_chapter_name,
     parse_chapter_number,
 )
 from .fs_utils import count_words, is_empty_document, read_text, split_frontmatter, to_rel
@@ -110,15 +111,16 @@ def rebuild_index(project_id: int) -> dict:
                 pass
             indexed += 1
 
-            if kind == "chapter" and path.parent.name == CHAPTER_DIR and is_chapter_filename(path.name):
+            if kind == "chapter" and path.parent.name == CHAPTER_DIR and is_chapter_name(path.name):
                 chapter_paths.add(rel_path)
                 meta, body = split_frontmatter(text)
+                # 标题/状态由 chapter_service 维护，索引刷新只更新字数与版本
                 conn.execute(
                     "INSERT INTO chapters"
                     " (project_id, rel_path, status, word_count, hash, mtime)"
                     " VALUES (?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(project_id, rel_path) DO UPDATE SET"
-                    " status = excluded.status, word_count = excluded.word_count,"
+                    " word_count = excluded.word_count,"
                     " hash = excluded.hash, mtime = excluded.mtime",
                     (
                         project_id,
@@ -138,6 +140,7 @@ def rebuild_index(project_id: int) -> dict:
                 (project_id, rel),
             )
 
+    invalidate_knowledge(project_id)
     return {
         "project_id": project_id,
         "project_name": row["name"],
@@ -161,6 +164,7 @@ def index_document(project_id: int, project_dir: Path, rel_path: str) -> dict | 
                 (project_id, rel_path),
             )
             _fts_delete(conn, project_id, rel_path)
+        invalidate_knowledge(project_id, rel_path)
         return None
 
     try:
@@ -175,6 +179,7 @@ def index_document(project_id: int, project_dir: Path, rel_path: str) -> dict | 
                 (project_id, rel_path),
             )
             _fts_delete(conn, project_id, rel_path)
+        invalidate_knowledge(project_id, rel_path)
         return None
 
     meta, body = split_frontmatter(text)
@@ -201,18 +206,19 @@ def index_document(project_id: int, project_dir: Path, rel_path: str) -> dict | 
         except Exception:  # noqa: BLE001
             pass
         if kind == "chapter":
+            # 标题/状态由 chapter_service 维护，索引刷新只更新字数与版本
             conn.execute(
                 "INSERT INTO chapters"
                 " (project_id, rel_path, status, word_count, hash, mtime)"
                 " VALUES (?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(project_id, rel_path) DO UPDATE SET"
-                " status = excluded.status, word_count = excluded.word_count,"
+                " word_count = excluded.word_count,"
                 " hash = excluded.hash, mtime = excluded.mtime",
                 (project_id, rel_path, str(meta.get("状态") or "草稿"), word_count,
                  digest, stat.st_mtime),
             )
 
-    # 增量向量索引（仅当该项目已建过向量库时；章节应用落盘后自动入索引）
+    # 失效本书旧知识依据；已启用时合并后台同步，不影响原稿保存。
     _vector_refresh(project_id, rel_path)
 
     return {
@@ -224,14 +230,19 @@ def index_document(project_id: int, project_dir: Path, rel_path: str) -> dict | 
 
 
 def _vector_refresh(project_id: int, rel_path: str) -> None:
-    """把文档同步进向量库（未启用向量检索时静默跳过）。"""
-    try:
-        from .vector_service import index_document as vector_index, vector_ready
+    """统一投影生命周期；基础索引自动维护，语义索引遵循本书启用配置。"""
+    invalidate_knowledge(project_id, rel_path)
 
-        if vector_ready(project_id):
-            vector_index(project_id, rel_path)
-    except Exception:  # noqa: BLE001 - 向量索引失败不影响主流程
-        pass
+
+def invalidate_knowledge(project_id: int, rel_path: str | None = None) -> None:
+    """保存/删除/改名/恢复及状态变更先失效旧依据，再安排同步。"""
+    try:
+        from . import knowledge_service
+        knowledge_service.invalidate(project_id, rel_path)
+        knowledge_service.enqueue(project_id, rel_path)
+    except Exception as exc:  # 派生知识库不可阻断原稿保存，失败留操作审计。
+        from . import operation_log
+        operation_log.log(project_id, "knowledge-sync-warning", rel_path, {"reason": str(exc)})
 
 
 def _fts_delete(conn, project_id: int, rel_path: str) -> None:
@@ -256,6 +267,7 @@ def remove_from_index(project_id: int, rel_path: str) -> None:
             (project_id, rel_path),
         )
         _fts_delete(conn, project_id, rel_path)
+    invalidate_knowledge(project_id, rel_path)
 
 
 _FTS_TOKEN_RE = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]")

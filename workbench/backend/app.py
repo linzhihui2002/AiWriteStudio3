@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import config, db
 from .api.content import router as content_router
 from .api.images import router as images_router
+from .api.knowledge import router as knowledge_router
 from .api.library import router as library_router
 from .api.models import router as models_router
 from .api.orchestration import router as orchestration_router
@@ -123,9 +124,19 @@ async def _lifespan(app: FastAPI):
     from .services import provider_service
     provider_service.project_to_dsh_home()
     app.state.selfcheck = run_startup_selfcheck()
-    from .services import chat_run_service
+    from .services import chat_run_service, workflow_service
     chat_run_service.recover_interrupted()
+    workflow_service.recover_interrupted()
+    from .services import knowledge_service, knowledge_candidate_service, embedding_service, asset_card_service
+    knowledge_candidate_service.recover()
+    knowledge_service.recover()
+    embedding_service.recover()
+    asset_card_service.recover()
     yield
+    asset_card_service.shutdown()
+    knowledge_candidate_service.shutdown()
+    knowledge_service.shutdown()
+    embedding_service.shutdown()
     chat_run_service.shutdown()
 
 
@@ -176,6 +187,7 @@ def create_app() -> FastAPI:
     app.include_router(content_router)
     app.include_router(orchestration_router)
     app.include_router(images_router)
+    app.include_router(knowledge_router)
 
     # 静态托管必须最后注册（catch-all 路由）
     _mount_frontend(app)

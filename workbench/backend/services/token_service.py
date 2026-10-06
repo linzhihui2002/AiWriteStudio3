@@ -63,9 +63,11 @@ def estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
 
 def summary(project_id: int | None = None, days: int = 30) -> dict:
     """用量汇总：按日 / 按项目 / 按任务类型，附预算告警。"""
-    since = (date.today() - timedelta(days=max(1, days))).isoformat()
-    params: list = [since]
-    where = "WHERE date(created_at) >= ?"
+    days = max(1, days)
+    today = date.today()
+    since = (today - timedelta(days=days - 1)).isoformat()
+    params: list = [since, today.isoformat()]
+    where = "WHERE date(created_at) >= ? AND date(created_at) <= ?"
     if project_id is not None:
         where += " AND project_id = ?"
         params.append(project_id)
@@ -98,7 +100,7 @@ def summary(project_id: int | None = None, days: int = 30) -> dict:
         ).fetchone()
 
     today_tokens = 0
-    today_str = date.today().isoformat()
+    today_str = today.isoformat()
     for row in by_day:
         if row["day"] == today_str:
             today_tokens = int(row["tokens"] or 0)
@@ -110,6 +112,7 @@ def summary(project_id: int | None = None, days: int = 30) -> dict:
 
     return {
         "days": days,
+        "period": {"start": since, "end": today_str},
         "project_id": project_id,
         "totals": {
             "tokens": int(totals["tokens"] or 0),

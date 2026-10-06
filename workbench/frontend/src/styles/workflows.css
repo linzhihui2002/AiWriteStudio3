@@ -1,0 +1,8 @@
+.workflow-chapter-picker { min-width: 0; padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-lg); }
+.workflow-chapter-picker__modes { display: flex; flex-wrap: wrap; gap: var(--space-4); margin-bottom: var(--space-4); }
+.workflow-chapter-picker__modes label { display: inline-flex; align-items: center; gap: var(--space-2); }
+.workflow-chapter-picker__list { display: grid; gap: var(--space-3); max-height: 320px; overflow-y: auto; }
+.workflow-chapter-picker__list label { align-items: flex-start; padding: var(--space-2); border-radius: var(--radius-md); }
+.workflow-chapter-picker__list label:hover { background: var(--color-bg-hover); }
+.workflow-chapter-picker__list span { min-width: 0; overflow-wrap: anywhere; }
+.workflow-chapter-picker__list small { display: block; margin-top: var(--space-1); }

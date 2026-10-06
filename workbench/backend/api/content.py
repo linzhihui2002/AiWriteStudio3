@@ -31,6 +31,7 @@ class OutlineCandidateIn(BaseModel):
 
 
 class OutlineLockIn(BaseModel):
+    candidate_id: str | None = None
     index: int | None = None
     title: str | None = None
     confirm: bool = True
@@ -39,6 +40,10 @@ class OutlineLockIn(BaseModel):
 class OutlineExpandIn(BaseModel):
     idea: str = ""
     use_ai: bool = True
+
+
+class OutlineCandidateRefineIn(BaseModel):
+    message: str = Field(min_length=1, max_length=20000)
 
 
 class SourceMarkIn(BaseModel):
@@ -57,17 +62,28 @@ class CardQueryIn(BaseModel):
 class CardRefreshIn(BaseModel):
     category: str | None = None
     force: bool = False
-    use_ai: bool = False
+    use_ai: bool = True
 
 
 class CardHighlightIn(BaseModel):
     ref: str
     color: str = ""
+    mode: str | None = None
+
+
+class CardFieldEditIn(BaseModel):
+    original_name: str
+    new_name: str | None = None
+    value: str | None = None
+    delete: bool = False
 
 
 class CardUpdateIn(BaseModel):
     ref: str
-    fields: dict
+    fields: dict = Field(default_factory=dict)
+    name: str | None = None
+    field_edits: list[CardFieldEditIn] = Field(default_factory=list)
+    expected_hash: str | None = None
 
 
 class CardAddIn(BaseModel):
@@ -120,6 +136,8 @@ class VectorModelIn(BaseModel):
     model_dir: str = ""
     provider: str = ""
     model: str = ""
+    mode: str | None = None
+    enabled: bool | None = None
 
 
 class TeardownImportIn(BaseModel):
@@ -194,16 +212,23 @@ def expand_outline(project_id: int, payload: OutlineExpandIn) -> dict:
 
 @router.post("/projects/{project_id}/outline/candidates")
 def outline_candidates(project_id: int, payload: OutlineCandidateIn) -> dict:
-    """生成 2-3 个大纲候选。"""
+    """追加不同的大纲候选，返回包含已有候选的完整列表。"""
     return outline_service.generate_candidates(
         project_id, idea=payload.idea, count=payload.count, use_ai=payload.use_ai
     )
 
 
+@router.post("/projects/{project_id}/outline/candidates/{candidate_id}/refine")
+def refine_outline_candidate(project_id: int, candidate_id: str,
+                             payload: OutlineCandidateRefineIn) -> dict:
+    """对话优化当前候选，保存新版本并保留原版。"""
+    return outline_service.refine_candidate(project_id, candidate_id, message=payload.message)
+
+
 @router.post("/projects/{project_id}/outline/lock")
 def lock_outline(project_id: int, payload: OutlineLockIn) -> dict:
     """确认锁定某个候选为正式大纲。"""
-    target: int | str = payload.title if payload.title else (payload.index or 0)
+    target: int | str = payload.candidate_id or payload.title or (payload.index or 0)
     return outline_service.lock_candidate(project_id, target, confirm=payload.confirm)
 
 
@@ -238,15 +263,25 @@ def card_categories(project_id: int) -> list[dict]:
 
 @router.post("/projects/{project_id}/cards/refresh")
 def refresh_cards(project_id: int, payload: CardRefreshIn) -> dict:
-    """刷新解析（缓存指纹：内容未变不重复解析）。"""
+    """手动触发异步 AI 解析；普通读取不会调用模型。"""
     return asset_card_service.refresh(project_id, category=payload.category,
                                       force=payload.force, use_ai=payload.use_ai)
+
+
+@router.get("/projects/{project_id}/cards/tasks/{task_id}")
+def card_parse_task(project_id: int, task_id: str) -> dict:
+    return asset_card_service.get_parse_task(project_id, task_id)
+
+
+@router.post("/projects/{project_id}/cards/tasks/{task_id}/cancel")
+def cancel_card_parse_task(project_id: int, task_id: str) -> dict:
+    return asset_card_service.cancel_parse_task(project_id, task_id)
 
 
 @router.post("/projects/{project_id}/cards/highlight")
 def set_highlight(project_id: int, payload: CardHighlightIn) -> dict:
     """指派/清除高亮色（token 色板；持久化不写 md）。"""
-    return asset_card_service.set_highlight(project_id, payload.ref, payload.color)
+    return asset_card_service.set_highlight(project_id, payload.ref, payload.color, mode=payload.mode)
 
 
 @router.get("/projects/{project_id}/cards/highlights")
@@ -263,7 +298,8 @@ def card_chapter_line(project_id: int, ref: str = Query(...)) -> dict:
 @router.patch("/projects/{project_id}/cards")
 def update_card(project_id: int, payload: CardUpdateIn) -> dict:
     """卡片字段编辑（diff 写回 Markdown，不破坏自由书写内容）。"""
-    return asset_card_service.update_card(project_id, payload.ref, payload.fields)
+    return asset_card_service.update_card(project_id, payload.ref, payload.fields, name=payload.name,
+                                         field_edits=[edit.model_dump(exclude_none=True) for edit in payload.field_edits], expected_hash=payload.expected_hash)
 
 
 @router.post("/projects/{project_id}/cards", status_code=201)
@@ -369,8 +405,27 @@ def set_vector_model(payload: VectorModelIn) -> dict:
     from ..services import vector_service
 
     return vector_service.set_embedder_config(
-        model_dir=payload.model_dir, provider=payload.provider, model=payload.model
+        model_dir=payload.model_dir, provider=payload.provider, model=payload.model,
+        mode=payload.mode, enabled=payload.enabled,
     )
+
+
+@router.post("/vector/model/prepare")
+def prepare_vector_model() -> dict:
+    from ..services.embedding_service import prepare
+    return prepare(background=True, enable=True)
+
+
+@router.get("/projects/{project_id}/vector/model")
+def book_vector_model(project_id: int) -> dict:
+    from ..services.vector_service import model_info
+    return model_info(project_id)
+
+
+@router.put("/projects/{project_id}/vector/model")
+def set_book_vector_model(project_id: int, payload: VectorModelIn) -> dict:
+    from ..services.vector_service import set_embedder_config
+    return set_embedder_config(project_id=project_id, **payload.model_dump())
 
 
 @router.get("/projects/{project_id}/vector/stats")
@@ -382,12 +437,12 @@ def vector_stats(project_id: int) -> dict:
 
 
 @router.post("/projects/{project_id}/vector/rebuild")
-def vector_rebuild(project_id: int) -> dict:
-    """全量重建向量索引（章节正文 / Story Bible / 拆书事实卡 / 技能规则文档）。"""
+def vector_rebuild(project_id: int, background: bool = False) -> dict:
+    """重建本书知识索引；保留同步调用，可选择后台执行。"""
     from ..services import vector_service
 
     get_project_dir(project_id)
-    return vector_service.rebuild(project_id)
+    return vector_service.rebuild(project_id, background=background)
 
 
 @router.post("/projects/{project_id}/vector/index")

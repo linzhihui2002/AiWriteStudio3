@@ -1,3 +1,5 @@
+import WorkspacePage, { ResourceState, useResourceRequest } from '../components/WorkspacePage'
+import Icon from '../components/Icon'
 /**
  * 生图工坊（全局页，不依赖项目上下文）。
  *
@@ -11,7 +13,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import Modal from '../components/Modal'
+import Drawer from '../components/Drawer'
+import CredentialInput from '../components/CredentialInput'
 import { useConfirm } from '../components/ConfirmDialog'
 import {
   cancelImageJob,
@@ -35,7 +38,7 @@ import type {
   ImageUploadRef,
 } from '../api/types'
 import { errorMessage, useToast } from '../state/useToast'
-import { CREDENTIAL_FIELD_EXTRA, NO_AUTOFILL, NO_AUTOFILL_PASSWORD } from '../lib/autofill'
+import { CREDENTIAL_FIELD_EXTRA, NO_AUTOFILL } from '../lib/autofill'
 
 // ─────────────────────────── 常量（与后端 image_adapters 对齐） ───────────────────────────
 
@@ -166,12 +169,17 @@ export default function ImageStudio() {
   const [healthText, setHealthText] = useState('')
   const [busy, setBusy] = useState('')
   const [sizeDialogOpen, setSizeDialogOpen] = useState(false)
+  const [composerDrag, setComposerDrag] = useState(false)
 
   // 画廊
   const [records, setRecords] = useState<ImageRecord[]>([])
   const [favoriteOnly, setFavoriteOnly] = useState(false)
   const [search, setSearch] = useState('')
   const [lightboxId, setLightboxId] = useState<number | null>(null)
+  const [failedJobs, setFailedJobs] = useState<ImageJob[]>([])
+  const providersResource = useResourceRequest('image-providers')
+  const recordsResource = useResourceRequest(`${favoriteOnly}:${search}`)
+  const jobsResource = useResourceRequest('image-jobs')
 
   // 任务轮询
   const [jobs, setJobs] = useState<ImageJob[]>([])
@@ -248,58 +256,32 @@ export default function ImageStudio() {
   // ── 数据加载 ──
 
   const refreshProviders = useCallback(async () => {
-    try {
-      const data = await listImageProviders()
-      setProviders(data.providers)
-    } catch (err) {
-      push(errorMessage(err), 'error')
-    }
-  }, [push])
-
+    const token = providersResource.begin()
+    try { const data = await listImageProviders(); if (!providersResource.accept(token)) return; setProviders(data.providers); providersResource.finish(token) }
+    catch (err) { providersResource.fail(token, errorMessage(err)) }
+  }, [])
   const refreshRecords = useCallback(async () => {
+    const token = recordsResource.begin()
     try {
-      const data = await listImageRecords({
-        favorite: favoriteOnly || undefined,
-        search: search || undefined,
-        limit: 200,
-      })
-      setRecords(data.records)
-    } catch {
-      setRecords([])
-    }
+      const data = await listImageRecords({favorite: favoriteOnly || undefined, search: search || undefined, limit: 200})
+      if (!recordsResource.accept(token)) return
+      setRecords(data.records); recordsResource.finish(token)
+    } catch (err) { recordsResource.fail(token, errorMessage(err)) }
   }, [favoriteOnly, search])
-
   const refreshRecordsRef = useRef(refreshRecords)
   refreshRecordsRef.current = refreshRecords
-
   const refreshJobs = useCallback(async () => {
+    const token = jobsResource.begin()
     try {
-      const data = await listImageJobs(true, 50)
-      setJobs(data.jobs)
-    } catch {
-      setJobs([])
-    }
+      const data = await listImageJobs(false, 50)
+      if (!jobsResource.accept(token)) return
+      setJobs(data.jobs.filter(job => job.status === 'running'))
+      setFailedJobs(data.jobs.filter(job => job.status === 'failed').slice(0, 3))
+      jobsResource.finish(token)
+    } catch (err) { jobsResource.fail(token, errorMessage(err)) }
   }, [])
-
   const jobsCountRef = useRef(0)
-  useEffect(() => {
-    const poll = async () => {
-      try {
-        const data = await listImageJobs(true, 50)
-        const count = data.jobs.length
-        setJobs(data.jobs)
-        if (jobsCountRef.current > 0 && count === 0) {
-          await refreshRecordsRef.current()
-        }
-        jobsCountRef.current = count
-      } catch {
-        setJobs([])
-      }
-    }
-    void poll()
-    const timer = window.setInterval(() => void poll(), 2500)
-    return () => window.clearInterval(timer)
-  }, [])
+  useEffect(() => { void refreshJobs(); const timer = window.setInterval(() => { if (!document.hidden) void refreshJobs() }, 2500); return () => window.clearInterval(timer) }, [refreshJobs])
 
   // 秒级计时（进行中任务的 elapsed）
   useEffect(() => {
@@ -342,7 +324,6 @@ export default function ImageStudio() {
   const handleGenerate = async () => {
     if (!selected) {
       push('请先在「模型配置」中添加并启用图片供应商', 'error')
-      setConfigOpen(true)
       return
     }
     if (!prompt.trim()) {
@@ -466,6 +447,7 @@ export default function ImageStudio() {
     document.body.appendChild(anchor)
     anchor.click()
     anchor.remove()
+    push('已开始下载', 'success')
   }
 
   // ── 模型配置 ──
@@ -573,7 +555,10 @@ export default function ImageStudio() {
   // ── 渲染 ──
 
   return (
-    <div className="studio">
+    <WorkspacePage className="studio workspace-image">
+      <header className="page-header"><div><h1 className="page-header__title">生图工坊</h1><p className="page-header__desc">创作封面与场景，保留提示词和参数，随时复用。</p></div></header>
+      <ResourceState {...providersResource} hasData={providersResource.loaded} onRetry={() => void refreshProviders()}>
+
       <div className="studio-toolbar">
         <label className="field studio-toolbar__provider">
           <span className="field__label">图片模型</span>
@@ -602,7 +587,7 @@ export default function ImageStudio() {
           aria-pressed={favoriteOnly}
           onClick={() => setFavoriteOnly((value) => !value)}
         >
-          ★ 只看收藏
+          只看收藏
         </button>
         <input
           autoComplete={NO_AUTOFILL}
@@ -626,14 +611,17 @@ export default function ImageStudio() {
         </button>
       </div>
 
+      </ResourceState>
       <div className="studio-body">
-        {providers.length === 0 ? (
+        {providersResource.loaded && providers.length === 0 ? (
           <div className="empty-state">
             <p className="empty-state__title">还没有配置图片模型</p>
             <p className="empty-state__desc">点击右上角「模型配置」，填写 base_url 与 API Key。</p>
           </div>
         ) : null}
 
+        <ResourceState {...jobsResource} loading={jobsResource.loading && !jobsResource.loaded} hasData={jobsResource.loaded} onRetry={() => void refreshJobs()}>
+        {failedJobs.map(job => <div className="workspace-notice workspace-notice--error" role="alert" key={`failed-${job.id}`}><span><strong>生成失败</strong> · {job.prompt}<br />{job.error || '没有返回错误详情'}</span><button className="btn btn--sm" onClick={() => { setPrompt(job.prompt); setSize(decomposeSize(job.params.size || '')); setComposer(current => ({...current, providerId:job.provider_id, quality:job.params.quality || current.quality, format:job.params.output_format || current.format, background:!!job.params.background, moderation:job.params.moderation || current.moderation, n:job.params.n || current.n})); setRefs((job.params.input_uploads || []).map(ref => ({...ref, size:0, media_type:''}))) }}>编辑后重试</button></div>)}
         {jobs.map((job) => (
           <div className="img-card img-card--job" key={`job-${job.id}`}>
             <div className="img-card__thumb img-card__thumb--pending">
@@ -655,6 +643,8 @@ export default function ImageStudio() {
           </div>
         ))}
 
+        </ResourceState>
+        <ResourceState {...recordsResource} hasData={recordsResource.loaded && records.length > 0} onRetry={() => void refreshRecords()}>
         {records.length > 0 ? (
           <div className="gallery-grid">
             {records.map((record) => (
@@ -689,7 +679,7 @@ export default function ImageStudio() {
                       title={record.favorite ? '取消收藏' : '收藏'}
                       onClick={() => handleToggleFavorite(record)}
                     >
-                      {record.favorite ? '★' : '☆'}
+                      {record.favorite ? '已收藏' : '收藏'}
                     </button>
                     <button className="btn btn--ghost btn--sm" type="button" title="复用配置" onClick={() => applyRecordConfig(record)}>
                       复用配置
@@ -711,15 +701,42 @@ export default function ImageStudio() {
         ) : (
           providers.length > 0 && jobs.length === 0 ? (
             <div className="empty-state">
-              <p className="empty-state__title">画廊还是空的</p>
-              <p className="empty-state__desc">在下方输入提示词开始第一张图的生成。</p>
+              <p className="empty-state__title">{search || favoriteOnly ? '没有匹配的图片' : '画廊还是空的'}</p>
+              <p className="empty-state__desc">{search || favoriteOnly ? '清除搜索或切换收藏筛选，查看其他图片。' : '在下方输入提示词开始第一张图的生成。'}</p>
             </div>
           ) : null
         )}
+        </ResourceState>
       </div>
 
       {/* 底部生成条 */}
-      <div className="composer">
+      <div
+        className={`composer${composerDrag ? ' is-dragover' : ''}`}
+        onDragOver={(event) => {
+          if (!supportsEdit) return
+          event.preventDefault()
+          setComposerDrag(true)
+        }}
+        onDragLeave={() => setComposerDrag(false)}
+        onDrop={(event) => {
+          if (!supportsEdit) return
+          event.preventDefault()
+          setComposerDrag(false)
+          void handleAddRefs(event.dataTransfer.files)
+        }}
+      >
+        {providers.length === 0 ? (
+          <div className="row row--between">
+            <span className="muted">还没有启用的图片供应商，先配置好再生成。</span>
+            <button
+              className="btn btn--sm"
+              type="button"
+              onClick={() => { setForm(null); setConfigOpen(true) }}
+            >
+              去配置
+            </button>
+          </div>
+        ) : null}
         {refs.length > 0 ? (
           <div className="composer__refs">
             {refs.map((item) => (
@@ -757,9 +774,25 @@ export default function ImageStudio() {
           }}
         />
         <div className="composer__opts">
-          <button className="btn btn--ghost btn--sm" type="button" onClick={() => setSizeDialogOpen(true)} title="设置图像尺寸">
-            尺寸 {sizeLabel}（{sizeText}）
-          </button>
+          <div className="popover-anchor">
+            <button className="btn btn--ghost btn--sm" type="button" onClick={() => setSizeDialogOpen((open) => !open)} title="设置图像尺寸" aria-expanded={sizeDialogOpen}>
+              尺寸 {sizeLabel}（{sizeText}）
+            </button>
+            <SizeDialog
+              open={sizeDialogOpen}
+              value={size}
+              baseOptions={baseOptions}
+              ratioOptions={ratioOptions}
+              minSide={caps?.min_side ?? 256}
+              maxSide={caps?.max_side ?? 4096}
+              onClose={() => setSizeDialogOpen(false)}
+              onApply={(next) => {
+                setSize(next)
+                setSizeDialogOpen(false)
+              }}
+            />
+          </div>
+          <details className="studio-advanced"><summary className="btn btn--ghost btn--sm">高级参数</summary><div className="studio-advanced__body">
           <label className="composer__opt">
             <span>质量</span>
             <select
@@ -797,8 +830,8 @@ export default function ImageStudio() {
                 setComposer((current) => ({ ...current, background: event.target.value === 'true' }))
               }
             >
-              <option value="false">false</option>
-              <option value="true">true</option>
+              <option value="false">普通背景</option>
+              <option value="true">透明背景</option>
             </select>
           </label>
           <label className="composer__opt">
@@ -815,6 +848,7 @@ export default function ImageStudio() {
               ))}
             </select>
           </label>
+          </div></details>
           <label className="composer__opt">
             <span>数量</span>
             <input
@@ -839,7 +873,7 @@ export default function ImageStudio() {
               onClick={() => fileInputRef.current?.click()}
               disabled={busy === 'upload'}
             >
-              📎 参考图
+              <Icon name="image" size={16} /> 参考图
             </button>
           ) : null}
           <input
@@ -862,23 +896,8 @@ export default function ImageStudio() {
         </div>
       </div>
 
-      {/* 尺寸弹窗 */}
-      <SizeDialog
-        open={sizeDialogOpen}
-        value={size}
-        baseOptions={baseOptions}
-        ratioOptions={ratioOptions}
-        minSide={caps?.min_side ?? 256}
-        maxSide={caps?.max_side ?? 4096}
-        onClose={() => setSizeDialogOpen(false)}
-        onApply={(next) => {
-          setSize(next)
-          setSizeDialogOpen(false)
-        }}
-      />
-
-      {/* 模型配置弹窗 */}
-      <Modal
+      {/* 模型配置抽屉 */}
+      <Drawer
         title="图片模型配置"
         open={configOpen}
         onClose={() => setConfigOpen(false)}
@@ -980,21 +999,18 @@ export default function ImageStudio() {
                     placeholder="https://api.openai.com/v1"
                   />
                 </label>
-                <label className="field">
-                  <span className="field__label">API Key（留空表示不修改）</span>
-                  <input
-                    className="input"
-                    type="password"
+                <div className="field">
+                  <label className="field__label" htmlFor="image-provider-credential">API Key（留空表示不修改）</label>
+                  <CredentialInput
+                    id="image-provider-credential"
                     name="image-api-key"
-                    autoComplete={NO_AUTOFILL_PASSWORD}
-                    {...CREDENTIAL_FIELD_EXTRA}
                     value={form.api_key}
                     onChange={(event) => setForm({ ...form, api_key: event.target.value })}
                     placeholder={
                       providers.find((p) => p.provider_id === form.provider_id)?.masked_secret || 'sk-…'
                     }
                   />
-                </label>
+                </div>
                 <label className="field">
                   <span className="field__label">超时（秒）</span>
                   <input
@@ -1039,7 +1055,7 @@ export default function ImageStudio() {
             </div>
           )}
         </div>
-      </Modal>
+      </Drawer>
 
       {/* 灯箱 */}
       {lightboxRecord ? (
@@ -1086,11 +1102,11 @@ export default function ImageStudio() {
       ) : null}
 
       {confirmNode}
-    </div>
+    </WorkspacePage>
   )
 }
 
-// ─────────────────────────── 尺寸弹窗 ───────────────────────────
+// ─────────────────────────── 尺寸面板（锚定生成条，非遮罩弹窗） ───────────────────────────
 
 function SizeDialog(props: {
   open: boolean
@@ -1105,6 +1121,7 @@ function SizeDialog(props: {
   const { open, value, baseOptions, ratioOptions, minSide, maxSide, onClose, onApply } = props
   const [draft, setDraft] = useState<SizeState>(value)
   const [customRatio, setCustomRatio] = useState('2:3')
+  const panelRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (open) {
@@ -1113,13 +1130,35 @@ function SizeDialog(props: {
     }
   }, [open, value])
 
+  // 打开时：Esc 与点击锚点区之外关闭（非阻塞面板，不占用整屏遮罩）
+  useEffect(() => {
+    if (!open) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        onClose()
+      }
+    }
+    const onMouseDown = (event: MouseEvent) => {
+      // 以锚点容器（含「尺寸」按钮）为界：点在按钮上交给按钮的 onClick 切换，不算面板外
+      const anchor = panelRef.current?.parentElement
+      if (anchor && !anchor.contains(event.target as Node)) onClose()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    document.addEventListener('mousedown', onMouseDown)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      document.removeEventListener('mousedown', onMouseDown)
+    }
+  }, [open, onClose])
+
   if (!open) return null
 
   const preview =
     draft.mode === 'ratio' ? calcSize(draft.base, draft.ratio) : `${draft.customW}x${draft.customH}`
 
   return (
-    <Modal title="设置图像尺寸" open={open} onClose={onClose} width={480}>
+    <div className="popover popover--size" ref={panelRef} role="dialog" aria-label="设置图像尺寸">
       <div className="stack">
         <p className="muted">当前：{preview}</p>
         <div className="seg" role="tablist">
@@ -1256,6 +1295,6 @@ function SizeDialog(props: {
           </span>
         </div>
       </div>
-    </Modal>
+    </div>
   )
 }

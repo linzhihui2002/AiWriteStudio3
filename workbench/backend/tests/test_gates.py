@@ -7,8 +7,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
-from workbench.backend.gates import density_gate, language_gate, prose_gate
+import pytest
+
+from workbench.backend import config, db
+from workbench.backend.gates import (
+    density_gate, language_gate, novel_format, outline_gate, prose_gate, setting_gate,
+    tracking_gate,
+)
+from workbench.backend.services import (
+    chat_tools, chat_workspace_tools, project_service, review_service,
+)
+from workbench.backend.services.chat_tools import ToolContext
 
 # ── 正例：规范中文散文 ────────────────────────────────────────
 GOOD_PROSE = """\
@@ -227,3 +238,322 @@ def test_all_gates_expose_run_passed_report() -> None:
         result = module.run(GOOD_PROSE)
         assert hasattr(result, "passed")
         assert isinstance(result.report(), str)
+
+
+# ── 小说正文格式门禁（番茄纯文本规范）─────────────────────────
+def test_novel_format_passes_plain_prose() -> None:
+    """合规纯正文（空行分段、引号成对、全角标点）通过。"""
+    result = novel_format.run(GOOD_PROSE)
+
+    assert result.passed is True, result.report()
+    assert result.findings == []
+    assert isinstance(result.report(), str)
+
+
+@pytest.mark.parametrize(
+    ("sample", "reason"),
+    [
+        ("# 第一章 起风\n\n他站着。\n", "Markdown 标题行"),
+        ("他站着，**很冷**。\n", "Markdown 加粗"),
+        ("他站着，*很冷*。\n", "Markdown 斜体"),
+        ("- 甲\n- 乙\n", "Markdown 无序列表"),
+        ("1. 甲\n2. 乙\n", "Markdown 有序列表"),
+        ("> 他站着。\n", "Markdown 引用"),
+        ("甲\n\n---\n\n乙\n", "Markdown 分隔线"),
+        ("```\n甲\n```\n", "Markdown 代码围栏"),
+        ("他站着`很冷`。\n", "行内代码"),
+        ("见[链接](https://example.com)。\n", "Markdown 链接"),
+        ("他站着<br>回头看。\n", "HTML 标签"),
+        ("甲&nbsp;乙\n", "HTML 实体"),
+    ],
+)
+def test_novel_format_blocks_markdown_leaks(sample: str, reason: str) -> None:
+    result = novel_format.run(sample)
+
+    assert result.passed is False, result.report()
+    hits = [item for item in result.findings if item.reason == reason]
+    assert hits, result.report()
+    # 定位清单必须给出行号与命中片段
+    assert hits[0].line >= 1
+    assert hits[0].text
+
+
+def test_novel_format_blocks_repeated_chapter_title_line() -> None:
+    """正文里又写一遍「第12章 xxx」当标题 —— 标题以数据库为准。"""
+    result = novel_format.run("第12章 起风\n\n他站在巷口。\n")
+
+    assert result.passed is False
+    assert any(item.reason == "正文重复章节标题行" for item in result.findings)
+
+
+def test_novel_format_blocks_unpaired_quotes() -> None:
+    result = novel_format.run("「你去哪儿了？\n\n他站在巷口。\n")
+
+    assert result.passed is False
+    hits = [item for item in result.findings if item.reason.startswith("成对引号不配对")]
+    assert hits, result.report()
+    assert hits[0].line == 1
+
+
+def test_novel_format_blocks_halfwidth_punctuation() -> None:
+    dots = novel_format.run("他站着...\n")
+    dashes = novel_format.run("他站着--风很大。\n")
+
+    assert dots.passed is False
+    assert any("半角省略号" in item.reason for item in dots.findings)
+    assert dashes.passed is False
+    assert any("半角破折号" in item.reason for item in dashes.findings)
+
+
+def test_novel_format_warns_long_block_without_blank_lines() -> None:
+    """连续多行无空行只给建议级提示，不阻断。"""
+    result = novel_format.run("甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲\n"
+                              "乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙\n"
+                              "丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙\n")
+
+    assert result.passed is True, result.report()
+    assert result.warnings
+    assert result.warnings[0].line == 1
+
+
+def test_novel_format_threshold_is_configurable() -> None:
+    short_block = ("甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲\n"
+                   "乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙\n"
+                   "丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙丙\n")
+
+    assert novel_format.run(short_block).warnings
+    relaxed = novel_format.run(short_block, block_warn_lines=4)
+    assert relaxed.warnings == []
+
+
+# ── 硬门禁集成：格式门并入 run_hard_gates ─────────────────────
+def test_run_hard_gates_includes_format_gate() -> None:
+    result = review_service.run_hard_gates(GOOD_PROSE)
+
+    keys = [gate["key"] for gate in result["gates"]]
+    assert "格式门" in keys
+    assert "记号泄漏" in keys
+    format_gate = next(gate for gate in result["gates"] if gate["key"] == "格式门")
+    assert format_gate["passed"] is True
+
+
+def test_run_hard_gates_blocks_markdown_leak_with_locations() -> None:
+    result = review_service.run_hard_gates(GOOD_PROSE + "\n# 第12章 起风\n")
+
+    assert result["passed"] is False
+    assert "格式门" in result["blocking_gates"]
+    located = [item for item in result["locations"] if item["gate"] == "格式门"]
+    assert located
+    assert located[0]["line"] >= 1
+    assert located[0]["text"]
+
+
+# ── 确定性校验：账本算术与条目 ID（tracking_gate） ────────────
+LEDGER_SAMPLE = (
+    "第0012章｜前值 10 ＋ 变动 ＋5 ＝ 结余 15\n"      # 通过
+    "第0013章｜10 ＋ 5 ＝ 20\n"                       # 不通过：应为 15
+    "第0014章｜前值 12 两 ＋ 18 两 ＝ 结余 待核实\n"   # 无法解析（结余没写数）
+)
+
+
+def test_tracking_gate_ledger_arithmetic_reports_line_and_diff() -> None:
+    result = tracking_gate.run_ledger(LEDGER_SAMPLE)
+
+    assert result["key"] == "账本算术"
+    assert result["passed"] is False
+    assert [item["line"] for item in result["findings"]] == [2]
+    finding = result["findings"][0]
+    assert finding["expected"] == "15"
+    assert finding["actual"] == "20"
+    assert finding["diff"] == "5"
+    assert result["unparsed"] == [3]
+    assert result["detail"] == "检查 3 行：1 行不满足，1 行无法解析"
+
+
+def test_tracking_gate_ledger_passes_balanced_rows() -> None:
+    result = tracking_gate.run_ledger("第0012章｜前值 12 两 ＋ 收货款 18 两 － 购麻绳 0 两 ＝ 结余 30 两\n")
+
+    assert result["passed"] is True, result["detail"]
+    assert result["findings"] == []
+
+
+def test_tracking_gate_run_aggregates_both_checks() -> None:
+    text = LEDGER_SAMPLE + "FACT-0001 沈砚身份\nFACT-0001 沈砚身份（重复登记）\n"
+
+    result = tracking_gate.run(text)
+
+    assert result["key"] == "追踪校验"
+    assert result["passed"] is False
+    assert [check["key"] for check in result["checks"]] == ["账本算术", "条目ID"]
+
+
+def test_tracking_gate_ids_unique_passes() -> None:
+    result = tracking_gate.run_ids(
+        "FACT-0001 沈砚身份（依据：第0003章）\nEVENT-0002 码头交货\nFX-01 铜印\n")
+
+    assert result["key"] == "条目ID"
+    assert result["passed"] is True, result["detail"]
+    assert result["findings"] == []
+
+
+def test_tracking_gate_ids_duplicate_fails() -> None:
+    result = tracking_gate.run_ids("FORESHADOW-0007 铜印埋设\nFORESHADOW-0007 铜印（重复登记）\n")
+
+    assert result["passed"] is False
+    assert result["findings"][0]["line"] == 2
+    assert "重复" in result["findings"][0]["message"]
+
+
+# ── 确定性校验：大纲 / 章纲（outline_gate） ──────────────────
+def test_outline_gate_flags_duplicate_chapter_number_as_error() -> None:
+    result = outline_gate.run("第0001章 ｜ 交货\n第0001章 ｜ 收货\n")
+
+    assert result["key"] == "大纲校验"
+    assert result["passed"] is False
+    errors = [item for item in result["findings"] if item["severity"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["line"] == 2
+    assert "章号重复" in errors[0]["message"]
+
+
+def test_outline_gate_flags_chapter_gap_as_warn() -> None:
+    result = outline_gate.run("第0001章 ｜ 交货\n第0004章 ｜ 收货\n")
+
+    assert result["passed"] is True
+    warns = [item for item in result["findings"] if item["severity"] == "warn"]
+    assert warns and warns[0]["line"] == 2
+    assert "跳号" in warns[0]["message"]
+
+
+def test_outline_gate_flags_chapter_line_without_event() -> None:
+    result = outline_gate.run("第0001章 ｜\n第0002章 ｜ 交货\n")
+
+    assert result["passed"] is False
+    assert result["findings"][0]["line"] == 1
+    assert "事件" in result["findings"][0]["message"]
+
+
+def test_outline_gate_warns_unpaired_volume_goal() -> None:
+    result = outline_gate.run("## 第1卷 起风\n- 卷级目标：攒够三十两赎身\n")
+
+    assert result["passed"] is True
+    assert [item["severity"] for item in result["findings"]] == ["warn"]
+    assert "钩子" in result["findings"][0]["message"]
+
+
+# ── 确定性校验：设定卡字段与来源分级（setting_gate） ─────────
+CARD_MISSING_FIELD = (
+    "## 沈砚\n"
+    "- 姓名：沈砚\n"
+    "- 身份：据点跑货人\n"
+    "- 来源：author（作者在第 3 次对话中确认）\n"
+)
+
+CARD_NO_SOURCE = (
+    "## 老周\n"
+    "- 姓名：老周\n"
+    "- 别名：老周头\n"
+    "- 身份：码头管事\n"
+    "- 目标：还清船钱\n"
+    "- 动机：给儿子还债\n"
+    "- 能力边界：会看水路，打不过镖师\n"
+    "- 关系：与沈砚是旧交\n"
+    "- 语言习惯：短句\n"
+    "- 已知信息边界：不知道货主是谁\n"
+    "- 状态锚点：见 状态/角色状态.md\n"
+)
+
+
+def test_setting_gate_flags_missing_required_field_as_error() -> None:
+    result = setting_gate.run(CARD_MISSING_FIELD, category="人物")
+
+    assert result["key"] == "设定校验"
+    assert result["passed"] is False
+    errors = [item for item in result["findings"] if item["severity"] == "error"]
+    assert any("能力边界" in item["message"] for item in errors)
+    assert {item["line"] for item in errors} == {1}
+
+
+def test_setting_gate_warns_missing_source_grade() -> None:
+    result = setting_gate.run(CARD_NO_SOURCE, category="人物")
+
+    assert result["passed"] is True
+    assert [item["severity"] for item in result["findings"]] == ["warn"]
+    assert "来源分级" in result["findings"][0]["message"]
+
+
+def test_setting_gate_requires_known_category() -> None:
+    empty = setting_gate.run(CARD_MISSING_FIELD, category="")
+    unknown = setting_gate.run(CARD_MISSING_FIELD, category="阵法")
+
+    assert empty["passed"] is False and "人物" in empty["detail"]
+    assert unknown["passed"] is False and "人物" in unknown["detail"]
+
+
+# ── 工具层：check_tracking（两条对话路径） ───────────────────
+LEDGER_FILE = (
+    "---\n标题: 资源账本\n---\n"
+    "第0012章｜前值 10 ＋ 变动 ＋5 ＝ 结余 15\n"
+    "第0013章｜10 ＋ 5 ＝ 20\n"
+)
+
+
+@pytest.fixture()
+def book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "books")
+    monkeypatch.setattr(config, "RUNTIME_DIR", tmp_path / ".workbench")
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / ".workbench" / "test.db")
+    db.init_db()
+    config.ensure_runtime_dirs()
+    project = project_service.create_project(name="校验小说")
+    _row, root = project_service.get_project_dir(project["id"])
+    (root / "状态").mkdir(exist_ok=True)
+    (root / "状态" / "资源账本.md").write_text(LEDGER_FILE, encoding="utf-8")
+    (root / "设定").mkdir(exist_ok=True)
+    (root / "设定" / "人物设定.md").write_text(CARD_MISSING_FIELD, encoding="utf-8")
+    return SimpleNamespace(id=project["id"], root=root)
+
+
+def test_check_tracking_tool_native(book: SimpleNamespace) -> None:
+    ctx = {"project_id": book.id, "read_hashes": {}}
+
+    result = chat_workspace_tools.execute("check_tracking", {"target": "账本"}, ctx)
+    assert result["ok"] is True
+    assert result["data"]["key"] == "追踪校验"
+    assert result["data"]["passed"] is False
+    assert [check["key"] for check in result["data"]["checks"]] == ["账本算术", "条目ID"]
+    assert result["data"]["checks"][0]["findings"][0]["line"] == 5  # 前 3 行是 frontmatter
+
+    setting = chat_workspace_tools.execute(
+        "check_tracking", {"target": "设定", "category": "人物"}, ctx)
+    assert setting["ok"] is True
+    assert setting["data"]["key"] == "设定校验"
+    assert any("能力边界" in item["message"] for item in setting["data"]["findings"])
+
+    # 只给 rel_path：按文件名推断分类
+    inferred = chat_workspace_tools.execute(
+        "check_tracking", {"target": "设定", "rel_path": "设定/人物设定.md"}, ctx)
+    assert inferred["ok"] is True
+    assert inferred["data"]["category"] == "人物"
+
+    # 用法错误：target=设定 既没 category 也没 rel_path
+    assert chat_workspace_tools.execute("check_tracking", {"target": "设定"}, ctx)["ok"] is False
+
+    # 越界路径被拒
+    escaped = chat_workspace_tools.execute(
+        "check_tracking", {"target": "账本", "rel_path": "../../x.md"}, ctx)
+    assert escaped["ok"] is False
+
+
+def test_check_tracking_tool_legacy(book: SimpleNamespace) -> None:
+    ctx = ToolContext(project_id=book.id, session_id=1)
+
+    result = chat_tools.execute("check_tracking", {"target": "账本"}, ctx)
+    assert result["ok"] is True
+    assert result["data"]["key"] == "追踪校验"
+    assert "账本算术" in result["text"]
+
+    assert chat_tools.execute(
+        "check_tracking", {"target": "账本", "rel_path": "../../x.md"}, ctx)["ok"] is False
+    assert chat_tools.execute("check_tracking", {"target": "设定"}, ctx)["ok"] is False

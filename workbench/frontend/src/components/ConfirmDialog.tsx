@@ -6,7 +6,7 @@
  *   if (!(await confirm({ title: '删除供应商', message: `确定删除「${id}」吗？`, danger: true }))) return
  */
 
-import { useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import Modal from './Modal'
 
 export interface ConfirmOptions {
@@ -38,7 +38,7 @@ export function ConfirmDialog({
       <div className="stack">
         <p className="dialog__message">{message}</p>
         <div className="btn-row btn-row--end">
-          <button className="btn btn--ghost btn--sm" type="button" onClick={onCancel}>
+          <button className="btn btn--ghost btn--sm" type="button" data-autofocus onClick={onCancel}>
             {cancelText ?? '取消'}
           </button>
           <button
@@ -60,12 +60,19 @@ interface PendingConfirm extends ConfirmOptions {
 
 export function useConfirm(): [(options: ConfirmOptions) => Promise<boolean>, ReactNode] {
   const [pending, setPending] = useState<PendingConfirm | null>(null)
+  const pendingRef = useRef<PendingConfirm | null>(null)
+  useEffect(() => () => { pendingRef.current?.resolve(false); pendingRef.current = null }, [])
 
-  const confirm = (options: ConfirmOptions) =>
-    new Promise<boolean>((resolve) => setPending({ ...options, resolve }))
+  const confirm = useCallback((options: ConfirmOptions) =>
+    new Promise<boolean>((resolve) => {
+      pendingRef.current?.resolve(false)
+      const next = { ...options, resolve }
+      pendingRef.current = next; setPending(next)
+    }), [])
 
   const settle = (ok: boolean) => {
-    pending?.resolve(ok)
+    pendingRef.current?.resolve(ok)
+    pendingRef.current = null
     setPending(null)
   }
 

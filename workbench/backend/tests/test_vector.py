@@ -17,6 +17,7 @@ from workbench.backend.services import (
     proposal_service,
     review_service,
     vector_service,
+    knowledge_service,
 )
 
 
@@ -51,12 +52,15 @@ class _FakeResponse:
         return self._payload
 
 
-def test_local_embedder_is_deterministic_and_offline(workspace: SimpleNamespace) -> None:
+def test_local_embedder_is_explicit_and_hash_diagnostic_is_offline(workspace: SimpleNamespace) -> None:
     embedder = vector_service.resolve_embedder(None)
     info = embedder.info()
-    assert info["name"] == vector_service.EMBEDDER_LOCAL
+    assert info["name"] == vector_service.MODEL_ID
     assert info["offline"] is True
     assert info["dim"] == vector_service.DIM_LOCAL
+    assert info["ready"] is False  # No verified model in this isolated workspace.
+    with pytest.raises(Exception):
+        embedder.embed_query("沈砚在南码头等货")
 
     first = vector_service.embed_local("沈砚在南码头等货")
     second = vector_service.embed_local("沈砚在南码头等货")
@@ -70,11 +74,12 @@ def test_local_embedder_is_deterministic_and_offline(workspace: SimpleNamespace)
     assert dot(first, similar) > dot(first, unrelated)
 
     model_info = vector_service.model_info()
-    assert model_info["options"][0]["download_required"] is False
+    assert model_info["options"][0]["download_required"] is True
     assert model_info["explicit_path_supported"] is True
 
 
-def test_vector_rebuild_incremental_and_recall(workspace: SimpleNamespace) -> None:
+def test_vector_rebuild_incremental_and_recall(workspace: SimpleNamespace, monkeypatch) -> None:
+    monkeypatch.setattr(knowledge_service, "enqueue", lambda *a, **k: None)
     project = project_service.create_project(name="向量书")
     project_id = project["id"]
     (workspace.projects / "向量书" / "设定" / "人物设定.md").write_text(
@@ -85,49 +90,53 @@ def test_vector_rebuild_incremental_and_recall(workspace: SimpleNamespace) -> No
     chapter_service.save_chapter(
         project_id, chapter["rel_path"],
         "沈砚在码头清点铜钱，一共十七枚。他打算先付三成定金。",
+        status="完成",
     )
     other = chapter_service.create_chapter(project_id, "第二章")
-    chapter_service.save_chapter(project_id, other["rel_path"], "北境三年一雪，商队改道南行。")
+    chapter_service.save_chapter(project_id, other["rel_path"], "北境三年一雪，商队改道南行。", status="发表")
 
     assert vector_service.vector_ready(project_id) is False
 
-    rebuilt = vector_service.rebuild(project_id)
-    assert rebuilt["chunks"] > 0
-    assert vector_service.vector_ready(project_id) is True
+    knowledge_service.sync(project_id, background=False, use_ai=False, enable=False)
+    assert vector_service.stats(project_id)["chunks"] > 0
+    assert vector_service.vector_ready(project_id) is False
 
     hits = vector_service.semantic_search(project_id, "铜钱定金", limit=3)
     assert hits
-    assert hits[0]["source"] == "vector"
+    assert hits[0]["source"] == "keyword"
     assert hits[0]["score"] > 0
-    assert "章节/第0001章.md" in hits[0]["rel_path"]
+    assert "章节/第0001章.txt" in hits[0]["rel_path"]
 
     # 增量：章节保存后自动入索引（向量库已就绪时）
     chapter_service.save_chapter(project_id, other["rel_path"], "北境盐铁互市，沈砚换到了鱼符。")
+    knowledge_service.sync(project_id, background=False, use_ai=False, enable=False)
     hits2 = vector_service.semantic_search(project_id, "鱼符互市", limit=3)
     assert any("第0002章" in hit["rel_path"] for hit in hits2)
 
     stats = vector_service.stats(project_id)
     assert stats["documents"] >= 2
-    assert stats["embedder"]["name"] == vector_service.EMBEDDER_LOCAL
+    assert stats["embedder"]["name"] == vector_service.MODEL_ID
 
     # 删除文档 → 向量同步移除
+    (workspace.projects / "向量书" / other["rel_path"]).unlink()
     vector_service.remove_document(project_id, other["rel_path"])
     assert not any("第0002章" in hit["rel_path"]
                    for hit in vector_service.semantic_search(project_id, "鱼符互市", limit=5))
 
 
-def test_context_level8_uses_vector(workspace: SimpleNamespace) -> None:
+def test_context_level8_uses_retrieval_with_explicit_lexical_fallback(workspace: SimpleNamespace, monkeypatch) -> None:
+    monkeypatch.setattr(knowledge_service, "enqueue", lambda *a, **k: None)
     project = project_service.create_project(name="召回书")
     project_id = project["id"]
     chapter = chapter_service.create_chapter(project_id, "第一章")
     chapter_service.save_chapter(project_id, chapter["rel_path"],
-                                 "沈砚把青铜鱼符按在桌上，问老周认不认识这个记号。")
-    vector_service.rebuild(project_id)
+                                 "沈砚把青铜鱼符按在桌上，问老周认不认识这个记号。", status="完成")
+    knowledge_service.sync(project_id, background=False, use_ai=False, enable=False)
 
     assembly = context_service.assemble(project_id, query="青铜鱼符")
     level8 = [block for block in assembly["blocks"] if block["level"] == 8]
     assert level8, "检索召回应进入上下文第 8 级"
-    assert "相似度" in level8[0]["text"] or "第0001章" in level8[0]["text"]
+    assert "青铜鱼符" in level8[0]["text"]
 
 
 def test_soft_deslop_creates_line_patches(workspace: SimpleNamespace, monkeypatch) -> None:
@@ -160,7 +169,7 @@ def test_soft_deslop_creates_line_patches(workspace: SimpleNamespace, monkeypatc
 
     applied = proposal_service.apply_proposal(result["proposal_ids"][0])
     assert applied["meta"]["applied"] is True
-    text = (workspace.projects / "软审书" / "章节" / "第0001章.md").read_text(encoding="utf-8")
+    text = (workspace.projects / "软审书" / "章节" / "第0001章.txt").read_text(encoding="utf-8")
     assert "他把碗按在桌上，指节发白。" in text
     assert "他感到一阵愤怒，桌上的碗晃了一下。" not in text
 

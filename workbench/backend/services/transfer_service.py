@@ -1,7 +1,7 @@
 """导入导出：章节正文的 MD/TXT 导出与导入。
 
 - 导出：仅正文 / 正文 + 标题两种口径，MD 或 TXT；产物不含任何凭据（只取章节正文与标题）；
-- 导入：MD/TXT 文本 → 生成**草稿**章节（``章节/第NNNN章.md``），自动剥离 frontmatter；
+- 导入：MD/TXT 文本 → 生成**草稿**章节（``章节/第NNNN章.txt``，纯正文），自动剥离 frontmatter；
 - 项目包导出/恢复（M5）：整项目 JSON 打包，见 :func:`export_project_package` /
   :func:`restore_project_package`。
 """
@@ -13,16 +13,13 @@ import re
 from pathlib import Path
 
 from .chapter_service import (
-    CHAPTER_DIR,
-    chapter_filename,
     create_chapter,
     list_chapters,
-    next_chapter_number,
     read_chapter,
     save_chapter,
 )
 from .errors import InvalidOperationError, NodeNotFoundError
-from .fs_utils import atomic_write_text, compose_document, count_words, read_text, split_frontmatter
+from .fs_utils import atomic_write_text, count_words, read_text, split_frontmatter
 from .project_service import get_project_dir, list_projects
 
 EXPORT_FORMATS = ("md", "txt")
@@ -66,7 +63,7 @@ def export_chapters(
         body = _normalize_line_endings(detail["body"]).strip()
         if not body:
             continue
-        title = detail["title"] or item["file_name"].removesuffix(".md")
+        title = detail["title"] or Path(item["file_name"]).stem
         heading = f"# {title}" if scope == "with_title" else ""
         if fmt == "txt" and scope == "with_title":
             heading = title
@@ -158,19 +155,16 @@ def import_document(
     _meta, body_only = split_frontmatter(text)
     payload = body_only if body_only.strip() else text
 
-    _row, project_dir = get_project_dir(project_id)
     created: list[dict] = []
 
     if as_single_chapter:
         chapter_title = title or Path(filename or "").stem or "导入章节"
-        created.append(
-            _create_draft_chapter(project_id, project_dir, chapter_title, payload.strip())
-        )
+        created.append(_create_draft_chapter(project_id, chapter_title, payload.strip()))
     else:
         for chunk_title, chunk_body in _split_import_chunks(payload):
             created.append(
                 _create_draft_chapter(
-                    project_id, project_dir, chunk_title or "导入章节", chunk_body
+                    project_id, chunk_title or "导入章节", chunk_body
                 )
             )
 
@@ -181,20 +175,10 @@ def import_document(
     }
 
 
-def _create_draft_chapter(
-    project_id: int, project_dir: Path, title: str, body: str
-) -> dict:
-    """新建草稿章节并写入正文（经 chapter_service 保证 frontmatter 与字数正确）。"""
-    number = next_chapter_number(Path(project_dir))
-    filename = chapter_filename(number)
-    directory = Path(project_dir) / CHAPTER_DIR
-    directory.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(directory / filename, compose_document({"标题": title, "状态": "草稿"}, ""))
-
-    rel_path = f"{CHAPTER_DIR}/{filename}"
-    meta = {"标题": title, "状态": "草稿"}
-    text = compose_document(meta, body)
-    detail = save_chapter(project_id, rel_path, text, status="草稿")
+def _create_draft_chapter(project_id: int, title: str, body: str) -> dict:
+    """新建草稿章节并写入纯正文（标题落 ``chapters`` 表，由 chapter_service 保证规范）。"""
+    chapter = create_chapter(project_id, title)
+    detail = save_chapter(project_id, chapter["rel_path"], body, status="草稿")
     return {
         "rel_path": detail["rel_path"],
         "title": detail["title"],

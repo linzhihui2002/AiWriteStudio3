@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,8 +13,8 @@ from workbench.backend import config, db
 from workbench.backend.services import (
     agent_service,
     chat_service,
-    project_service,
     prompt_registry_service,
+    project_service,
     provider_service,
     rule_service,
     routing_service,
@@ -85,14 +87,58 @@ def fake_model(monkeypatch: pytest.MonkeyPatch):
                                      models=[{"id": "m"}], api_key="sk-test-abcdefgh",
                                      enabled=True)
 
-    def _install(text: str):
+    def _install(text: str, *, route_workflow: bool = False):
+        calls = []
+        plot_evidence = {
+            "沈砚询问北边货物延误": "你上次说，北边那批货晚三天到。",
+            "沈砚支付定金": "十二枚，先付一半。",
+            "码头闷响让两人回头": "两个人同时转过头去。",
+            "沈砚已等货四十天": "我等这批货，等了四十天。",
+        }
+
+        def respond(*_args, **kwargs):
+            response_text = text
+            if route_workflow:
+                messages = kwargs["json"]["messages"]
+                system = messages[0]["content"]
+                if system.startswith("你是中文小说的章节策划。"):
+                    task = "章节合同"
+                    response_text = json.dumps({
+                        "情节点": list(plot_evidence)[:3],
+                        "字数预算": 3000, "钩子类型": "悬念",
+                        "涉及实体": ["沈砚", "老周"],
+                        "必须承上": ["沈砚已等货四十天"], "禁止事项": [],
+                    }, ensure_ascii=False)
+                elif system.startswith("你是严格的小说审稿编辑。"):
+                    task = "审稿"
+                    contract_text = messages[-1]["content"].split(
+                        "【本轮章节合同（本次逐项验收依据）】\n", 1)[1]
+                    contract, _end = json.JSONDecoder().raw_decode(contract_text)
+                    response_text = json.dumps({
+                        "逐项": [{"项": point, "判定": "已完成",
+                                  "证据": plot_evidence[point]}
+                                 for field in ("plot_points", "must_connect")
+                                 for point in contract[field]],
+                        "一致性": [], "结论": "通过", "修改指令": [],
+                    }, ensure_ascii=False)
+                elif "你是中文小说写作者。请按本章合同写作正文" in system:
+                    task = "章节正文"
+                elif system.startswith("你是小说信息抽取器。"):
+                    task = "结构化抽取"
+                    response_text = "{}"
+                else:
+                    raise AssertionError(f"Unexpected workflow model prompt: {system[:120]}")
+                calls.append({"task": task, "messages": messages})
+            return _FakeResponse(
+                {"choices": [{"message": {"content": response_text}}],
+                 "usage": {"prompt_tokens": 5, "completion_tokens": 9}}
+            )
+
         monkeypatch.setattr(
             "workbench.backend.engine.direct_api.httpx.post",
-            lambda *a, **k: _FakeResponse(
-                {"choices": [{"message": {"content": text}}],
-                 "usage": {"prompt_tokens": 5, "completion_tokens": 9}}
-            ),
+            respond,
         )
+        return calls
 
     return _install
 
@@ -106,7 +152,7 @@ def test_skill_sync_and_validation(workspace: SimpleNamespace) -> None:
     assert report["errors"] == []
     target = workspace.root / ".dsh" / "skills" / "novel-review" / "SKILL.md"
     assert target.is_file()
-    assert report["total_bytes"] <= report["budget_bytes"]
+    assert report["estimated_tokens"] > 0 and "budget_bytes" not in report
 
     created = skill_service.create_skill(
         "foreshadow-check", "伏笔回收检查技能。",
@@ -153,6 +199,7 @@ def test_builtin_agents_protected(workspace: SimpleNamespace) -> None:
     names = {item["name"] for item in all_agents}
     assert {"chief-editor", "planner", "writer", "reviewer", "context-keeper"} <= names
     assert "writing-assistant" in names
+    assert {"setting-keeper", "teardown-analyst"} <= names
 
     with pytest.raises(Exception) as excinfo:
         agent_service.delete_agent("writer")
@@ -247,6 +294,267 @@ def test_intent_routing(workspace: SimpleNamespace) -> None:
     assert dirty["agent"] == agent_service.DEFAULT_AGENT  # 未命中不再落到「总编」分类人格
 
 
+# ─────────────────────── 意图路由 v2（LLM 判定 + 回退） ───────────────────────
+
+
+def _install_intent_llm(monkeypatch: pytest.MonkeyPatch, payload) -> None:
+    """把 LLM 语义判定打成可控假响应：不联网、不需要 API Key。"""
+    from workbench.backend.services import intent_service
+
+    monkeypatch.setattr(intent_service, "_llm_engine_available", lambda: True)
+    monkeypatch.setattr(intent_service, "_intent_llm_enabled", lambda: True)
+
+    def fake_run_task(**_kwargs):
+        if isinstance(payload, Exception):
+            raise payload
+        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        return {"ok": True, "text": text, "task_id": 0}
+
+    monkeypatch.setattr(intent_service.generation_service, "run_task", fake_run_task)
+
+
+# 触发词并列（设定 vs 大纲）→ 关键词快路径不唯一 → 走 LLM 判定
+AMBIGUOUS_TEXT = "设定和大纲都过一遍"
+
+
+def test_intent_llm_setting_only(workspace: SimpleNamespace, monkeypatch) -> None:
+    """完善设定：判定主导设定类 Agent，产出材料只含 设定。"""
+    project = project_service.create_project(name="判定书")
+    _install_intent_llm(monkeypatch, {
+        "intent": "设定管理", "primary_agent": "setting-keeper",
+        "support_agents": [], "write_targets": ["设定"], "read_only_refs": [],
+        "skills": ["novel-setting"], "plan": [], "confidence": 0.9, "reason": "完善设定",
+    })
+
+    res = routing_service.route(project["id"], AMBIGUOUS_TEXT, record=False)
+
+    assert res["write_targets"] == ["设定"]
+    assert res["agent"] == "setting-keeper"
+    assert res["plan"] == []
+    assert res["llm_used"] is True
+    assert res["source"] == "llm"
+    assert res["read_only_refs"] == []
+    assert res["scope_unresolved"] is False
+    assert res["reason"] == "完善设定"
+
+
+def test_intent_llm_separates_basis_and_output(workspace: SimpleNamespace, monkeypatch) -> None:
+    """根据设定写大纲：设定是只读依据，大纲才是产出。"""
+    project = project_service.create_project(name="依据书")
+    _install_intent_llm(monkeypatch, {
+        "intent": "大纲规划", "primary_agent": "planner",
+        "write_targets": ["大纲"], "read_only_refs": ["设定"],
+        "skills": ["novel-planning"], "plan": [], "confidence": 0.82,
+        "reason": "根据设定写大纲",
+    })
+
+    res = routing_service.route(project["id"], "根据现有设定把大纲补出来", record=False)
+
+    assert res["write_targets"] == ["大纲"]
+    assert res["read_only_refs"] == ["设定"]
+    assert "设定" not in res["write_targets"]
+    assert res["agent"] == "planner"
+
+
+@pytest.mark.parametrize("payload", ["{oops 不是 JSON", RuntimeError("判定服务挂了")])
+def test_intent_llm_failure_falls_back_to_keyword(workspace: SimpleNamespace,
+                                                 monkeypatch, payload) -> None:
+    """非法 JSON / 抛异常：确定性回退关键词结果，不阻断整轮对话。"""
+    project = project_service.create_project(name="回退书")
+    _install_intent_llm(monkeypatch, payload)
+
+    res = routing_service.route(project["id"], AMBIGUOUS_TEXT, record=False)
+
+    assert res["source"] == "keyword"
+    assert res["llm_used"] is False
+    assert res["matched"] is True
+    assert res["agent"] in {"planner", "setting-keeper"}
+    assert "回退关键词" in res["basis"]
+
+
+def test_intent_llm_unknown_agent_falls_back_to_keyword(workspace: SimpleNamespace,
+                                                        monkeypatch) -> None:
+    """判定返回注册表里没有的角色名：丢弃并回退关键词结果。"""
+    project = project_service.create_project(name="未知角色书")
+    _install_intent_llm(monkeypatch, {
+        "intent": "设定管理", "primary_agent": "not-exist",
+        "write_targets": ["设定"], "confidence": 0.9, "reason": "瞎猜",
+    })
+
+    res = routing_service.route(project["id"], AMBIGUOUS_TEXT, record=False)
+
+    assert res["source"] == "keyword"
+    assert res["llm_used"] is False
+    assert res["agent"] != "not-exist"
+    assert "未知角色" in res["basis"]
+
+
+@pytest.mark.parametrize("confidence", [0.01, None])
+def test_intent_llm_low_confidence_falls_back_to_keyword(workspace: SimpleNamespace,
+                                                         monkeypatch, confidence) -> None:
+    """判定置信低于阈值（含缺失按 0 处理）：丢弃 LLM 判定，确定性回退关键词结果并说明原因。"""
+    project = project_service.create_project(name="低置信书")
+    payload = {
+        "intent": "设定管理", "primary_agent": "setting-keeper",
+        "write_targets": ["设定"], "read_only_refs": [],
+        "skills": ["novel-setting"], "plan": [], "reason": "瞎猜",
+    }
+    if confidence is not None:
+        payload["confidence"] = confidence
+    _install_intent_llm(monkeypatch, payload)
+
+    res = routing_service.route(project["id"], AMBIGUOUS_TEXT, record=False)
+
+    assert res["source"] == "keyword"
+    assert res["llm_used"] is False
+    assert res["agent"] in {"planner", "setting-keeper"}
+    assert "置信" in res["basis"] and "回退关键词" in res["basis"]
+
+
+def test_teardown_analyst_binds_novel_teardown(workspace: SimpleNamespace) -> None:
+    """拆书 Agent 绑定 1 个对应技能，且版本升到 4（否则既有安装不幂等升级）。"""
+    agent_service.list_all_agents()  # 先确保内置定义落盘
+
+    agent = agent_service.get_agent("teardown-analyst")
+
+    assert agent["skills"] == ["novel-teardown"]
+    assert agent["capabilities"][0]["skill"] == "novel-teardown"
+    assert agent["version"] >= 4
+    assert agent["capabilities"][0]["retrieval_profile"] == "teardown"
+
+
+def test_intent_llm_multi_step_plan(workspace: SimpleNamespace, monkeypatch) -> None:
+    """跨材料任务：多步计划按序保留，且每步只写自己声明的材料。"""
+    project = project_service.create_project(name="接力书")
+    step_one = {"step": 1, "agent": "setting-keeper", "write_targets": ["设定"],
+                "read_only_refs": [], "note": "先补设定"}
+    step_two = {"step": 2, "agent": "planner", "write_targets": ["大纲"],
+                "read_only_refs": ["设定"], "note": "再按设定列卷纲"}
+    _install_intent_llm(monkeypatch, {
+        "intent": "大纲规划", "primary_agent": "planner", "write_targets": ["大纲"],
+        "read_only_refs": ["设定"], "plan": [step_one, step_two],
+        "confidence": 0.85, "reason": "先设定后大纲",
+    })
+
+    res = routing_service.route(project["id"], "先帮我把设定补全，再按设定列一版卷纲",
+                                record=False)
+
+    assert len(res["plan"]) == 2
+    assert res["plan"][0]["agent"] == "setting-keeper"
+    assert res["plan"][1]["agent"] == "planner"
+    assert "设定" in res["plan"][1]["read_only_refs"]
+    assert res["plan"][0]["write_targets"] == ["设定"]
+
+    # 计划里塞入不存在的 Agent → 该步整步丢弃
+    ghost = {"step": 3, "agent": "ghost-keeper", "write_targets": ["大纲"],
+             "read_only_refs": []}
+    _install_intent_llm(monkeypatch, {
+        "intent": "大纲规划", "primary_agent": "planner", "write_targets": ["大纲"],
+        "read_only_refs": ["设定"], "plan": [step_one, ghost, step_two],
+        "confidence": 0.85, "reason": "先设定后大纲",
+    })
+
+    filtered = routing_service.route(project["id"], "先帮我把设定补全，再按设定列一版卷纲",
+                                     record=False)
+
+    assert len(filtered["plan"]) == 2
+    assert all(step["agent"] != "ghost-keeper" for step in filtered["plan"])
+    assert [step["step"] for step in filtered["plan"]] == [1, 2]
+
+
+def test_intent_llm_invalid_write_targets_dropped(workspace: SimpleNamespace,
+                                                  monkeypatch) -> None:
+    """产出材料非法（不存在的目录 / 越界路径）一律丢弃；兜底也空则标记未声明。"""
+    project = project_service.create_project(name="越界材料书")
+    _install_intent_llm(monkeypatch, {
+        "intent": "设定管理", "primary_agent": "writing-assistant",
+        "write_targets": ["不存在的目录", "../../x"], "read_only_refs": [],
+        "confidence": 0.5, "reason": "瞎猜",
+    })
+
+    res = routing_service.route(project["id"], AMBIGUOUS_TEXT, record=False)
+
+    assert res["write_targets"] == []
+    assert res["scope_unresolved"] is True
+
+
+# ───────────── 意图路由：关键词路径的显式材料扫描（无项目场景） ─────────────
+
+
+def test_keyword_scan_merges_named_materials_into_plan(workspace: SimpleNamespace) -> None:
+    """作者点名多类材料：并入写域，并按点名先后生成协作计划。"""
+    res = routing_service.route(None, "把设定补全，顺便把后续章节也写出来", record=False)
+
+    assert res["source"] == "keyword" and res["llm_used"] is False
+    assert "设定" in res["write_targets"] and "章节" in res["write_targets"]
+    assert len(res["plan"]) == 2
+    assert res["plan"][0]["agent"] == "setting-keeper"
+    assert res["plan"][1]["agent"] == "writer"
+    assert res["plan"][1]["read_only_refs"] == ["设定"]
+    assert res["scope_unresolved"] is False
+    assert "生成 2 步协作计划" in res["basis"]
+
+
+def test_keyword_scan_skips_readonly_agents(workspace: SimpleNamespace) -> None:
+    """审稿是只读角色：消息里的「这章」不为其带来写域。"""
+    res = routing_service.route(None, "帮我审一下这章，看看能不能发", record=False)
+
+    assert res["agent"] == "reviewer"
+    assert res["write_targets"] == []
+    assert res["plan"] == []
+
+
+def test_keyword_scan_single_material_keeps_no_plan(workspace: SimpleNamespace) -> None:
+    """只点名一类材料：写域就是这一类，不生成计划。"""
+    res = routing_service.route(None, "完善设定", record=False)
+
+    assert res["write_targets"] == ["设定"]
+    assert res["plan"] == []
+    assert res["scope_unresolved"] is False
+
+
+def test_keyword_basis_material_goes_readonly(workspace: SimpleNamespace) -> None:
+    """依据介词后的材料是只读依据，不进写域，也不触发多步计划。"""
+    res = routing_service.route(None, "根据现有设定把大纲补出来", record=False)
+
+    assert res["source"] == "keyword"
+    assert res["write_targets"] == ["大纲"]
+    assert "设定" in res["read_only_refs"]
+    assert "设定" not in res["write_targets"]
+    assert res["plan"] == []
+
+
+def test_keyword_location_qualified_material_goes_readonly(workspace: SimpleNamespace) -> None:
+    """「设定里的角色状态」：设定是查找位置（只读），状态才是产出。"""
+    res = routing_service.route(None, "把设定里的角色状态更新一下", record=False)
+
+    assert res["agent"] == "context-keeper"
+    assert "状态" in res["write_targets"]
+    assert "设定" not in res["write_targets"]
+    assert "设定" in res["read_only_refs"]
+    assert res["plan"] == []
+
+
+def test_keyword_agent_own_materials_do_not_force_plan(workspace: SimpleNamespace) -> None:
+    """只有 Agent 自带的多类材料（作者只点名一类）不得自动分步。"""
+    state = routing_service.route(None, "把角色状态和时间线更新一下", record=False)
+    assert "状态" in state["write_targets"]
+    assert state["plan"] == []
+
+    hook = routing_service.route(None, "伏笔检查一下，有哪些坑还没填", record=False)
+    assert hook["plan"] == []
+
+
+def test_keyword_normalized_trigger_matches(workspace: SimpleNamespace) -> None:
+    """含空格/全角的触发词归一化后仍能命中：去 AI 味 → reviewer（只读，无写域）。"""
+    res = routing_service.route(None, "这几章的去 AI 味处理一下", record=False)
+
+    assert res["source"] == "keyword"
+    assert res["agent"] == "reviewer"
+    assert res["write_targets"] == []
+    assert res["plan"] == []
+
+
 # ─────────────────────────── 工作流 ───────────────────────────
 
 
@@ -276,9 +584,9 @@ def test_workflow_builtin_and_custom(workspace: SimpleNamespace) -> None:
 
 def test_workflow_run_batch_with_checkpoints(workspace: SimpleNamespace,
                                              fake_model) -> None:
-    from workbench.backend.services import chapter_service, contract_service
+    from workbench.backend.services import chapter_service, contract_service, review_service
 
-    fake_model(CLEAN_BODY)
+    calls = fake_model(CLEAN_BODY, route_workflow=True)
     project = project_service.create_project(name="批产书")
     project_id = project["id"]
     (workspace.projects / "批产书" / "大纲" / "大纲.md").write_text(
@@ -296,6 +604,23 @@ def test_workflow_run_batch_with_checkpoints(workspace: SimpleNamespace,
     assert executed["status"] == "done"
     assert len(executed["progress"]["completed"]) == 2
     assert executed["log"], "执行日志必须有节点记录"
+    # 空的已建章节也必须审本轮候选，不能以旧正文为空跳过模型验收。
+    review_calls = [call for call in calls if call["task"] == "审稿"]
+    assert len(review_calls) == 2
+    for call in review_calls:
+        assert call["messages"][-1]["content"].split("【待审正文】\n", 1)[1] == CLEAN_BODY.strip()
+    reviews = review_service.list_reviews(project_id)
+    assert len(reviews) == 2
+    expected_hash = hashlib.sha256(CLEAN_BODY.strip().encode("utf-8")).hexdigest()
+    for review in reviews:
+        assert review["verdict"] == "通过"
+        assert review["payload"]["ai_used"] is True
+        assert review["payload"]["candidate_hash"] == expected_hash
+        assert review["payload"]["counts"] == {"已完成": 4, "未完成": 0, "待核实": 0}
+        assert all(item["证据"] in CLEAN_BODY for item in review["payload"]["items"])
+        assert contract_service.get_contract(project_id, review["rel_path"])["source"] == "model"
+        assert (workspace.projects / "批产书" / review["rel_path"]).read_text(
+            encoding="utf-8") == CLEAN_BODY.strip()
 
     # 已完成章节不重复生成：再跑一次应立即完成且不新增 log
     again = workflow_service.execute_run(run["id"], use_ai=True) if False else None
@@ -343,3 +668,114 @@ def test_chat_round_with_routing_and_native_tools(workspace: SimpleNamespace, mo
     assert engine.calls[-1]["resume"] and engine.calls[-1]["model"] == "m2"
     chat_service.delete_session(session["id"])
     assert chat_service.list_sessions(project["id"]) == []
+
+
+# ─────────────── 技能绑定与「上传/自建技能」闭环 ───────────────
+
+
+def _repo_skills_root() -> Path:
+    """仓库真实 ``skills/`` 目录（只读；用于绑定建议的「真实数据」断言）。"""
+    return Path(skill_service.__file__).resolve().parents[3] / "skills"
+
+
+def test_skill_sync_accepts_large_files_and_reports_body_tokens_only(workspace: SimpleNamespace) -> None:
+    """单文件与合计超出旧阈值仍完整同步，token 估算不含按需引用。"""
+    from workbench.backend.engine.runtime import estimate_tokens
+    skill_dir = workspace.skills / "ref-heavy"
+    (skill_dir / "references").mkdir(parents=True)
+    body = "技能条目。\n" * 12000 + "技能正文尾部验证。"
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: ref-heavy\ndescription: 仅用于体积口径测试。\n---\n\n" + body,
+        encoding="utf-8",
+    )
+    reference = "清单行\n" * 12000 + "引用尾部验证。"
+    (skill_dir / "references" / "big.md").write_text(reference, encoding="utf-8")
+
+    report = skill_service.sync_skills()
+    assert "core_bytes" in report
+    assert report["core_bytes"] < report["total_bytes"], "total_bytes 仍应含附带文件"
+
+    assert report["core_bytes"] > 128 * 1024
+    assert report["errors"] == [] and report["warnings"] == []
+    assert "budget_bytes" not in report
+    item = skill_service.get_skill("ref-heavy")
+    assert item["size_bytes"] > 32 * 1024
+    assert item["estimated_tokens"] == estimate_tokens(body.strip())
+    assert item["references_estimated_tokens"] == estimate_tokens(reference)
+    assert report["estimated_tokens"] == sum(row["estimated_tokens"] for row in skill_service.list_skills())
+    assert body in skill_service.skill_digest(["ref-heavy"])
+    target = skill_service.dsh_skills_root() / "ref-heavy"
+    assert (target / "SKILL.md").read_text(encoding="utf-8").endswith(body)
+    assert (target / "references/big.md").read_text(encoding="utf-8") == reference
+
+
+def test_skills_endpoint_merges_binding_fields(workspace: SimpleNamespace) -> None:
+    from workbench.backend.api import orchestration
+
+    payload = orchestration.list_skills()
+    assert payload["skills"]
+    item = payload["skills"][0]
+    assert {"agents", "suggested_agents", "missing_references"} <= set(item)
+    assert {"name", "size_bytes", "synced", "reference_files", "references_bytes"} <= set(item)
+    assert "estimated_tokens" in payload and "budget_bytes" not in payload and "target_root" in payload
+    assert payload["estimated_tokens"] == sum(row["estimated_tokens"] for row in payload["skills"])
+
+    agents_payload = orchestration.list_agents()
+    assert agents_payload["material_dirs"] == list(agent_service.MATERIAL_DIRS)
+
+
+def test_binding_report_bound_and_unbound(workspace: SimpleNamespace,
+                                          monkeypatch) -> None:
+    monkeypatch.setattr(skill_service, "skills_root", _repo_skills_root)
+    report = skill_service.binding_report()
+
+    bound = report["novel-setting"]
+    assert "setting-keeper" in bound["agents"], "内置设定类 Agent 应已绑定该技能"
+    assert bound["suggested_agents"] == [], "已有绑定时不再给建议"
+
+    unbound = report["foreshadow-check"]
+    assert unbound["agents"] == []
+    assert "context-keeper" in unbound["suggested_agents"], "按材料交集给出建议"
+    assert unbound["missing_references"], "未同步时源 references 应被列为缺失"
+    assert unbound["synced"] is False
+
+
+def test_list_skills_reports_applies_to_and_references(workspace: SimpleNamespace,
+                                                       monkeypatch) -> None:
+    monkeypatch.setattr(skill_service, "skills_root", _repo_skills_root)
+    items = {item["name"]: item for item in skill_service.list_skills()}
+
+    setting = items["novel-setting"]
+    assert "设定" in setting["appliesTo"]
+    assert len(setting["reference_files"]) >= 2
+    assert setting["references_bytes"] > 0
+    for rel in setting["reference_files"]:
+        assert (_repo_skills_root() / "novel-setting" / rel).is_file(), rel
+
+
+def test_custom_skill_binding_injects_into_digest(workspace: SimpleNamespace) -> None:
+    """上传/自建技能闭环：建技能 → 同步 → 绑定自建 Agent → 注入正文 → 清理。"""
+    marker = "自建技能闭环标记词"
+    skill_service.create_skill(
+        "e2e-binding-skill", "端到端绑定测试技能。",
+        f"## 做什么\n\n- 输出包含 {marker} 的清单。\n",
+    )
+    report = skill_service.sync_skills()
+    assert any(item["name"] == "e2e-binding-skill" for item in report["synced"])
+
+    agent = agent_service.create_agent(
+        "e2e-bound-agent",
+        description="端到端绑定测试",
+        system_prompt="只做绑定闭环测试。",
+        skills=["e2e-binding-skill"],
+    )
+    try:
+        assert "e2e-binding-skill" in agent["skills"]
+        assert marker in skill_service.skill_digest(agent["skills"])
+        assert "e2e-bound-agent" in skill_service.binding_report()["e2e-binding-skill"]["agents"]
+    finally:
+        agent_service.delete_agent("e2e-bound-agent")
+        skill_service.delete_skill("e2e-binding-skill")
+
+    assert all(item["name"] != "e2e-bound-agent" for item in agent_service.list_agents())
+    assert all(item["name"] != "e2e-binding-skill" for item in skill_service.list_skills())

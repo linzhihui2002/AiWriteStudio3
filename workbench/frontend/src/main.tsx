@@ -10,6 +10,9 @@ import './styles/tokens.css'
 import './styles/theme.css'
 import './styles/global.css'
 import './styles/app.css'
+import './styles/workbench.css'
+import './styles/chatWorkspace.css'
+import './styles/editorWorkspace.css'
 
 const container = document.getElementById('root')
 if (!container) throw new Error('找不到挂载节点 #root')

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 import uuid
+import re
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator, Protocol, runtime_checkable
 
@@ -58,6 +59,11 @@ def normalize_dsh_error(stderr: str) -> tuple[str, str]:
     line = (stderr or "").strip().splitlines()[0] if (stderr or "").strip() else ""
     if not line:
         return "UNKNOWN", "dsh 执行失败（无 stderr 输出）"
+    # Some vendor providers emit an HTTP status directly instead of a DSH code.
+    # Match only the error prefix; incidental numbers in prose are not statuses.
+    http = re.match(r"^(?:dsh:\s*)?(?:HTTP(?:\s+status)?\s*)?([45]\d{2})\s*[: -]", line, re.I)
+    if http:
+        return normalize_http_error(int(http[1]), line)
     if line.startswith("dsh: "):
         parts = line[len("dsh: "):].split(":", 1)
         raw_code = parts[0].strip()
@@ -69,6 +75,9 @@ def normalize_dsh_error(stderr: str) -> tuple[str, str]:
             "UNAUTHORIZED": "AUTH_ERROR",
             "RATE_LIMIT": "RATE_LIMIT",
             "TIMEOUT": "TIMEOUT",
+            "SERVER_ERROR": "SERVER_ERROR",
+            "NETWORK_ERROR": "NETWORK_ERROR",
+            "BAD_REQUEST": "BAD_REQUEST",
         }
         return mapping.get(raw_code.upper(), "UNKNOWN"), message
     return "UNKNOWN", line

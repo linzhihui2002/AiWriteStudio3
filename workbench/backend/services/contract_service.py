@@ -39,11 +39,14 @@ def _read_all(project_dir: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _write_all(project_dir: Path, data: dict) -> None:
-    atomic_write_text(
-        contracts_path(project_dir),
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-    )
+def _write_all(project_dir: Path, data: dict, *, project_id: int) -> None:
+    from .file_change_service import project_lock
+    # A candidate's contract check and manuscript commit use the same book lock.
+    with project_lock(project_id):
+        atomic_write_text(
+            contracts_path(project_dir),
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        )
 
 
 def _sync_index(project_id: int, chapter_rel: str, contract: dict) -> None:
@@ -72,7 +75,21 @@ def _sync_index(project_id: int, chapter_rel: str, contract: dict) -> None:
 # ─────────────────────────── 生成 ───────────────────────────
 
 
-def _deterministic_contract(project_dir: Path, chapter_rel: str) -> dict:
+def default_word_budget(project_id: int | None) -> int:
+    """本书区间中值作为单章默认字数预算（四舍五入取整）。"""
+    if project_id is None:
+        return config.DEFAULT_WORD_BUDGET
+    from .writing_preference_service import chapter_word_range
+
+    try:
+        minimum, maximum = chapter_word_range(int(project_id))
+    except Exception:  # noqa: BLE001 - 区间不可读时回落常量，不阻断合同生成
+        return config.DEFAULT_WORD_BUDGET
+    return int((minimum + maximum) / 2 + 0.5)
+
+
+def _deterministic_contract(project_dir: Path, chapter_rel: str,
+                            project_id: int | None = None) -> dict:
     """零 LLM 兜底合同：从 ``大纲/章纲.md`` 抓本章要点（AI 不可用时的降级路径）。"""
     from .context_service import _chapter_outline_entry  # 复用章纲提取
 
@@ -84,7 +101,7 @@ def _deterministic_contract(project_dir: Path, chapter_rel: str) -> dict:
             plot_points.append(stripped[:120])
     return {
         "plot_points": plot_points[:6] or ["（未找到章纲条目，请手工补充情节点）"],
-        "word_budget": config.DEFAULT_WORD_BUDGET,
+        "word_budget": default_word_budget(project_id),
         "hook_type": "悬念",
         "entities": [],
         "must_connect": [],
@@ -121,13 +138,20 @@ def generate_contract(
     word_budget: int | None = None,
 ) -> dict:
     """生成章节合同（AI 优先，失败自动降级到章纲提取）。"""
-    require_chapter_path(project_id, chapter_rel)
-    row, project_dir = get_project_dir(project_id)
+    from .file_change_service import project_lock
+
+    # Capture this chapter's version under the same lock used by short edits.
+    # The model call stays outside it so another chapter can continue changing.
+    absent = object()
+    with project_lock(project_id):
+        require_chapter_path(project_id, chapter_rel)
+        row, project_dir = get_project_dir(project_id)
+        original_contract = _read_all(project_dir).get(chapter_rel, absent)
     prompt = prompt_registry_service.get_prompt("novel.chapter.contract")
 
     from .context_service import assemble, to_messages
 
-    context = assemble(project_id, chapter_rel=chapter_rel, query="章节情节点")
+    context = assemble(project_id, chapter_rel=chapter_rel, query="", retrieval_profile="history")
     _system, messages = to_messages(context, system=prompt["body"])
     messages.append(
         {
@@ -157,7 +181,7 @@ def generate_contract(
                 contract = {
                     "plot_points": [str(item) for item in parsed.get("情节点") or []],
                     "word_budget": int(parsed.get("字数预算") or word_budget
-                                       or config.DEFAULT_WORD_BUDGET),
+                                       or default_word_budget(project_id)),
                     "hook_type": str(parsed.get("钩子类型") or "悬念"),
                     "entities": [str(item) for item in parsed.get("涉及实体") or []],
                     "must_connect": [str(item) for item in parsed.get("必须承上") or []],
@@ -166,7 +190,7 @@ def generate_contract(
                 }
 
     if contract is None:
-        contract = _deterministic_contract(project_dir, chapter_rel)
+        contract = _deterministic_contract(project_dir, chapter_rel, project_id)
         if word_budget:
             contract["word_budget"] = int(word_budget)
 
@@ -179,12 +203,18 @@ def generate_contract(
         }
     )
 
-    data = _read_all(project_dir)
-    data[chapter_rel] = contract
-    _write_all(project_dir, data)
-    _sync_index(project_id, chapter_rel, contract)
-    operation_log.log(project_id, "contract-generate", chapter_rel,
-                      {"source": contract.get("source")})
+    with project_lock(project_id):
+        require_chapter_path(project_id, chapter_rel)
+        # Merge only this chapter into the freshest file, preserving concurrent
+        # work on other chapters. Never overwrite a changed target contract.
+        data = _read_all(project_dir)
+        if data.get(chapter_rel, absent) != original_contract:
+            raise InvalidOperationError("本章合同在生成期间已变化，请重新生成；已保留最新合同。")
+        data[chapter_rel] = contract
+        _write_all(project_dir, data, project_id=project_id)
+        _sync_index(project_id, chapter_rel, contract)
+        operation_log.log(project_id, "contract-generate", chapter_rel,
+                          {"source": contract.get("source")})
     return contract
 
 
@@ -215,6 +245,14 @@ def update_contract(
     confirm: bool = False,
 ) -> dict:
     """修改合同；**已冻结**时必须 ``confirm=True``（差异确认）并记录差异。"""
+    from .file_change_service import project_lock
+
+    with project_lock(project_id):
+        return _update_contract_locked(project_id, chapter_rel, patch, confirm=confirm)
+
+
+def _update_contract_locked(project_id: int, chapter_rel: str, patch: dict,
+                            *, confirm: bool) -> dict:
     require_chapter_path(project_id, chapter_rel)
     row, project_dir = get_project_dir(project_id)
     data = _read_all(project_dir)
@@ -241,7 +279,7 @@ def update_contract(
         current.setdefault("history", []).append({"diff": diff, "confirmed": bool(confirm)})
 
     data[chapter_rel] = current
-    _write_all(project_dir, data)
+    _write_all(project_dir, data, project_id=project_id)
     _sync_index(project_id, chapter_rel, current)
     operation_log.log(project_id, "contract-update", chapter_rel, {"diff": list(diff)})
     return current
@@ -249,6 +287,13 @@ def update_contract(
 
 def freeze_contract(project_id: int, chapter_rel: str, *, confirm: bool = True) -> dict:
     """冻结合同（DRAFT 前置条件）。"""
+    from .file_change_service import project_lock
+
+    with project_lock(project_id):
+        return _freeze_contract_locked(project_id, chapter_rel, confirm=confirm)
+
+
+def _freeze_contract_locked(project_id: int, chapter_rel: str, *, confirm: bool) -> dict:
     require_chapter_path(project_id, chapter_rel)
     row, project_dir = get_project_dir(project_id)
     data = _read_all(project_dir)
@@ -261,7 +306,7 @@ def freeze_contract(project_id: int, chapter_rel: str, *, confirm: bool = True) 
     contract["status"] = "frozen"
     contract["frozen_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     data[chapter_rel] = contract
-    _write_all(project_dir, data)
+    _write_all(project_dir, data, project_id=project_id)
     _sync_index(project_id, chapter_rel, contract)
     operation_log.log(project_id, "contract-freeze", chapter_rel, None)
     return contract
@@ -300,13 +345,27 @@ def write_gates(project_dir: Path, patch: dict) -> dict:
 
 def freeze_outline(project_id: int, *, confirm: bool = True) -> dict:
     """冻结大纲（CHECK 门控的一项）。"""
-    _row, project_dir = get_project_dir(project_id)
-    if not confirm:
-        raise InvalidOperationError("冻结大纲需要作者确认")
-    data = write_gates(project_dir, {"outline_frozen": True,
-                                     "outline_frozen_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
-    operation_log.log(project_id, "outline-freeze", "大纲/大纲.md", None)
-    return data
+    from .file_change_service import project_lock
+
+    with project_lock(project_id):
+        _row, project_dir = get_project_dir(project_id)
+        if not confirm:
+            raise InvalidOperationError("冻结大纲需要作者确认")
+        data = write_gates(project_dir, {"outline_frozen": True,
+                                         "outline_frozen_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        operation_log.log(project_id, "outline-freeze", "大纲/大纲.md", None)
+        return data
+
+
+def unfreeze_outline(project_id: int) -> dict:
+    """取消大纲冻结并清空冻结时间，仅变更本书的大纲门控状态。"""
+    from .file_change_service import project_lock
+
+    with project_lock(project_id):
+        _row, project_dir = get_project_dir(project_id)
+        data = write_gates(project_dir, {"outline_frozen": False, "outline_frozen_at": None})
+        operation_log.log(project_id, "outline-unfreeze", "大纲/大纲.md", None)
+        return data
 
 
 def check_prerequisites(project_id: int, chapter_rel: str) -> dict:
@@ -387,6 +446,7 @@ __all__ = [
     "check_contract_ready",
     "check_prerequisites",
     "contract_budget",
+    "default_word_budget",
     "freeze_contract",
     "freeze_outline",
     "generate_contract",
@@ -394,5 +454,6 @@ __all__ = [
     "list_contracts",
     "read_gates",
     "update_contract",
+    "unfreeze_outline",
     "write_gates",
 ]

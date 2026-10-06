@@ -100,3 +100,20 @@ def test_human_approval_wait_pauses_both_budgets(monkeypatch) -> None:
     assert events[-1]["type"] == "done"
     assert any(message.get("type") == "tool_response" for message in worker.sent)
     assert not any(message.get("type") == "cancel" for message in worker.sent)
+
+
+def test_same_run_control_shares_total_budget_across_plan_steps(monkeypatch) -> None:
+    clock = Clock()
+    monkeypatch.setattr(dsh_chat.time, "monotonic", clock.monotonic)
+    runtime = dsh_chat.DshChatRuntime()
+    control = dsh_chat.RunControl()
+    first = Worker(clock, [(200, {"type": "delta", "text": "进展"}) for _ in range(4)] + [(200, {"type": "done"})])
+    second = Worker(clock, [(200, {"type": "delta", "text": "进展"}) for _ in range(5)])
+    workers = iter([first, second])
+    monkeypatch.setattr(runtime, "_worker", lambda *_: next(workers))
+    params = dict(session_id="book-chat", resume=True, project_root="book", user_text="继续", provider="fake", model="fake",
+                  tool_specs=[], execute_tool=lambda *_: {"ok": True}, wait_control=control)
+    assert list(runtime.stream(**params))[-1]["type"] == "done"
+    events = list(runtime.stream(**params))
+    assert events[-1]["code"] == "TIMEOUT" and events[-1]["reason"] == "total"
+    assert control.active_seconds() >= 1800

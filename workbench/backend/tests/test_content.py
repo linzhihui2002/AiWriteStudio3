@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import re
 
 import pytest
 
@@ -48,7 +49,28 @@ def _write(workspace: SimpleNamespace, project: str, rel: str, content: str) -> 
 # ─────────────────────────── 设定卡片 ───────────────────────────
 
 
-def test_cards_skeleton_and_cache(workspace: SimpleNamespace) -> None:
+def _parse_cards(project_id, monkeypatch, *, category=None, force=False):
+    """A mock model response for these fixed fixtures, never a production parser."""
+    def extract(project_id, text, rel, category, model, prompt, job_id):
+        raw = []
+        for heading in re.finditer(r"^## (.+)\n", text, re.M):
+            start, name = heading.start(), heading[1]
+            next_heading = re.search(r"^## ", text[heading.end():], re.M)
+            end = heading.end() + next_heading.start() if next_heading else len(text)
+            section = text[start:end]
+            fields = [{"name": m[1], "value": m[2], "evidence": {"quote": m[0]}}
+                      for m in re.finditer(r"^- ([^：]+)：(.+)$", section, re.M)]
+            raw.append({"name": name, "category": category, "evidence": {"quote": heading[0], "start": start},
+                        "extent": {"quote": section, "start": start}, "fields": fields, "aliases": []})
+        if "| 周伯 |" in text:
+            raw.append({"name": "周伯", "category": category,
+                        "evidence": {"quote": "| 周伯 | 船老大，欠沈砚人情 |"}, "fields": [], "aliases": []})
+        return asset_card_service._validate_objects({"objects": raw}, text, rel, category)
+    monkeypatch.setattr(asset_card_service, "_extract", extract)
+    return asset_card_service.refresh(project_id, category=category, force=force, background=False)
+
+
+def test_cards_ai_and_cache(workspace: SimpleNamespace, monkeypatch) -> None:
     project = project_service.create_project(name="卡片书")
     project_id = project["id"]
     _write(
@@ -59,6 +81,8 @@ def test_cards_skeleton_and_cache(workspace: SimpleNamespace) -> None:
         "| 周伯 | 船老大，欠沈砚人情 |\n",
     )
 
+    assert asset_card_service.list_cards(project_id)["count"] == 0
+    _parse_cards(project_id, monkeypatch, category="人物")
     data = asset_card_service.list_cards(project_id)
     names = [card["name"] for card in data["cards"]]
     assert "沈砚" in names and "老周" in names and "周伯" in names
@@ -67,7 +91,7 @@ def test_cards_skeleton_and_cache(workspace: SimpleNamespace) -> None:
     assert data["palette"], "必须有 token 化色板"
 
     # 缓存指纹：内容未变 → 第二次刷新走缓存
-    refreshed = asset_card_service.refresh(project_id, category="人物")
+    refreshed = _parse_cards(project_id, monkeypatch, category="人物")
     assert refreshed["parsed_files"] == 0
     assert refreshed["cached_files"] == 1
 
@@ -76,19 +100,21 @@ def test_cards_skeleton_and_cache(workspace: SimpleNamespace) -> None:
         workspace, "卡片书", "设定/人物设定.md",
         "---\n标题: 人物设定\n---\n\n## 沈砚\n- 性格：沉默\n- 弱点：轻信旧友\n",
     )
-    refreshed = asset_card_service.refresh(project_id, category="人物")
+    assert asset_card_service.list_cards(project_id)["stale_files"]
+    refreshed = _parse_cards(project_id, monkeypatch, category="人物")
     assert refreshed["parsed_files"] == 1
     data = asset_card_service.list_cards(project_id)
     assert data["count"] == 1
     assert data["cards"][0]["fields"].get("弱点") == "轻信旧友"
 
 
-def test_cards_highlight_persist_and_filter(workspace: SimpleNamespace) -> None:
+def test_cards_highlight_persist_and_filter(workspace: SimpleNamespace, monkeypatch) -> None:
     project = project_service.create_project(name="高亮书")
     project_id = project["id"]
     _write(workspace, "高亮书", "设定/人物设定.md",
            "---\n标题: 人物设定\n---\n\n## 主角\n- 性格：直\n\n## 反派\n- 性格：阴\n")
 
+    _parse_cards(project_id, monkeypatch, category="人物")
     cards = asset_card_service.list_cards(project_id)["cards"]
     main = next(card for card in cards if card["name"] == "主角")
     villain = next(card for card in cards if card["name"] == "反派")
@@ -116,10 +142,11 @@ def test_cards_highlight_persist_and_filter(workspace: SimpleNamespace) -> None:
 
     asset_card_service.clear_highlight(project_id, main["ref"])
     assert asset_card_service.list_cards(project_id)["cards"]
-    assert len(asset_card_service.list_highlights(project_id)) == 1
+    assert len(asset_card_service.list_highlights(project_id)) == 2
+    assert next(c for c in asset_card_service.list_highlights(project_id) if c["name"] == "主角")["highlight_mode"] == "off"
 
 
-def test_cards_write_back_preserves_free_text(workspace: SimpleNamespace) -> None:
+def test_cards_write_back_preserves_free_text(workspace: SimpleNamespace, monkeypatch) -> None:
     project = project_service.create_project(name="写回书")
     project_id = project["id"]
     _write(
@@ -130,7 +157,7 @@ def test_cards_write_back_preserves_free_text(workspace: SimpleNamespace) -> Non
         "## 盐商\n- 首领：钱七\n",
     )
 
-    asset_card_service.refresh(project_id, force=True)
+    _parse_cards(project_id, monkeypatch, category="势力", force=True)
     asset_card_service.update_card(project_id, "设定/势力设定.md#漕帮",
                                    {"首领": "周伯（已退位）", "规模": "三百人"})
 
@@ -141,7 +168,7 @@ def test_cards_write_back_preserves_free_text(workspace: SimpleNamespace) -> Non
     assert "## 盐商" in text and "钱七" in text
 
 
-def test_cards_add_via_proposal_and_chapter_line(workspace: SimpleNamespace) -> None:
+def test_cards_add_via_proposal_and_chapter_line(workspace: SimpleNamespace, monkeypatch) -> None:
     project = project_service.create_project(name="新增书")
     project_id = project["id"]
     _write(workspace, "新增书", "设定/物品设定.md", "---\n标题: 物品设定\n---\n\n")
@@ -157,6 +184,7 @@ def test_cards_add_via_proposal_and_chapter_line(workspace: SimpleNamespace) -> 
     proposal_service.apply_proposal(result["proposal_id"])
     text = (workspace.projects / "新增书" / "设定" / "物品设定.md").read_text(encoding="utf-8")
     assert "青铜鱼符" in text and "老周所赠" in text
+    _parse_cards(project_id, monkeypatch, category="物品")
 
     chapter = chapter_service.create_chapter(project_id, "第一章")
     chapter_service.save_chapter(project_id, chapter["rel_path"],

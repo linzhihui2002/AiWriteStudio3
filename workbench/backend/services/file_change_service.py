@@ -79,13 +79,17 @@ def ensure_schema() -> None:
 
 
 def managed_path(project_dir: Path, rel_path: str, *, write: bool = False) -> tuple[str, Path]:
-    """Only visible Markdown documents, with no absolute/hidden/link aliases."""
+    """Only visible project documents, with no absolute/hidden/link aliases.
+
+    章节正文为 ``章节/第NNNN章.txt``（纯正文）；其余文档保持 Markdown ``.md``。
+    尚未迁移的历史 ``第NNNN章.md`` 仍可读写（由迁移任务改写为 ``.txt``）。
+    """
     raw = str(rel_path or "").replace("\\", "/")
     parts = PurePosixPath(raw).parts
     if not parts or raw.startswith("/") or ":" in raw or any(
         p in {".", ".."} or p.startswith(".") for p in parts
     ):
-        raise InvalidNameError("只能访问本书内的可见 Markdown 文档")
+        raise InvalidNameError("只能访问本书内的可见文档")
     for part in parts:
         validate_node_name(part)
     book_directory = Path(project_dir)
@@ -98,14 +102,22 @@ def managed_path(project_dir: Path, rel_path: str, *, write: bool = False) -> tu
         if lexical.is_symlink() or (hasattr(lexical, "is_junction") and lexical.is_junction()):
             raise InvalidNameError("不允许通过链接目录访问文档")
     target = resolve_within(root, raw)
-    if target.suffix.lower() != ".md" or target == root or target.is_dir():
-        raise InvalidNameError("此工具只支持单个 Markdown 文档")
+    if target == root or target.is_dir():
+        raise InvalidNameError("此工具只支持单个文档")
     rel = target.relative_to(root).as_posix()
-    if write and rel.split("/", 1)[0] == "章节":
-        from .chapter_service import validate_chapter_filename
-        if len(PurePosixPath(rel).parts) != 2:
-            raise InvalidNameError("章节必须位于章节目录直属位置")
-        validate_chapter_filename(target.name)
+    rel_parts = PurePosixPath(rel).parts
+    if rel_parts[0] == "章节":
+        from .chapter_service import is_chapter_name
+        if is_chapter_name(target.name):
+            if len(rel_parts) != 2:
+                raise InvalidNameError("章节必须位于章节目录直属位置")
+            return rel, target
+        if write:
+            if len(rel_parts) != 2:
+                raise InvalidNameError("章节必须位于章节目录直属位置")
+            raise InvalidNameError("章节文件名必须为「第NNNN章.txt」（如 第0001章.txt）")
+    if target.suffix.lower() != ".md":
+        raise InvalidNameError("此工具只支持单个 Markdown 文档")
     return rel, target
 
 
@@ -144,17 +156,11 @@ def _normalize(root: Path, rel: str, content: str, before: str | None,
     if len(content) > MAX_FILE_CHARS or "\x00" in content:
         raise InvalidOperationError("内容过长或包含二进制字符")
     if rel.startswith("章节/"):
-        from .chapter_service import CHAPTER_STATUSES, _normalize_meta
-        meta, body = split_frontmatter(content)
-        if not has_frontmatter(content):
-            meta = split_frontmatter(before or "")[0]
-        if title is not None:
-            meta["标题"] = title
-        if status is not None:
-            if status not in CHAPTER_STATUSES:
-                raise InvalidOperationError("非法章节状态")
-            meta["状态"] = status
-        return compose_document(_normalize_meta(meta, body), body)
+        from .chapter_service import CHAPTER_STATUSES
+        if status is not None and status not in CHAPTER_STATUSES:
+            raise InvalidOperationError("非法章节状态")
+        # 章节正文为纯文本：不写 frontmatter；标题/状态改由 chapters 表承载（落盘后写库）
+        return split_frontmatter(content)[1]
     if rel == "project.md":
         old_meta, _ = split_frontmatter(before or "")
         meta, body = split_frontmatter(content)
@@ -164,6 +170,22 @@ def _normalize(root: Path, rel: str, content: str, before: str | None,
             raise InvalidOperationError("请通过项目设置修改书名；对话可修改本书简介与其他元信息")
         return compose_document(meta, body)
     return content
+
+
+def _sync_chapter_meta(project_id: int, rel: str, content: str | None,
+                       title: str | None, status: str | None) -> None:
+    """章节标题/状态写入 ``chapters`` 表（原先存在 frontmatter 里的元数据改由库承载）。"""
+    if not rel.startswith("章节/"):
+        return
+    from .chapter_service import CHAPTER_STATUSES, upsert_chapter_meta
+
+    meta, _body = split_frontmatter(content or "")
+    candidate_status = status if status is not None else meta.get("状态")
+    upsert_chapter_meta(
+        project_id, rel,
+        title=title if title is not None else meta.get("标题"),
+        status=str(candidate_status) if candidate_status in CHAPTER_STATUSES else None,
+    )
 
 
 def _public(row: dict) -> dict:
@@ -221,6 +243,25 @@ def _refresh(project_id: int, root: Path, paths: list[str]) -> None:
             pass
 
 
+def rebind_cards_after_move(project_id: int, source: str, destination: str) -> None:
+    """Best-effort relocation of setting-card views after a committed move.
+
+    Documents and the durable change journal remain authoritative. A malformed
+    derived cache must not turn a completed move into an apparent file failure.
+    """
+    source = str(source).replace("\\", "/").rstrip("/")
+    destination = str(destination).replace("\\", "/").rstrip("/")
+    if not source.startswith("设定/") or not destination.startswith("设定/"):
+        return
+    try:
+        from .asset_card_service import rebind_file
+
+        rebind_file(project_id, source, destination)
+    except Exception as exc:
+        operation_log.log(project_id, "card-cache-rebind-warning", destination,
+                          {"from": source, "to": destination, "error": str(exc)})
+
+
 def _prepare_change(project_id: int, *, operation: str, rel_path: str,
                     content: str | None = None, expected_hash: str | None = None,
                     old_text: str | None = None, new_text: str | None = None,
@@ -258,7 +299,10 @@ def _prepare_change(project_id: int, *, operation: str, rel_path: str,
         after = {rel: None, dst: before_text}
         if validate_gates and dst.startswith("章节/"):
             from .review_service import run_hard_gates
-            gates = run_hard_gates(before_text or "", project_dir=root, rel_path=dst)
+            from .writing_preference_service import chapter_word_range
+            word_min, word_max = chapter_word_range(project_id)
+            gates = run_hard_gates(before_text or "", project_dir=root, rel_path=dst,
+                                   min_words=word_min, max_words=word_max)
     elif operation == "delete":
         after = {rel: None}
     else:
@@ -278,7 +322,10 @@ def _prepare_change(project_id: int, *, operation: str, rel_path: str,
         candidate = _normalize(root, rel, candidate, before_text, title, status)
         if validate_gates and rel.startswith("章节/"):
             from .review_service import run_hard_gates
-            gates = run_hard_gates(candidate, project_dir=root, rel_path=rel)
+            from .writing_preference_service import chapter_word_range
+            word_min, word_max = chapter_word_range(project_id)
+            gates = run_hard_gates(candidate, project_dir=root, rel_path=rel,
+                                   min_words=word_min, max_words=word_max)
         after = {rel: candidate}
     return {"row": row, "root": root, "target": target, "path": rel,
             "destination": dst, "before": before, "after": after, "gates": gates}
@@ -315,6 +362,7 @@ def apply_change(project_id: int, *, run_id: str | int, session_id: int | None,
                  status: str | None = None, read_only: bool = False,
                  validate_gates: bool = True,
                  approved_preview: dict | None = None,
+                 source_request: dict | None = None,
                  should_cancel: Callable[[], bool] | None = None) -> dict:
     if read_only:
         raise InvalidOperationError("审稿模式只读，不能修改小说文件")
@@ -326,6 +374,11 @@ def apply_change(project_id: int, *, run_id: str | int, session_id: int | None,
                "old_text": old_text, "new_text": new_text, "destination": destination,
                "title": title, "status": status}
     digest = content_hash(json.dumps(request, ensure_ascii=False, sort_keys=True))
+    # 自动修订的来源凭据不改变有效写入摘要或审批文本；只绑定原工具请求供严格重放。
+    if source_request is not None and not isinstance(source_request, dict):
+        raise InvalidOperationError("来源请求必须是对象")
+    source_json = json.dumps(source_request, ensure_ascii=False, sort_keys=True)
+    journal_request = {**request, "source_request": source_request} if source_request is not None else request
     with project_lock(project_id):
         if should_cancel and should_cancel():
             raise InvalidOperationError("本轮已停止，未执行文件变更")
@@ -337,7 +390,9 @@ def apply_change(project_id: int, *, run_id: str | int, session_id: int | None,
         if binding and (binding["project_id"] != project_id or binding["session_id"] != session_id):
             raise InvalidOperationError("运行已绑定其他项目或会话")
         if existing:
-            if existing["request_hash"] != digest:
+            recorded_source = json.loads(existing["request_json"]).get("source_request")
+            if (existing["request_hash"] != digest or
+                    json.dumps(recorded_source, ensure_ascii=False, sort_keys=True) != source_json):
                 raise InvalidOperationError("重复工具调用编号的参数不一致")
             if existing["status"] == "applying":
                 raise FileConflictError("先前操作的提交状态待核实，请查看本轮文件变更")
@@ -371,7 +426,7 @@ def apply_change(project_id: int, *, run_id: str | int, session_id: int | None,
                 "destination,before_state,after_state,request_hash,request_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (project_id, session_id, str(run_id), tool_call_id, operation, rel, dst,
                  json.dumps(before, ensure_ascii=False), json.dumps(after, ensure_ascii=False), digest,
-                 json.dumps(request, ensure_ascii=False)))
+                 json.dumps(journal_request, ensure_ascii=False)))
             change_id = int(cursor.lastrowid)
         if gates is not None and not gates["passed"]:
             with db.get_conn() as conn:
@@ -403,6 +458,7 @@ def apply_change(project_id: int, *, run_id: str | int, session_id: int | None,
                     raise InvalidOperationError("本轮已停止，未执行文件变更")
                 assert_version(rel, _text(target), content_hash(before[rel]))
                 atomic_write_text(target, after[rel] or "")
+                _sync_chapter_meta(project_id, rel, content, title, status)
             with db.get_conn() as conn:
                 conn.execute("UPDATE workspace_changes SET status='applied',result=? WHERE id=?",
                              (json.dumps(details, ensure_ascii=False), change_id))
@@ -414,6 +470,8 @@ def apply_change(project_id: int, *, run_id: str | int, session_id: int | None,
                 conn.execute("UPDATE workspace_changes SET status=?,result=? WHERE id=?",
                              (commit_status, json.dumps({"error": str(exc), **details}, ensure_ascii=False), change_id))
             raise
+        if operation == "move":
+            rebind_cards_after_move(project_id, rel, dst)
         _refresh(project_id, root, list(after))
         operation_log.log(project_id, "file-change", rel,
                           {"change_id": change_id, "run_id": str(run_id), "operation": operation, **details})
@@ -421,9 +479,11 @@ def apply_change(project_id: int, *, run_id: str | int, session_id: int | None,
 
 
 def revert(run_id: str | int, change_ids: list[int] | None = None,
-           project_id: int | None = None) -> dict:
+           project_id: int | None = None, *, should_cancel: Callable[[], bool] | None = None) -> dict:
     """Preflight the entire undo in reverse order; later user edits are never lost."""
     ensure_schema()
+    if should_cancel and should_cancel():
+        raise InvalidOperationError("本轮已停止，不撤回文件修改")
     with db.get_conn() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM workspace_changes WHERE run_id=? ORDER BY id DESC", (str(run_id),))]
@@ -448,9 +508,13 @@ def revert(run_id: str | int, change_ids: list[int] | None = None,
             simulated.update(before)
         reverted = []
         for row in active:
+            if should_cancel and should_cancel():
+                raise InvalidOperationError("本轮已停止，不撤回文件修改")
             before, after = json.loads(row["before_state"]), json.loads(row["after_state"])
             for path, expected in after.items():
                 assert_version(path, _text(managed_path(root, path, write=True)[1]), content_hash(expected))
+            if should_cancel and should_cancel():
+                raise InvalidOperationError("本轮已停止，不撤回文件修改")
             with db.get_conn() as conn:
                 conn.execute("UPDATE workspace_changes SET status='reverting' WHERE id=?", (row["id"],))
             if row["operation"] == "move":
@@ -468,6 +532,8 @@ def revert(run_id: str | int, change_ids: list[int] | None = None,
             with db.get_conn() as conn:
                 conn.execute("UPDATE workspace_changes SET status='reverted',reverted_at=datetime('now') WHERE id=?",
                              (row["id"],))
+            if row["operation"] == "move":
+                rebind_cards_after_move(pid, row["destination"], row["path"])
             _refresh(pid, root, list(before))
             operation_log.log(pid, "file-change-revert", row["path"],
                               {"run_id": str(run_id), "change_id": row["id"]})
@@ -497,6 +563,11 @@ def recover_changes(run_id: str | int) -> list[dict]:
                 state = "conflict"
             with db.get_conn() as conn:
                 conn.execute("UPDATE workspace_changes SET status=? WHERE id=?", (state, row["id"]))
+            if row["operation"] == "move":
+                if state == "applied":
+                    rebind_cards_after_move(pid, row["path"], row["destination"])
+                elif state == "reverted":
+                    rebind_cards_after_move(pid, row["destination"], row["path"])
             _refresh(pid, root, list(before))
             operation_log.log(pid, "file-change-recovery", row["path"],
                               {"change_id": row["id"], "status": state})

@@ -5,6 +5,7 @@ AI 调用一律用假 provider（monkeypatch httpx），不依赖网络与 Key�
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -126,6 +127,7 @@ def test_context_assembly_levels_and_trimming(workspace: SimpleNamespace) -> Non
 
     first = chapter_service.create_chapter(project_id, "第一章")
     chapter_service.save_chapter(project_id, first["rel_path"], "前章结尾：缆绳断了。")
+    chapter_service.set_chapter_meta(project_id, first["rel_path"], status="完成")
     second = chapter_service.create_chapter(project_id, "第二章")
 
     assembly = context_service.assemble(
@@ -262,13 +264,17 @@ def test_ingestion_four_trackers(workspace: SimpleNamespace) -> None:
         project_id, chapter["rel_path"],
         "次日清晨，沈砚在南码头等货。获得 3 袋盐。伏笔：崩断的缆绳另有蹊跷。\n"
         "沈砚数了数铜钱，消耗 5 枚铜钱。",
+        status="完成",
     )
 
     result = ingestion_service.ingest_chapter(project_id, chapter["rel_path"], use_ai=False)
     assert result["timeline_added"] >= 1
     assert result["ledger_added"] >= 1
     assert result["foreshadow_added"] >= 1
-    assert result["memory_added"] >= 1
+    # 出场不代表知晓整章事件；自动摄取不能制造全知记忆。
+    assert result["memory_added"] == 0
+    assert "沈砚" in result["characters_present"]
+    assert not character_service.list_memory(project_id)
 
     timeline = ingestion_service.list_timeline(project_id)
     assert timeline and "依据" in timeline[0] or timeline[0].get("evidence") is not None
@@ -331,7 +337,7 @@ def test_quality_matrix(workspace: SimpleNamespace) -> None:
     chapter_service.save_chapter(project_id, chapter["rel_path"], CLEAN_BODY)
 
     matrix = review_service.quality_matrix(project_id)
-    assert matrix["columns"] == ["字数门", "语言门", "禁词门", "去AI味", "一致性", "逐项审稿"]
+    assert matrix["columns"] == ["字数门", "语言门", "禁词门", "去AI味", "格式门", "硬门禁总状态", "一致性", "逐项审稿"]
     row = matrix["chapters"][0]
     assert row["cells"]["字数门"] == "通过"
     assert row["cells"]["逐项审稿"] == "未跑"
@@ -370,6 +376,22 @@ def test_character_state_and_memory(workspace: SimpleNamespace) -> None:
 
 def test_pipeline_end_to_end(workspace: SimpleNamespace, monkeypatch) -> None:
     _install_fake_model(monkeypatch, CLEAN_BODY)
+
+    def fake_post(*args, **kwargs):
+        system = str(kwargs["json"]["messages"][0]["content"])
+        if "逐项" in system and "判定" in system:
+            text = json.dumps({"逐项": [{"项": "码头交付定金", "判定": "已完成",
+                                         "证据": "十二枚，先付一半。"}],
+                               "一致性": [], "修改指令": []}, ensure_ascii=False)
+        elif "情节点" in system and "必须承上" in system:
+            text = json.dumps({"情节点": ["码头交付定金"], "必须承上": [],
+                               "字数预算": 2000, "钩子类型": "悬念"}, ensure_ascii=False)
+        else:
+            text = CLEAN_BODY
+        return _FakeResponse({"choices": [{"message": {"content": text}}],
+                              "usage": {"prompt_tokens": 10, "completion_tokens": 20}})
+
+    monkeypatch.setattr("workbench.backend.engine.direct_api.httpx.post", fake_post)
 
     project = project_service.create_project(name="循环书")
     project_id = project["id"]

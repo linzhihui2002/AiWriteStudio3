@@ -12,10 +12,11 @@ import json
 import re
 from pathlib import Path
 
-from .character_service import list_characters
+from .character_service import DEEP_FIELDS
 from .errors import InvalidOperationError
-from .fs_utils import atomic_write_text, read_text, split_frontmatter
+from .fs_utils import atomic_write_text, read_text, resolve_within
 from .ingestion_service import list_foreshadows, list_timeline
+from .material_parser import parse_entities
 from .project_service import get_project_dir
 
 SETTING_FILES = {
@@ -41,12 +42,18 @@ KIND_LABELS = {
 SOURCE_LEVELS = ("author", "model", "unknown")
 META_FILE = ".meta/bible_sources.json"
 
-_HEADING_RE = re.compile(r"^(#{2,4})\s*([^\n#]{1,40})\s*$", re.MULTILINE)
-_TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
-
-
 def _meta_path(project_dir: Path) -> Path:
-    return Path(project_dir) / META_FILE
+    return _safe_path(project_dir, META_FILE)
+
+
+def _safe_path(project_dir: Path, rel: str) -> Path:
+    candidate = Path(project_dir) / rel
+    for part in (candidate, *candidate.parents):
+        if part == Path(project_dir):
+            break
+        if part.is_symlink() or (hasattr(part, "is_junction") and part.is_junction()):
+            raise InvalidOperationError("设定资料拒绝链接文件或目录")
+    return resolve_within(project_dir, rel)
 
 
 def read_sources(project_dir: Path) -> dict:
@@ -65,11 +72,17 @@ def write_source(project_id: int, ref: str, source: str, *, note: str = "") -> d
     if source not in SOURCE_LEVELS:
         raise InvalidOperationError(f"来源必须是 {'/'.join(SOURCE_LEVELS)}：{source}")
     _row, project_dir = get_project_dir(project_id)
-    data = read_sources(project_dir)
-    data[ref] = {"source": source, "note": note}
-    path = _meta_path(project_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    from .file_change_service import project_lock
+    with project_lock(project_id):
+        if not any(entity["ref"] == ref for kind in SETTING_FILES for entity in list_entities(project_id, kind)):
+            raise InvalidOperationError("条目不存在或字段尚未补齐，请打开原材料核对")
+        data = read_sources(project_dir)
+        data[ref] = {"source": source, "note": note}
+        path = _meta_path(project_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    from .index_service import invalidate_knowledge
+    invalidate_knowledge(project_id)
     return {"ref": ref, "source": source, "note": note}
 
 
@@ -77,54 +90,14 @@ def write_source(project_id: int, ref: str, source: str, *, note: str = "") -> d
 
 
 def _parse_entities(project_dir: Path, kind: str) -> list[dict]:
-    """解析设定文件里的实体条目：优先 ``## 名称`` 段落，退化用列表行。"""
+    """读取明确对象定义；属性表属于对象，不计为额外实体。"""
     rel = SETTING_FILES.get(kind)
     if not rel:
         return []
-    path = Path(project_dir) / rel
+    path = _safe_path(project_dir, rel)
     if not path.is_file():
         return []
-    body = split_frontmatter(read_text(path))[1]
-
-    entries: list[dict] = []
-    current: str | None = None
-    buffer: list[str] = []
-    for line in body.splitlines():
-        match = _HEADING_RE.match(line)
-        if match:
-            if current:
-                entries.append({"name": current, "content": "\n".join(buffer).strip()})
-            current = match.group(2).strip()
-            buffer = []
-            continue
-        if current is not None:
-            buffer.append(line)
-    if current:
-        entries.append({"name": current, "content": "\n".join(buffer).strip()})
-
-    if not entries:
-        for line in body.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(("- ", "* ")) and len(stripped) > 4:
-                text = stripped[2:].strip()
-                name = _TABLE_ROW_RE.sub("", text)[:20].strip() or text[:20]
-                entries.append({"name": name, "content": text})
-
-    # 表格行也算实体（| 名称 | 说明 |）
-    for line in body.splitlines():
-        match = _TABLE_ROW_RE.match(line)
-        if not match:
-            continue
-        cells = [cell.strip() for cell in match.group(1).split("|")]
-        if len(cells) < 2 or set(cells[0]) <= {"-", " "} or not cells[0]:
-            continue
-        if cells[0] in ("名称", "势力", "物品", "技能", "场景", "世界", "条目"):
-            continue
-        if any(entry["name"] == cells[0] for entry in entries):
-            continue
-        entries.append({"name": cells[0], "content": " ｜ ".join(cells[1:])})
-
-    return [entry for entry in entries if entry["name"]]
+    return parse_entities(read_text(path), kind)
 
 
 def list_entities(project_id: int, kind: str) -> list[dict]:
@@ -136,17 +109,7 @@ def list_entities(project_id: int, kind: str) -> list[dict]:
     row, project_dir = get_project_dir(project_id)
     sources = read_sources(project_dir)
 
-    if kind == "character":
-        entities = [
-            {
-                "name": item["name"],
-                "content": item.get("raw", ""),
-                "fields": item.get("fields", {}),
-                "missing": item.get("missing", []),
-            }
-            for item in list_characters(project_id)
-        ]
-    elif kind == "foreshadow":
+    if kind == "foreshadow":
         entities = [
             {
                 "name": item["content"][:24] or f"伏笔{item['line']}",
@@ -155,18 +118,24 @@ def list_entities(project_id: int, kind: str) -> list[dict]:
                 "planted_in": item["planted_in"],
                 "evidence": item["evidence"],
                 "line": item["line"],
+                "source": item.get("source", "unknown"),
+                "is_planned": item.get("is_planned", False),
             }
             for item in list_foreshadows(project_id)
         ]
     else:
         entities = _parse_entities(project_dir, kind)
+        if kind == "character":
+            for entity in entities:
+                entity["missing"] = [field for field in DEEP_FIELDS if not entity.get("fields", {}).get(field)]
 
     for entity in entities:
         ref = f"{kind}:{entity['name']}"
-        meta = sources.get(ref) or {}
+        meta = sources.get(ref) if isinstance(sources.get(ref), dict) else {}
         entity["ref"] = ref
         # 未显式标注的一律 unknown（来源不可考 → 审稿按待核实处理）
-        entity["source"] = meta.get("source") or "unknown"
+        entity["source"] = meta.get("source") if meta.get("source") in SOURCE_LEVELS else entity.get("source") or "unknown"
+        entity["rel_path"] = SETTING_FILES[kind]
         entity["summary"] = re.sub(r"\s+", " ", str(entity.get("content") or ""))[:120]
 
     return entities
@@ -191,8 +160,9 @@ def overview(project_id: int) -> dict:
         "counts": counts,
         "total": sum(counts.values()),
         "timeline_count": len(timeline),
-        "foreshadow_open": sum(1 for item in foreshadows if item["status"] == "待回收"),
-        "foreshadow_total": len(foreshadows),
+        "foreshadow_open": sum(1 for item in foreshadows if item["status"] in {"待回收", "疑似回收"} and not item.get("is_planned")),
+        "foreshadow_total": sum(1 for item in foreshadows if not item.get("is_planned")),
+        "foreshadow_planned": sum(1 for item in foreshadows if item.get("is_planned")),
         "unknown_refs": unknown[:50],
         "unknown_count": len(unknown),
     }
@@ -205,7 +175,7 @@ def unknown_fields(project_id: int) -> list[dict]:
         for entity in list_entities(project_id, kind):
             if entity["source"] == "unknown":
                 result.append(
-                    {"kind": kind, "name": entity["name"], "ref": entity["ref"],
+                    {"kind": kind, "name": entity["name"], "ref": entity["ref"], "reason": "source_unknown", "rel_path": entity["rel_path"],
                      "说明": "来源未标注，审稿按待核实处理"}
                 )
             if kind == "character":
@@ -215,6 +185,7 @@ def unknown_fields(project_id: int) -> list[dict]:
                             "kind": kind,
                             "name": entity["name"],
                             "ref": f"{entity['ref']}#{field}",
+                            "reason": "missing_field", "field": field, "rel_path": entity["rel_path"],
                             "说明": f"深度设定字段「{field}」缺失，审稿按待核实处理",
                         }
                     )
@@ -230,6 +201,8 @@ def mark_model_extracted(project_id: int, refs: list[str]) -> dict:
     path = _meta_path(project_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    from .index_service import invalidate_knowledge
+    invalidate_knowledge(project_id)
     return {"marked": len(refs)}
 
 

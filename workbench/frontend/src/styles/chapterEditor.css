@@ -1,0 +1,18 @@
+.chapter-editor { min-height: 52vh; width: 100%; min-width: 0; }
+/* ui-style-ok: document width and typography follow the requested Markdown defaults. */
+.prose-reading.prose-reading--document { max-width: 960px; width: 100%; font-family: var(--font-sans); font-size: 16px; line-height: 1.75; }
+.chapter-editor .cm-editor { background: transparent; color: var(--color-fg); font-family: var(--prose-font); }
+.chapter-editor .cm-editor.cm-focused { outline: none; }
+.chapter-editor .cm-scroller { font-family: inherit; font-size: var(--prose-font-size); line-height: var(--prose-line-height); letter-spacing: var(--prose-letter-spacing); overflow-x: hidden; }
+.chapter-editor .cm-content { min-height: 52vh; padding: 8px 0 28px; caret-color: var(--color-fg); }
+.chapter-editor .cm-line { padding: 0 14px; }
+.chapter-editor .cm-gutters { background: transparent; color: var(--color-fg-subtle); border-right: 1px solid var(--color-border); font-family: var(--font-mono); font-size: 12px; user-select: none; }
+.chapter-editor .cm-lineNumbers .cm-gutterElement { min-width: 3em; padding: 0 8px; }
+.chapter-editor .cm-cursor { border-left-color: var(--color-fg); }
+.chapter-editor .cm-selectionBackground, .chapter-editor.cm-focused .cm-selectionBackground { background: var(--color-primary-subtle) !important; }
+.novel-dialogue { font-style: italic; }
+.novel-name { color: var(--novel-name-light); }
+:root[data-theme='dark'] .novel-name { color: var(--novel-name-dark); }
+:root[data-theme='paper'] .novel-name { color: var(--novel-name-paper); }
+.novel-milestone { display: block; width: 100%; box-sizing: border-box; margin: var(--space-1) 0; padding: 0 14px; font: var(--text-xs)/var(--leading-normal) var(--font-sans); color: var(--color-fg-subtle); user-select: none; pointer-events: none; }
+.novel-milestone::after { content: attr(data-label); }

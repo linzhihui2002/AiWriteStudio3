@@ -3,6 +3,8 @@
 > 本文件记录工作台内置 dsh 的三项关键能力**实测**结论，作为后续对话/模型配置架构的决策依据。
 > 所有结论均为**本机实测**，包含失败项与与预期不符项，未做美化。
 
+> 2026-09-24 补记：B1 的失败结论仅针对一次性 **headless CLI**。工作台对话现经 vendor 原生 Agent API 持续会话，见下方 B4 和[开发文档 §6.8](AI小说创作工作台-开发文档.md#68-对话运行权限与恢复2026-09-24-实现)。本文件旧的全局 `~/.dsh` 基线检查属于历史方案，与现行“禁止读写”红线不兼容，不应再次运行。
+
 ## 0. 元信息
 
 | 项 | 值 |
@@ -46,10 +48,11 @@ llm-pi-ai:
 
 | # | 能力 | Workbench | dsh | 验证状态 | 结论 | 破坏性变更 / 风险备注 |
 |---|---|---|---|---|---|---|
-| B1 | headless 多轮会话续接（`--resume`） | 0.1.0 | 0.1.0-rc.8 | ❌ **不支持**（实测） | headless 无续接入口；多轮只能"每轮完整重放上下文" | 每次调用新建会话并落盘；无引用回会话的入口；rc 版本随时可能变 |
+| B1 | headless CLI 多轮会话续接（`--resume`） | 0.1.0 | 0.1.0-rc.8 | ❌ **不支持**（实测） | 该 CLI 无续接入口；不能用于工作台持续对话 | 每次调用新建会话并落盘；无引用回会话的 CLI 入口 |
 | B2 | `--patch` 运行时覆盖指定模型 | 0.1.0 | 0.1.0-rc.8 | ✅ **可行**（实测） | `- id: agent-default-model` + `config.{provider,model}`；**但优先级低于 settings.yaml 用户层** | patch 不做深合并，整段替换 config；settings 用户层会盖掉 `--patch`（易踩坑） |
 | B3 | headless stdout 协议 | 0.1.0 | 0.1.0-rc.8 | ✅ **已确认**（实测） | stdout = 最后一条非空 assistant 文本 + `\n`；stderr 失败时才有一行；成功退出码 0 / 失败 1 | 无 JSON 模式、无日志流；失败时 stdout 仍可能是一个空行 |
-| A | 完整性自检脚本 | 0.1.0 | 0.1.0-rc.8 | ✅ 跑通（实测） | `workbench/cli/selfcheck.py` 基线/比对两模式均正常，退出码语义正确 | 基线落 `.workbench/dsh_baseline.json`；跳过 `profiles/**/node_modules` |
+| B4 | 原生 Agent API 对话续接 | 0.1.0 | 0.1.0-rc.8 | ✅ 已实现并验收 | 同一会话 `followup()`；冷恢复 `agents.resume()`；工作台保存原生会话 ID 与投递确认 | 仅适用于工作台对话路径，不改变 B1 的 CLI 结论；验收范围见对话体验记录 |
+| A | 完整性自检脚本（历史记录） | 0.1.0 | 0.1.0-rc.8 | ⚠️ 当时跑通，现不可执行 | `selfcheck.py` 的基线/比对会读取用户全局 `~/.dsh` | 与现行禁止读写红线冲突，待替换为不访问全局目录的检查 |
 
 ---
 
@@ -117,9 +120,8 @@ const { agent } = await agents.create({
 ### 2.3 结论（决定对话功能实现方式）
 
 - **headless 不支持多轮续接，也不支持 `--resume <sessionId>`。**
-- 工作台的对话功能**只能靠「每轮完整重放上下文」**：把系统提示 + 全部历史消息 + 本轮用户输入拼成单个 task 文本，作为**一次** headless 调用提交。
-- 代价：每轮 token 成本随对话轮数**线性增长**（无服务端会话缓存复用），需在工作台侧设计上下文裁剪 / 摘要压缩。
-- 备选（未验证、需另立任务评估）：`dsh web`（profile `web`，默认端口 3080）走 Host/ApiProxy，可能具备真正的会话续接与流式协议；但会引入端口占用与 Web runtime 依赖，与"零冲突共存"目标存在张力。
+- 工作台对话现使用锁定版 vendor dsh 的原生 Agent API：同一会话 `followup()`，进程重启后 `agents.resume()`，正文事件经 SSE 增量送达。该路径不需要启动 dsh web，也不占用 3080。
+- 一次性 headless 任务仍按本节限制处理。持续会话的工作台状态、未送达作者历史和文件变更由工作台自己记录与恢复。
 
 ---
 
@@ -231,15 +233,15 @@ io.exit(outcome.reason?.kind === "completed" ? 0 : 1);
 
 ---
 
-## 5. 附：完整性自检脚本（任务 A）
+## 5. 附：完整性自检脚本（历史记录，不再执行）
 
-`workbench/cli/selfcheck.py` —— 对用户全局 `~/.dsh` 的**只读**基线与比对。
+2026-09-19 曾用 `workbench/cli/selfcheck.py` 对用户全局 `~/.dsh` 做只读基线与比对。现行红线禁止读取该目录，因此以下内容仅用于解释旧验收结果，**不得按旧流程重新运行脚本**。
 
-| 模式 | 命令 | 行为 |
-|---|---|---|
-| 记录基线 | `python workbench/cli/selfcheck.py --baseline` | 采集关键项 SHA-256 + mtime，写 `.workbench/dsh_baseline.json` |
-| 比对 | `python workbench/cli/selfcheck.py --verify` | 比对当前状态与基线，列出差异并告警 |
-| 默认 | `python workbench/cli/selfcheck.py` | 基线不存在则记录，存在则比对 |
+| 历史模式 | 当时行为 |
+|---|---|
+| 记录基线 | 采集关键项 SHA-256 + mtime，写 `.workbench/dsh_baseline.json` |
+| 比对 | 比对当前状态与基线，列出差异并告警 |
+| 默认 | 基线不存在则记录，存在则比对 |
 
 - 关键项：`settings.yaml`、`profiles/`（跳过 `node_modules` 依赖树）、`.agent-presets/`、`storages/workspace.json`；外加 `npm ls -g --depth=0` 全局包快照。
 - 退出码：一致 `0`；不一致 `1`（含基线缺失无法比对）。
@@ -270,3 +272,9 @@ io.exit(outcome.reason?.kind === "completed" ? 0 : 1);
 - 自定义 profile（`ai-novel-workbench`）在 headless 组合下的行为是否与 `headless` 模板完全一致。
 - 会话文件的读取/重放可行性（`session.jsonl.zstd` 解压后能否人工拼回上下文）。
 - `reasoningEffort` 等 `agent-default-model` 可选字段在 FluxLane 网关上的实际支持情况。
+
+## 2026-10-04：headless 长输入桥接验收
+
+锁定 vendor 版本未变。`DshEngine` 通过 `dsh_paths.get_dsh_cli_command()` 获取 Node 和 vendor 入口，再由自有 `dsh_headless_stdin.mjs` 从二进制 stdin 接收完整 UTF-8，在 Node 进程内构建 CLI 参数。操作系统命令行不包含书稿，也不经过 Windows `.cmd`。9000 / 40000 字符中文及换行、引号、反引号、美元符号传输回归通过；超时收尾不再次传入 stdin，进程树取消仍沿用原实现。vendor 直接输出 HTTP 状态的错误归一化补齐为 AUTH_ERROR / RATE_LIMIT / SERVER_ERROR 等，不再全部落到 UNKNOWN。
+
+当前书第 0001 章真实审稿已发起一次，checkpoint 显示 `input_transport=stdin-utf8`、`task_chars=13657`，长输入确已进入 vendor。供应商返回 503，此次 `ai_used=false`，报告保留错误及任务 322。随后只做一次真实软审，任务 323 `ai_used=true`、结构化建议数组为空、无错误和源版本变化，正常完成且无修改提案。前者不记作模型成功，后者不据此推断小说读感改善。迁移与最终回归详见 [本轮验收记录](工作台功能修复与数据一致性-验收记录-2026-10-04.md)。

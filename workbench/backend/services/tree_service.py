@@ -1,7 +1,7 @@
 """文档树服务：项目目录树读取 + 文件/文件夹的新建、重命名、删除、移动。
 
 - 树与磁盘一一对应，按资产分组返回：备忘录 / 大纲 / 设定 / 状态 / 章节；
-- 新建文件默认补 ``.md`` 后缀；章节目录下的文件重命名需符合 ``第NNNN章.md`` 规范；
+- 新建文件默认补 ``.md`` 后缀；章节目录下的文件固定为 ``第NNNN章.txt``（纯正文，元数据在库）；
 - 删除复用「按内容分策略」：空文件（含空文件夹）物理删除，非空进回收站；
 - 内部目录（``.`` 开头的如 ``.meta/``）不在树中展示，但仍可通过显式路径操作。
 """
@@ -19,22 +19,20 @@ from .errors import (
 from . import operation_log
 from .fs_utils import (
     atomic_write_text,
-    count_words,
     directory_is_all_empty,
     delete_path_by_content,
     is_empty_file,
-    read_text,
     resolve_within,
-    split_frontmatter,
     to_rel,
     validate_node_name,
 )
 from .chapter_service import (
     CHAPTER_DIR,
-    chapter_placeholder,
-    is_chapter_filename,
+    chapter_node_info,
+    is_chapter_name,
+    move_chapter_meta,
     normalize_chapter_create_name,
-    parse_chapter_number,
+    upsert_chapter_meta,
     validate_chapter_filename,
 )
 from .project_service import get_project_dir
@@ -59,7 +57,7 @@ def _visible_entries(directory: Path) -> list[Path]:
     return sorted(entries, key=lambda path: (not path.is_dir(), path.name))
 
 
-def _file_node(project_dir: Path, path: Path) -> dict:
+def _file_node(project_id: int, project_dir: Path, path: Path) -> dict:
     stat = path.stat()
     node = {
         "name": path.name,
@@ -70,21 +68,12 @@ def _file_node(project_dir: Path, path: Path) -> dict:
         "is_empty": is_empty_file(path),
     }
 
-    if path.parent.name == CHAPTER_DIR and is_chapter_filename(path.name):
-        meta, body = split_frontmatter(read_text(path))
-        node.update(
-            {
-                "is_chapter": True,
-                "number": parse_chapter_number(path.name),
-                "title": str(meta.get("标题") or ""),
-                "status": str(meta.get("状态") or "草稿"),
-                "word_count": count_words(body),
-            }
-        )
+    if path.parent.name == CHAPTER_DIR and is_chapter_name(path.name):
+        node.update(chapter_node_info(project_id, project_dir, path))
     return node
 
 
-def _build_node(project_dir: Path, path: Path) -> dict:
+def _build_node(project_id: int, project_dir: Path, path: Path) -> dict:
     """递归构建树节点。"""
     if path.is_dir():
         return {
@@ -93,9 +82,12 @@ def _build_node(project_dir: Path, path: Path) -> dict:
             "type": "dir",
             "is_empty": directory_is_all_empty(path),
             "file_count": sum(1 for child in path.rglob("*") if child.is_file()),
-            "children": [_build_node(project_dir, child) for child in _visible_entries(path)],
+            "children": [
+                _build_node(project_id, project_dir, child)
+                for child in _visible_entries(path)
+            ],
         }
-    return _file_node(project_dir, path)
+    return _file_node(project_id, project_dir, path)
 
 
 def get_file_tree(project_id: int) -> dict:
@@ -114,13 +106,14 @@ def get_file_tree(project_id: int) -> dict:
                 "rel_path": label,
                 "exists": directory.is_dir(),
                 "nodes": [
-                    _build_node(project_dir, child) for child in _visible_entries(directory)
+                    _build_node(project_id, project_dir, child)
+                    for child in _visible_entries(directory)
                 ],
             }
         )
 
     root_nodes = [
-        _build_node(project_dir, child)
+        _build_node(project_id, project_dir, child)
         for child in _visible_entries(project_dir)
         if child.name not in grouped_names
     ]
@@ -147,8 +140,9 @@ def _require_existing(project_dir: Path, rel_path: str) -> Path:
 def create_node(project_id: int, parent_rel: str, name: str, is_dir: bool = False) -> dict:
     """在 ``parent_rel`` 下新建文件（默认 ``.md``）或文件夹。
 
-    「章节/」直属文件自动规范化为 ``第NNNN章.md``：已合规的名字原样保留，
-    ``第7章`` 这类补齐零填充，其余一律把输入当作章节标题并取下一个可用编号。
+    「章节/」直属文件自动规范化为 ``第NNNN章.txt``（纯正文，标题写入 ``chapters`` 表）：
+    已合规的名字原样保留，``第7章`` / ``第7章.md`` 这类补齐零填充，
+    其余一律把输入当作章节标题并取下一个可用编号。
     """
     _row, project_dir = get_project_dir(project_id)
 
@@ -171,13 +165,19 @@ def create_node(project_id: int, parent_rel: str, name: str, is_dir: bool = Fals
 
     if is_dir:
         target.mkdir(parents=True)
+    elif in_chapter_dir:
+        atomic_write_text(target, "")
+        upsert_chapter_meta(
+            project_id, f"{CHAPTER_DIR}/{clean_name}",
+            title=(title or ""), status="草稿", word_count=0,
+        )
     else:
-        atomic_write_text(target, chapter_placeholder(title) if in_chapter_dir else "")
-    return _build_node(project_dir, target)
+        atomic_write_text(target, "")
+    return _build_node(project_id, project_dir, target)
 
 
 def rename_node(project_id: int, rel_path: str, new_name: str) -> dict:
-    """重命名；章节目录下的文件必须保持 ``第NNNN章.md`` 命名规范。"""
+    """重命名；章节目录下的文件必须保持 ``第NNNN章.txt`` 命名规范。"""
     _row, project_dir = get_project_dir(project_id)
     source = _require_existing(project_dir, rel_path)
     if source == project_dir.resolve():
@@ -188,16 +188,22 @@ def rename_node(project_id: int, rel_path: str, new_name: str) -> dict:
         validate_chapter_filename(clean_name)
 
     if clean_name == source.name:
-        return _build_node(project_dir, source)
+        return _build_node(project_id, project_dir, source)
 
     target = source.parent / clean_name
     if target.exists():
         raise NodeExistsError(f"同名对象已存在：{to_rel(project_dir, target)}")
     source.rename(target)
+    if source.parent.name == CHAPTER_DIR and is_chapter_name(target.name):
+        move_chapter_meta(project_id, str(rel_path).replace("\\", "/"),
+                          to_rel(project_dir, target))
     operation_log.log(project_id, "rename", to_rel(project_dir, target),
                       {"from": rel_path})
+    from .file_change_service import rebind_cards_after_move
+
+    rebind_cards_after_move(project_id, to_rel(project_dir, source), to_rel(project_dir, target))
     _rebuild_index(project_id)
-    return _build_node(project_dir, target)
+    return _build_node(project_id, project_dir, target)
 
 
 def delete_node(project_id: int, rel_path: str) -> dict:
@@ -278,8 +284,11 @@ def move_node(project_id: int, src_rel: str, dst_parent_rel: str) -> dict:
     shutil.move(str(source), str(target))
     operation_log.log(project_id, "move", to_rel(project_dir, target),
                       {"from": src_rel})
+    from .file_change_service import rebind_cards_after_move
+
+    rebind_cards_after_move(project_id, to_rel(project_dir, source), to_rel(project_dir, target))
     _rebuild_index(project_id)
-    return _build_node(project_dir, target)
+    return _build_node(project_id, project_dir, target)
 
 
 __all__ = [

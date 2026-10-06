@@ -85,6 +85,8 @@ def _write(project_id: int, project_dir: Path, project_name: str, target: str,
     rel = f"{TEARDOWN_DIR}/{target}/{name}"
     snapshot_file(project_id, project_dir, project_name, rel, reason="teardown")
     atomic_write_text(target_dir(project_dir, target) / name, text)
+    from .index_service import invalidate_knowledge
+    invalidate_knowledge(project_id, rel)
 
 
 # ─────────────────────────── 导入目标 ───────────────────────────

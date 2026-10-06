@@ -2,5 +2,6 @@
     "editor.wrappingIndent": "none",
     "writerHelper.plugin.lineAsParagraph": true,
     "writerHelper.plugin.markdownFormatting": true,
-    "writerHelper.enabled": true
+    "writerHelper.enabled": true,
+    "editor.wordWrap": "on"
 }

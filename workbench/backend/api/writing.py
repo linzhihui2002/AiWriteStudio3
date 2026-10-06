@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
@@ -24,7 +25,8 @@ from ..services import (
     review_service,
     style_service,
 )
-from ..services.context_service import assemble
+from ..engine.runtime import estimate_tokens
+from ..services.context_service import assemble, build_preview, to_messages
 from ..services.errors import InvalidOperationError
 from ..services.project_service import get_project_dir
 
@@ -42,6 +44,11 @@ class ContextPreviewIn(BaseModel):
     budget_tokens: int | None = None
     exclude_levels: list[int] = Field(default_factory=list)
     use_retrieval: bool = True
+    retrieval_profile: str = "history"
+    task_type: str = "章节正文"
+    include_style: bool = True
+    style_query: str | None = None
+    include_prose_history: bool = True
 
 
 class PipelineRunIn(BaseModel):
@@ -79,6 +86,10 @@ class ProposalContentIn(BaseModel):
     content: str
 
 
+class ProposalReviewIn(BaseModel):
+    use_ai: bool = True
+
+
 class BatchIn(BaseModel):
     ids: list[int]
 
@@ -106,6 +117,7 @@ class GenerateIn(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     context_preview_only: bool = False
+    retrieval_profile: str = ""
 
 
 class StreamIn(GenerateIn):
@@ -128,6 +140,11 @@ class GhostTextIn(BaseModel):
 class StyleSampleIn(BaseModel):
     rel_path: str
     approved: bool = True
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class StyleApprovalIn(BaseModel):
+    approved: Literal[False] = False
 
 
 # ─────────────────────────── 上下文 ───────────────────────────
@@ -145,6 +162,10 @@ def context_preview(project_id: int, payload: ContextPreviewIn) -> dict:
         budget_tokens=payload.budget_tokens,
         exclude_levels=payload.exclude_levels,
         use_retrieval=payload.use_retrieval,
+        retrieval_profile=payload.retrieval_profile,
+        include_style=payload.include_style and _is_writing_task(payload.task_type, payload.retrieval_profile),
+        style_query=payload.style_query,
+        include_prose_history=payload.include_prose_history and _is_writing_task(payload.task_type, payload.retrieval_profile),
     )
     return {
         "preview": assembly["preview"],
@@ -152,11 +173,19 @@ def context_preview(project_id: int, payload: ContextPreviewIn) -> dict:
         "budget_tokens": assembly["budget_tokens"],
         "blocks": [
             {"level": b["level"], "title": b["title"], "source": b["source"],
-             "chars": b["chars"], "tokens": b["tokens"], "mandatory": b["mandatory"]}
+              "chars": b["chars"], "tokens": b["tokens"], "mandatory": b["mandatory"],
+              **({"type": "style", "style_reference": b["style_reference"]}
+                 if b.get("type") == "style" else {}),
+              **({"type": "prose_history", "prose_history_reference": b["prose_history_reference"]}
+                 if b.get("type") == "prose_history" else {}),
+              **({"retrieval": b["retrieval"]} if b.get("retrieval") else {})}
             for b in assembly["blocks"]
         ],
         "degradation": assembly["degradation"],
         "duration_ms": assembly["duration_ms"],
+        "retrieval": assembly.get("retrieval", {}),
+        "style_reference": assembly.get("style_reference", {}),
+        "prose_history_reference": assembly.get("prose_history_reference", {}),
     }
 
 
@@ -207,6 +236,12 @@ def check_gates(project_id: int, chapter_rel: str = Query(...)) -> dict:
 @router.post("/projects/{project_id}/outline/freeze")
 def freeze_outline(project_id: int) -> dict:
     return outline_service.freeze(project_id)
+
+
+@router.post("/projects/{project_id}/outline/unfreeze")
+def unfreeze_outline(project_id: int) -> dict:
+    """取消大纲冻结；取消后 CHECK 会重新要求冻结大纲。"""
+    return outline_service.unfreeze(project_id)
 
 
 # ─────────────────────────── 8 步循环 ───────────────────────────
@@ -261,11 +296,24 @@ def update_proposal(proposal_id: int, payload: ProposalContentIn) -> dict:
     return proposal_service.update_proposal_content(proposal_id, payload.content)
 
 
+@router.post("/proposals/{proposal_id}/review")
+def review_proposal(proposal_id: int, payload: ProposalReviewIn | None = None) -> dict:
+    """审查收件箱内当前管线候选，仅绑定审稿结果，不应用正文。"""
+    return proposal_service.review_pipeline_candidate(
+        proposal_id, use_ai=payload.use_ai if payload is not None else True,
+    )
+
+
 @router.post("/proposals/{proposal_id}/apply")
 def apply_proposal(proposal_id: int, payload: ProposalApplyIn | None = None) -> dict:
     content = payload.content if payload is not None else None
     status = payload.status if payload is not None else None
     return proposal_service.apply_proposal(proposal_id, content=content, status=status)
+
+
+@router.post("/proposals/{proposal_id}/rebase-state")
+def rebase_state_proposal(proposal_id: int) -> dict:
+    return proposal_service.rebase_state_proposal(proposal_id)
 
 
 @router.post("/proposals/{proposal_id}/discard")
@@ -341,10 +389,10 @@ def foreshadows(project_id: int) -> list[dict]:
 
 
 @router.post("/projects/{project_id}/foreshadows/confirm")
-def confirm_foreshadow(project_id: int, line: int, planned_chapter: str = "") -> dict:
+def confirm_foreshadow(project_id: int, line: int, planned_chapter: str = "", expected_hash: str | None = None) -> dict:
     """人工确认伏笔回收（spec：回收需人工确认）。"""
     return ingestion_service.confirm_payoff(project_id, line,
-                                            planned_chapter=planned_chapter)
+                                            planned_chapter=planned_chapter, expected_hash=expected_hash)
 
 
 @router.get("/projects/{project_id}/ledger")
@@ -355,18 +403,80 @@ def ledger(project_id: int) -> list[dict]:
 # ─────────────────────────── 写作辅助 ───────────────────────────
 
 
+def _is_writing_task(task_type: str, profile: str) -> bool:
+    """Use registered task policies/capabilities; reviews never inherit samples."""
+    if profile in {"review", "teardown"}:
+        return False
+    prompt = prompt_registry_service.find_by_task(task_type)
+    if prompt:
+        return prompt.get("context_policy") in {"chapter_draft", "chapter_revision"}
+    from ..services import agent_service
+
+    return any(capability.get("task_type") == task_type and capability.get("skill") == "novel-writing"
+               for capability in agent_service.capability_index())
+
+
+def _generation_snapshot(chapter_rel: str | None, assembly: dict) -> dict:
+    return {"chapter": chapter_rel, "tokens": assembly["total_tokens"],
+            "context_preview": assembly["preview"],
+            "style_reference": assembly.get("style_reference", {}),
+            "prose_history_reference": assembly.get("prose_history_reference", {})}
+
+
+def _compact_writing_context(assembly: dict, *, fact_limit: int, fact_chars: int) -> dict:
+    """Keep the existing brief fact context and the full separate style block.
+
+    Samples must not disappear behind the first-N fact slice while an audit
+    claims they were injected. Rebuild the preview for the material actually sent.
+    """
+    facts = [block for block in assembly["blocks"] if block.get("type") not in {"style", "prose_history"}]
+    selected = []
+    degradation = list(assembly["degradation"])
+    for original in facts[:fact_limit]:
+        block = dict(original)
+        block["text"] = original["text"][:fact_chars]
+        block["chars"] = len(block["text"])
+        block["tokens"] = estimate_tokens(block["text"])
+        if block["text"] != original["text"]:
+            block["truncated"] = True
+            degradation.append({"level": block["level"], "title": block["title"],
+                                "source": block["source"], "reason": "局部写作保留简短事实片段",
+                                "dropped_chars": original["chars"] - block["chars"]})
+        selected.append(block)
+    for block in facts[fact_limit:]:
+        degradation.append({"level": block["level"], "title": block["title"],
+                            "source": block["source"], "reason": "局部写作限制事实材料数量",
+                            "dropped_tokens": block["tokens"]})
+    selected.extend(block for block in assembly["blocks"] if block.get("type") in {"style", "prose_history"})
+    total_tokens = sum(block["tokens"] for block in selected)
+    retrieval = {**assembly.get("retrieval", {}), "hits": [dict(hit) for hit in assembly.get("retrieval", {}).get("hits", [])]}
+    kept_sources = {block["source"] for block in selected if block.get("retrieval")}
+    for hit in retrieval["hits"]:
+        source = f"{hit['rel_path']}:{hit.get('line_start', 1)}-{hit.get('line_end', 1)}"
+        hit["injected"] = source in kept_sources
+    compact = {**assembly, "blocks": selected, "total_tokens": total_tokens,
+               "remaining_tokens": assembly["budget_tokens"] - total_tokens,
+               "degradation": degradation, "retrieval": retrieval,
+               "mandatory_sources": [block["source"] for block in selected if block["mandatory"]]}
+    compact["preview"] = build_preview(compact)
+    return compact
+
+
 def _assist_messages(project_id: int, payload: GenerateIn) -> tuple[str, list[dict], dict]:
     """构造写作辅助的消息与上下文（生成/流式共用，保证两条通道行为一致）。"""
     if payload.chapter_rel:
         chapter_service.require_chapter_path(project_id, payload.chapter_rel)
+    from ..services import agent_service
+    profile = payload.retrieval_profile or agent_service.retrieval_profile_for_task(payload.task_type)
     assembly = assemble(
         project_id,
         chapter_rel=payload.chapter_rel,
         related_characters=payload.related_characters,
         query=payload.instruction or "本章情节点",
+        retrieval_profile=profile,
+        include_style=_is_writing_task(payload.task_type, profile),
+        include_prose_history=_is_writing_task(payload.task_type, profile),
     )
-    from ..services.context_service import to_messages
-
     prompt = prompt_registry_service.find_by_task(payload.task_type) or \
         prompt_registry_service.get_prompt("novel.chapter.continue")
     _system, messages = to_messages(assembly, system=prompt["body"])
@@ -397,8 +507,7 @@ def generate(project_id: int, payload: GenerateIn) -> dict:
         agent=payload.agent,
         prompt_id=meta["prompt_id"],
         prompt_version=meta["prompt_version"],
-        context_snapshot={"chapter": payload.chapter_rel,
-                          "tokens": meta["context"]["total_tokens"]},
+        context_snapshot=_generation_snapshot(payload.chapter_rel, meta["context"]),
         temperature=payload.temperature,
         max_tokens=payload.max_tokens,
     )
@@ -425,6 +534,7 @@ def generate_stream(project_id: int, payload: StreamIn) -> StreamingResponse:
                 agent=payload.agent,
                 prompt_id=meta["prompt_id"],
                 prompt_version=meta["prompt_version"],
+                context_snapshot=_generation_snapshot(payload.chapter_rel, meta["context"]),
                 temperature=payload.temperature,
                 max_tokens=payload.max_tokens,
             ):
@@ -462,10 +572,13 @@ def local_operation(project_id: int, payload: LocalOpIn) -> dict:
     task_type, instruction = mapping[payload.operation]
     short = len(payload.selection) < 500
 
-    assembly = assemble(project_id, chapter_rel=payload.chapter_rel, query="")
-    context_text = "\n\n".join(
-        f"【{block['title']}】\n{block['text'][:1200]}" for block in assembly["blocks"][:3]
-    )
+    assembly = assemble(project_id, chapter_rel=payload.chapter_rel, query="", use_retrieval=False,
+                        retrieval_profile="off", include_style=True,
+                        include_prose_history=True,
+                        style_query=payload.instruction or payload.selection)
+    assembly = _compact_writing_context(assembly, fact_limit=3, fact_chars=1200)
+    _, context_messages = to_messages(assembly)
+    context_text = context_messages[0]["content"]
     result = generation_service.run_task(
         project_id=project_id,
         task_type=task_type,
@@ -479,9 +592,11 @@ def local_operation(project_id: int, payload: LocalOpIn) -> dict:
         engine="direct-api" if short else "",
         prompt_id="",
         prompt_version="",
+        context_snapshot=_generation_snapshot(payload.chapter_rel, assembly),
         temperature=0.5,
     )
     result["short_path"] = short
+    result["context_preview"] = assembly["preview"]
     return result
 
 
@@ -489,10 +604,12 @@ def local_operation(project_id: int, payload: LocalOpIn) -> dict:
 def ghost_text(project_id: int, payload: GhostTextIn) -> dict:
     """Ghost Text 候选（前端 Tab 接受 / Esc 拒绝）；产物不落盘。"""
     chapter_service.require_chapter_path(project_id, payload.chapter_rel)
-    assembly = assemble(project_id, chapter_rel=payload.chapter_rel, query="", use_retrieval=False)
-    context_text = "\n\n".join(
-        f"【{block['title']}】\n{block['text'][:800]}" for block in assembly["blocks"][:2]
-    )
+    assembly = assemble(project_id, chapter_rel=payload.chapter_rel, query="", use_retrieval=False,
+                        include_prose_history=True,
+                        include_style=True, style_query=payload.prefix[-400:])
+    assembly = _compact_writing_context(assembly, fact_limit=2, fact_chars=800)
+    _, context_messages = to_messages(assembly)
+    context_text = context_messages[0]["content"]
     result = generation_service.run_task(
         project_id=project_id,
         task_type="续写",
@@ -505,12 +622,14 @@ def ghost_text(project_id: int, payload: GhostTextIn) -> dict:
                                         f"【下文（如有）】\n{payload.suffix[:200]}"}
         ],
         engine="direct-api",
+        context_snapshot=_generation_snapshot(payload.chapter_rel, assembly),
         temperature=0.8,
         max_tokens=120,
     )
     candidate = (result.get("text") or "").strip().strip('"“”')
     return {"candidate": candidate[:120], "ok": result["ok"],
-            "task_id": result.get("task_id"), "error": result.get("error_message")}
+            "task_id": result.get("task_id"), "error": result.get("error_message"),
+            "context_preview": assembly["preview"]}
 
 
 # ─────────────────────────── 文风指纹 ───────────────────────────
@@ -518,7 +637,7 @@ def ghost_text(project_id: int, payload: GhostTextIn) -> dict:
 
 @router.post("/projects/{project_id}/style/sample")
 def sample_style(project_id: int, payload: StyleSampleIn) -> dict:
-    return style_service.sample(project_id, payload.rel_path, approved=payload.approved)
+    return style_service.sample(project_id, payload.rel_path, approved=payload.approved, note=payload.note)
 
 
 @router.get("/projects/{project_id}/style/fingerprints")
@@ -527,6 +646,12 @@ def list_fingerprints(project_id: int, approved_only: bool = False) -> dict:
         "samples": style_service.list_fingerprints(project_id, approved_only=approved_only),
         "reference": style_service.reference_metrics(project_id),
     }
+
+
+@router.patch("/projects/{project_id}/style/fingerprints/{fingerprint_id}")
+def cancel_style_approval(project_id: int, fingerprint_id: int, payload: StyleApprovalIn) -> dict:
+    """取消当前章样稿认可；重新认可必须显式重新采样当前正文。"""
+    return style_service.cancel_approval(project_id, fingerprint_id)
 
 
 @router.post("/projects/{project_id}/style/compare")

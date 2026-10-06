@@ -23,6 +23,8 @@ export interface DocumentTreeProps {
   onRename: (node: TreeNode, newName: string) => void
   onDelete: (node: TreeNode) => void
   onMove: (node: TreeNode, dstParentRel: string) => void
+  onSetStatus?: (node: TreeNode, status: string) => void
+  pendingStatusRel?: string
 }
 
 function statusTag(node: TreeNode) {
@@ -40,6 +42,8 @@ export default function DocumentTree({
   onRename,
   onDelete,
   onMove,
+  onSetStatus,
+  pendingStatusRel = '',
 }: DocumentTreeProps) {
   const [dragNode, setDragNode] = useState<TreeNode | null>(null)
   const [overTarget, setOverTarget] = useState('')
@@ -172,7 +176,15 @@ export default function DocumentTree({
                 {node.is_chapter ? chapterLabel(node) : node.name}
               </button>
               {node.is_chapter ? <span className="mono">{node.word_count ?? 0}字</span> : null}
-              {statusTag(node)}
+              {node.is_chapter && onSetStatus ? <select
+                className="tree-node__status"
+                aria-label={`${chapterLabel(node)}状态`}
+                title="修改章节状态"
+                value={node.status || '草稿'}
+                disabled={!!pendingStatusRel}
+                draggable={false}
+                onChange={event => onSetStatus(node, event.target.value)}
+              >{['草稿', '完成', '发表'].map(status => <option key={status} value={status}>{status}</option>)}</select> : statusTag(node)}
             </>
           )}
           <span className="tree-node__actions">
@@ -219,7 +231,7 @@ export default function DocumentTree({
                 type="button"
                 title={
                   group.key === 'chapter'
-                    ? '新建章节（自动命名为 第NNNN章.md）'
+                    ? '新建章节（自动命名为 第NNNN章.txt）'
                     : '在该分组新建文件'
                 }
                 onClick={() => startCreate(group.rel_path, false)}
@@ -248,7 +260,7 @@ export default function DocumentTree({
                   creating.isDir
                     ? '目录名称'
                     : group.key === 'chapter'
-                      ? '章节标题（自动命名为 第NNNN章.md）'
+                      ? '章节标题（自动命名为 第NNNN章.txt）'
                       : '文件名（自动补 .md）'
                 }
                 onChange={(event) => setDraft(event.target.value)}

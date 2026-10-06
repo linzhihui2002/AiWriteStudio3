@@ -64,6 +64,33 @@ def test_provider_multiple_models_round_trip(workspace: SimpleNamespace) -> None
     assert provider_service.primary_model_id(provider) == "big-model"
 
 
+def test_provider_changes_schedule_only_books_using_its_cloud_embeddings(
+    workspace: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workbench.backend.services import knowledge_service, knowledge_store, project_service
+
+    matching = project_service.create_project(name="使用甲云嵌入")
+    other = project_service.create_project(name="使用乙云嵌入")
+    local = project_service.create_project(name="使用本地嵌入")
+    for project, mode, provider in ((matching, "cloud", "cloud-a"),
+                                    (other, "cloud", "cloud-b"),
+                                    (local, "local", "")):
+        knowledge_store.set_preference(project["id"], "vector", {
+            "mode": mode, "provider": provider, "model": "embedding-1", "enabled": True,
+        })
+    calls: list[int] = []
+    monkeypatch.setattr(knowledge_service, "enqueue", lambda project_id: calls.append(project_id))
+    monkeypatch.setattr(provider_service, "project_to_dsh_home", lambda: None)
+
+    provider_service.upsert_provider("cloud-a", base_url="https://first.example/v1",
+                                     models=["embedding-1"], enabled=True)
+    provider_service.upsert_provider("cloud-a", base_url="https://second.example/v1",
+                                     models=["embedding-1"], enabled=True)
+    provider_service.set_enabled("cloud-a", False)
+    provider_service.delete_provider("cloud-a")
+    assert calls == [matching["id"]] * 4
+
+
 def test_legacy_model_id_column_falls_back(workspace: SimpleNamespace) -> None:
     """旧库残留的 model_id 列在 models 为空时合成单模型。"""
     with db.get_conn() as conn:

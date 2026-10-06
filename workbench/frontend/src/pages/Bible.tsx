@@ -1,3 +1,5 @@
+import { usePageChatContext } from '../state/usePageChatContext'
+import WorkspacePage, { ResourceState, useResourceRequest } from '../components/WorkspacePage'
 /**
  * Story Bible —— 作品设定的事实源视图。
  *
@@ -5,7 +7,7 @@
  * 实体分栏浏览、伏笔台账、时间线、来源待标注，以及角色状态机 / 视角记忆 / 成长弧线。
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   addMemory,
@@ -24,6 +26,8 @@ import type { BibleEntity, BibleOverview, Foreshadow, TimelineEntry } from '../a
 import MarkdownView from '../components/MarkdownView'
 import { errorMessage, useToast } from '../state/useToast'
 import { NO_AUTOFILL } from '../lib/autofill'
+import { useScopedAction } from '../state/useScopedAction'
+import '../styles/bible.css'
 
 type EntityKind = 'character' | 'world' | 'faction' | 'item' | 'skill' | 'scene'
 type TabKey = EntityKind | 'foreshadow' | 'timeline' | 'unknown'
@@ -67,7 +71,7 @@ const ENTITY_TABS: Array<{ key: EntityKind; label: string }> = [
 const OTHER_TABS: Array<{ key: TabKey; label: string }> = [
   { key: 'foreshadow', label: '伏笔' },
   { key: 'timeline', label: '时间线' },
-  { key: 'unknown', label: '来源待标注' },
+  { key: 'unknown', label: '来源与缺项' },
 ]
 
 const TABS: Array<{ key: TabKey; label: string }> = [...ENTITY_TABS, ...OTHER_TABS]
@@ -75,12 +79,6 @@ const TABS: Array<{ key: TabKey; label: string }> = [...ENTITY_TABS, ...OTHER_TA
 /** 状态机字段（与后端 CORE_STATE_FIELDS / SECONDARY_STATE_FIELDS 对齐）。 */
 const STATE_FIELDS = ['位置', '伤势', '心理', '持有物', '关系', '能力', '立场', '目标']
 
-const SECTION_LINKS = [
-  { key: 'editor', label: '正文编辑器' },
-  { key: 'outline', label: '大纲规划' },
-  { key: 'cards', label: '设定卡片' },
-  { key: 'review', label: '审稿中心' },
-] as const
 
 function isEntityKind(tab: TabKey): tab is EntityKind {
   return tab !== 'foreshadow' && tab !== 'timeline' && tab !== 'unknown'
@@ -112,61 +110,59 @@ export default function Bible() {
   const projectId = Number(id)
   const navigate = useNavigate()
   const { push } = useToast()
+  const action = useScopedAction(projectId)
 
   const [overview, setOverview] = useState<BibleOverview | null>(null)
   const [activeTab, setActiveTab] = useState<TabKey>('character')
+  const activeTabRef = useRef(activeTab)
+  activeTabRef.current = activeTab
 
   const [entities, setEntities] = useState<BibleEntity[]>([])
   const [foreshadows, setForeshadows] = useState<Foreshadow[]>([])
   const [timeline, setTimeline] = useState<TimelineEntry[]>([])
-  const [unknown, setUnknown] = useState<Array<{ kind: string; name: string; ref: string; 说明: string }>>([])
+  const [unknown, setUnknown] = useState<Array<{ kind: string; name: string; ref: string; rel_path: string; reason: 'source_unknown' | 'missing_field'; field?: string; 说明: string }>>([])
   const [characters, setCharacters] = useState<CharacterRow[]>([])
-  const [tabLoading, setTabLoading] = useState(false)
+  const overviewResource = useResourceRequest(projectId)
+  const charactersResource = useResourceRequest(projectId)
+  const tabResource = useResourceRequest(`${projectId}:${activeTab}`)
+  const tabLoading = tabResource.loading
+  const [selectedEntity, setSelectedEntity] = useState('')
+  const [query, setQuery] = useState('')
 
   const [planned, setPlanned] = useState<Record<number, string>>({})
   const [stateForm, setStateForm] = useState<StateForm | null>(null)
   const [memoryForm, setMemoryForm] = useState<MemoryForm | null>(null)
   const [growth, setGrowth] = useState<GrowthData | null>(null)
-  const [growthLoading, setGrowthLoading] = useState(false)
+  const [growthName, setGrowthName] = useState('')
+  const growthResource = useResourceRequest(`${projectId}:${growthName}`)
 
   const loadOverview = useCallback(async () => {
-    try {
-      setOverview(await bibleOverview(projectId))
-    } catch (err) {
-      push(errorMessage(err), 'error')
-    }
-  }, [projectId, push])
+    const token = overviewResource.begin()
+    try { const data = await bibleOverview(projectId); if (!overviewResource.accept(token)) return; setOverview(data); overviewResource.finish(token) }
+    catch (err) { overviewResource.fail(token, errorMessage(err)) }
+  }, [projectId])
 
   const loadCharacters = useCallback(async () => {
-    try {
-      setCharacters(await listCharacters(projectId))
-    } catch (err) {
-      push(errorMessage(err), 'error')
-    }
-  }, [projectId, push])
+    const token = charactersResource.begin()
+    try { const data = await listCharacters(projectId); if (!charactersResource.accept(token)) return; setCharacters(data); charactersResource.finish(token) }
+    catch (err) { charactersResource.fail(token, errorMessage(err)) }
+  }, [projectId])
 
-  const loadTab = useCallback(
-    async (tab: TabKey) => {
-      setTabLoading(true)
-      try {
-        if (tab === 'foreshadow') {
-          setForeshadows(await listForeshadows(projectId))
-        } else if (tab === 'timeline') {
-          setTimeline(await listTimeline(projectId))
-        } else if (tab === 'unknown') {
-          setUnknown(await bibleUnknown(projectId))
-        } else {
-          const result = await bibleEntities(projectId, tab)
-          setEntities(result.entities)
-        }
-      } catch (err) {
-        push(errorMessage(err), 'error')
-      } finally {
-        setTabLoading(false)
-      }
-    },
-    [projectId, push],
-  )
+  const loadTab = useCallback(async (tab: TabKey) => {
+    // A completed write may still hold the callback for the previous category.
+    // Do not give that request the current category's loading/result token.
+    if (tab !== activeTabRef.current) return
+    const token = tabResource.begin()
+    try {
+      if (tab === 'foreshadow') { const data = await listForeshadows(projectId); if (!tabResource.accept(token)) return; setForeshadows(data) }
+      else if (tab === 'timeline') { const data = await listTimeline(projectId); if (!tabResource.accept(token)) return; setTimeline(data) }
+      else if (tab === 'unknown') { const data = await bibleUnknown(projectId); if (!tabResource.accept(token)) return; setUnknown(data) }
+      else { const data = await bibleEntities(projectId, tab); if (!tabResource.accept(token)) return; setEntities(data.entities) }
+      tabResource.finish(token)
+      void loadOverview()
+    } catch (err) { tabResource.fail(token, errorMessage(err)) }
+  }, [projectId, activeTab])
+  useEffect(() => { setOverview(null); setCharacters([]); setEntities([]); setForeshadows([]); setTimeline([]); setUnknown([]); setStateForm(null); setMemoryForm(null); setPlanned({}); setGrowth(null); setGrowthName(''); setSelectedEntity(''); setQuery('') }, [projectId])
 
   useEffect(() => {
     void loadOverview()
@@ -183,16 +179,25 @@ export default function Bible() {
     void loadTab(activeTab)
   }
 
+  useEffect(() => {
+    const refresh = () => { void loadOverview(); void loadCharacters(); void loadTab(activeTab) }
+    window.addEventListener('focus', refresh)
+    return () => window.removeEventListener('focus', refresh)
+  }, [loadOverview, loadCharacters, loadTab, activeTab])
+
   const goEditor = () => navigate(`/project/${projectId}/editor`)
 
   const markSource = async (ref: string, source: 'author' | 'model') => {
+    const token = action.begin('source')
+    if (!token) return
     try {
       await markBibleSource(projectId, ref, source)
+      if (!action.accept(token)) return
       push(source === 'author' ? '已标为作者来源' : '已标为模型来源', 'success')
       await Promise.all([loadOverview(), loadCharacters(), loadTab(activeTab)])
     } catch (err) {
-      push(errorMessage(err), 'error')
-    }
+      if (action.accept(token)) push(errorMessage(err), 'error')
+    } finally { action.finish(token) }
   }
 
   const submitStateForm = async () => {
@@ -201,6 +206,8 @@ export default function Bible() {
       push('请填写状态值', 'error')
       return
     }
+    const token = action.begin('state')
+    if (!token) return
     try {
       await applyCharacterState(projectId, {
         character: stateForm.character,
@@ -208,12 +215,13 @@ export default function Bible() {
         value: stateForm.value.trim(),
         source: 'author',
       })
+      if (!action.accept(token)) return
       push('已写回 状态/角色状态.md', 'success')
       setStateForm(null)
-      await loadCharacters()
+      await Promise.all([loadCharacters(), loadTab(activeTab)])
     } catch (err) {
-      push(errorMessage(err), 'error')
-    }
+      if (action.accept(token)) push(errorMessage(err), 'error')
+    } finally { action.finish(token) }
   }
 
   const submitMemoryForm = async () => {
@@ -222,6 +230,8 @@ export default function Bible() {
       push('请填写记忆内容', 'error')
       return
     }
+    const token = action.begin('memory')
+    if (!token) return
     try {
       await addMemory(projectId, {
         character: memoryForm.character,
@@ -229,43 +239,55 @@ export default function Bible() {
         when_known: memoryForm.when_known.trim(),
         source_event: memoryForm.source_event.trim(),
       })
+      if (!action.accept(token)) return
       push('已新增视角记忆', 'success')
       setMemoryForm(null)
     } catch (err) {
-      push(errorMessage(err), 'error')
-    }
+      if (action.accept(token)) push(errorMessage(err), 'error')
+    } finally { action.finish(token) }
   }
 
-  const openGrowth = async (name: string) => {
-    setGrowthLoading(true)
-    setGrowth({ character: name, series: {}, events: [] })
-    try {
-      const result = await growthCurve(projectId, name)
-      setGrowth({ character: result.character, series: result.series, events: result.events })
-    } catch (err) {
-      setGrowth(null)
-      push(errorMessage(err), 'error')
-    } finally {
-      setGrowthLoading(false)
-    }
+  const loadGrowth = useCallback(async () => {
+    if (!growthName) return
+    const token = growthResource.begin()
+    try { const result = await growthCurve(projectId, growthName); if (!growthResource.accept(token)) return; setGrowth({ character: result.character, series: result.series, events: result.events }); growthResource.finish(token) } catch (err) { growthResource.fail(token, errorMessage(err)) }
+  }, [projectId, growthName])
+  useEffect(() => { if (growthName) void loadGrowth() }, [growthName, loadGrowth])
+  const openGrowth = (name: string) => {
+    if (name === growthName) { void loadGrowth(); return }
+    setGrowth(null); setGrowthName(name)
   }
 
-  const handleConfirmForeshadow = async (line: number) => {
+  const handleConfirmForeshadow = async (item: Foreshadow) => {
+    const line = item.line
+    const token = action.begin('payoff')
+    if (!token) return
     try {
-      await confirmForeshadow(projectId, line, planned[line] ?? '')
+      await confirmForeshadow(projectId, line, planned[line] ?? item.planned_chapter ?? '', item.document_hash)
+      if (!action.accept(token)) return
       push('已确认回收该伏笔', 'success')
       setPlanned((prev) => ({ ...prev, [line]: '' }))
       await Promise.all([loadTab('foreshadow'), loadOverview()])
     } catch (err) {
-      push(errorMessage(err), 'error')
-    }
+      if (action.accept(token)) push(errorMessage(err), 'error')
+    } finally { action.finish(token) }
   }
 
   const entityKeys = (entity: BibleEntity) => Object.keys(entity.fields ?? {})
 
+  const matchesQuery = (value: unknown) => !query.trim() || JSON.stringify(value).toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
+  const visibleEntities = entities.filter(matchesQuery)
+  const visibleForeshadows = foreshadows.filter(matchesQuery)
+  const visibleTimeline = timeline.filter(matchesQuery)
+  const visibleUnknown = unknown.filter(matchesQuery)
+  const currentEntity = visibleEntities.find(entity => entity.ref === selectedEntity) || visibleEntities[0]
+  const activeMaterial = !tabResource.loaded ? null : isEntityKind(activeTab) ? currentEntity?.rel_path : activeTab === 'foreshadow' ? '设定/伏笔管理.md' : activeTab === 'timeline' ? '状态/时间线.md' : null
+  usePageChatContext({ projectId, activeFile: activeMaterial, files: tabResource.loaded && isEntityKind(activeTab) ? entities.map(entity => entity.rel_path) : [], onFilesChanged: async () => { await Promise.allSettled([loadOverview(), loadCharacters(), loadTab(activeTab)]) } })
   const renderEntities = () => (
-    <div className="card-grid">
-      {entities.map((entity) => (
+    <div className="workspace-collection">
+      <nav className="workspace-collection-nav" aria-label="设定条目">{visibleEntities.map(entity => <button key={entity.ref} className={entity.ref === currentEntity?.ref ? 'is-active' : ''} aria-pressed={entity.ref === currentEntity?.ref} onClick={() => setSelectedEntity(entity.ref)}>{entity.name}<small>{sourceLabel(entity.source)} · {Object.keys(entity.fields || {}).length} 个字段</small></button>)}</nav>
+      <div className="workspace-collection-detail">
+      {visibleEntities.filter(entity => entity.ref === currentEntity?.ref).map((entity) => (
         <article className="asset-card" key={entity.ref}>
           <div className="asset-card__head">
             <span className="asset-card__name">{entity.name}</span>
@@ -294,37 +316,39 @@ export default function Bible() {
               </div>
             </div>
           ) : null}
+          <p className="muted">原材料：{entity.rel_path}</p><button className="btn btn--sm" onClick={() => navigate(`/project/${projectId}/editor?${new URLSearchParams({path: entity.rel_path})}`)}>打开原材料</button>
           <div className="row">
-            <button className="btn btn--sm" type="button" onClick={() => void markSource(entity.ref, 'author')}>
+            <button className="btn btn--sm" type="button" disabled={!!action.pending} onClick={() => void markSource(entity.ref, 'author')}>
               标为作者
             </button>
-            <button className="btn btn--sm" type="button" onClick={() => void markSource(entity.ref, 'model')}>
+            <button className="btn btn--sm" type="button" disabled={!!action.pending} onClick={() => void markSource(entity.ref, 'model')}>
               标为模型
             </button>
           </div>
         </article>
-      ))}
+      ))}</div>
     </div>
   )
 
   const renderForeshadows = () => (
-    <div className="stack">
-      {foreshadows.map((item) => (
-        <div className="panel" key={item.line}>
+    <div className="bible-records">
+      {visibleForeshadows.map((item) => (
+        <article className="bible-record" key={item.line}>
           <div className="panel__header">
             <span className="asset-card__name">{item.content || `伏笔 ${item.line}`}</span>
-            <span className={foreshadowTagClass(item.status)}>{item.status}</span>
+            <span className={foreshadowTagClass(item.status)}>{item.is_planned ? '计划候选' : item.status}</span>
           </div>
           <div className="panel__body panel__body--tight stack stack--tight">
             <span className="muted">埋设于：{item.planted_in || '未标注'}</span>
             <span className="muted">依据原文：{item.evidence || '未标注'}</span>
-            <div className="row">
+            {!item.is_planned && ['待回收', '疑似回收'].includes(item.status) ? <div className="row bible-record__actions">
               <label className="field">
                 <span className="field__label">计划回收章（可选）</span>
                 <input
                   autoComplete={NO_AUTOFILL}
                   className="input"
-                  value={planned[item.line] ?? ''}
+                  disabled={!!action.pending}
+                  value={planned[item.line] ?? item.planned_chapter ?? ''}
                   placeholder="例如：第 42 章"
                   onChange={(event) =>
                     setPlanned((prev) => ({ ...prev, [item.line]: event.target.value }))
@@ -334,13 +358,14 @@ export default function Bible() {
               <button
                 className="btn btn--primary btn--sm"
                 type="button"
-                onClick={() => void handleConfirmForeshadow(item.line)}
+                disabled={!!action.pending}
+                onClick={() => void handleConfirmForeshadow(item)}
               >
                 确认回收
               </button>
-            </div>
+            </div> : <span className="field__hint">{item.is_planned ? '尚未埋设，计划不作为正文事实。' : item.status === '已回收' ? '作者已确认回收。' : '该伏笔已作废。'}</span>}
           </div>
-        </div>
+        </article>
       ))}
     </div>
   )
@@ -358,7 +383,7 @@ export default function Bible() {
             </tr>
           </thead>
           <tbody>
-            {timeline.map((entry, index) => (
+            {visibleTimeline.map((entry, index) => (
               <tr key={`${entry.chapter}-${index}`}>
                 <td>{entry.chapter || '未标注'}</td>
                 <td>{entry.story_time || '—'}</td>
@@ -374,7 +399,7 @@ export default function Bible() {
 
   const renderUnknown = () => (
     <div className="stack stack--tight">
-      {unknown.map((item) => (
+      {visibleUnknown.map((item) => (
         <div className="panel" key={`${item.ref}-${item.说明}`}>
           <div className="panel__body panel__body--tight row row--between">
             <div className="stack stack--tight">
@@ -382,12 +407,13 @@ export default function Bible() {
               <span className="muted">{item.说明}</span>
             </div>
             <div className="row">
-              <button className="btn btn--sm" type="button" onClick={() => void markSource(item.ref, 'author')}>
+              {item.reason === 'missing_field' ? <button className="btn btn--sm" type="button" onClick={() => navigate(`/project/${projectId}/editor?${new URLSearchParams({path: item.rel_path})}`)}>补齐原材料</button> : <>
+              <button className="btn btn--sm" type="button" disabled={!!action.pending} onClick={() => void markSource(item.ref, 'author')}>
                 标为作者
               </button>
-              <button className="btn btn--sm" type="button" onClick={() => void markSource(item.ref, 'model')}>
+              <button className="btn btn--sm" type="button" disabled={!!action.pending} onClick={() => void markSource(item.ref, 'model')}>
                 标为模型
-              </button>
+              </button></>}
             </div>
           </div>
         </div>
@@ -396,7 +422,9 @@ export default function Bible() {
   )
 
   const renderTabBody = () => {
-    if (tabLoading) return <p className="muted">加载中…</p>
+    const total = isEntityKind(activeTab) ? entities.length : activeTab === 'foreshadow' ? foreshadows.length : activeTab === 'timeline' ? timeline.length : unknown.length
+    const matched = isEntityKind(activeTab) ? visibleEntities.length : activeTab === 'foreshadow' ? visibleForeshadows.length : activeTab === 'timeline' ? visibleTimeline.length : visibleUnknown.length
+    if (total > 0 && query.trim() && matched === 0) return <div className="empty-state"><p className="empty-state__title">没有匹配的设定资料</p><p className="empty-state__desc">当前分类有 {total} 条资料，请调整关键词或清除搜索。</p><button className="btn btn--sm" type="button" onClick={() => setQuery('')}>清除搜索</button></div>
     if (isEntityKind(activeTab)) {
       if (entities.length === 0) {
         return (
@@ -452,6 +480,7 @@ export default function Bible() {
       { key: 'scene', label: overview.labels.scene ?? '场景', value: overview.counts.scene ?? 0 },
       { key: 'foreshadow', label: overview.labels.foreshadow ?? '伏笔', value: overview.counts.foreshadow ?? 0 },
       { key: 'timeline', label: '时间线条目', value: overview.timeline_count },
+      { key: 'foreshadow_planned', label: '计划伏笔', value: overview.foreshadow_planned ?? 0 },
       {
         key: 'foreshadow_open',
         label: '未回收伏笔',
@@ -462,36 +491,26 @@ export default function Bible() {
   }
 
   return (
-    <div className="page page--wide stack">
+    <WorkspacePage className="stack bible-page">
       <header className="page-header">
         <div>
-          <h1 className="page-header__title">{overview?.project_name ?? 'Story Bible'}</h1>
+          <h1 className="page-header__title">设定资料</h1>
           <p className="page-header__desc">
-            作品设定的事实源：角色、世界、势力、物品、技能、场景、伏笔与时间线，字段级来源分级。
+            {overview?.project_name ? `${overview.project_name} · ` : ''}作品设定的事实源：角色、世界、势力、物品、技能、场景、伏笔与时间线，字段级来源分级。
           </p>
         </div>
         <div className="btn-row">
           <button className="btn btn--sm" type="button" onClick={refreshAll}>
             刷新
           </button>
-          {SECTION_LINKS.map((section) => (
-            <button
-              key={section.key}
-              className="btn btn--ghost btn--sm"
-              type="button"
-              onClick={() => navigate(`/project/${projectId}/${section.key}`)}
-            >
-              {section.label}
-            </button>
-          ))}
         </div>
       </header>
 
+      <ResourceState {...overviewResource} hasData={overviewResource.loaded && !!overview} onRetry={() => void loadOverview()}>
       {overview ? (
-        <section className="row" aria-label="设定总览">
+        <section className="bible-statistics" aria-label="设定总览">
           {stats.map((stat) => (
-            <div className="panel" key={stat.key}>
-              <div className="panel__body panel__body--tight stack stack--tight">
+            <button className="bible-stat" key={stat.key} type="button" onClick={() => { const key = ['foreshadow_open', 'foreshadow_planned'].includes(stat.key) ? 'foreshadow' : stat.key; setQuery(''); setActiveTab(key as TabKey) }}>
                 <div className="row row--between">
                   <span className="muted">{stat.label}</span>
                   {stat.warn ? (
@@ -500,36 +519,38 @@ export default function Bible() {
                     </span>
                   ) : null}
                 </div>
-                <span className="tag tag--primary">{stat.value}</span>
-              </div>
-            </div>
+                <strong className="bible-stat__value">{stat.value}</strong>
+            </button>
           ))}
         </section>
       ) : (
         <p className="muted">正在加载总览…</p>
       )}
 
-      <nav className="tabs" aria-label="Story Bible 分类">
+      </ResourceState>
+      <nav className="workspace-tabs" aria-label="Story Bible 分类">
         {TABS.map((tab) => (
           <button
             key={tab.key}
             className={activeTab === tab.key ? 'tab is-active' : 'tab'}
             type="button"
+            aria-pressed={activeTab === tab.key}
             onClick={() => setActiveTab(tab.key)}
           >
             {tab.label}
           </button>
         ))}
       </nav>
+      <label className="field"><span className="field__label">搜索当前分类</span><input className="input" autoComplete={NO_AUTOFILL} value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索名称、字段或依据" /></label>
 
       <section className="panel">
         <div className="panel__header">
           <h2 className="panel__title">
             {TABS.find((tab) => tab.key === activeTab)?.label}
-            {isEntityKind(activeTab) && !tabLoading ? `（${entities.length} 条）` : ''}
+            {isEntityKind(activeTab) && !tabLoading ? `（${visibleEntities.length}${query.trim() ? ` / ${entities.length}` : ''} 条）` : ''}
           </h2>
         </div>
-        <div className="panel__body">{renderTabBody()}</div>
+        <div className="panel__body"><ResourceState {...tabResource} hasData={tabResource.loaded} onRetry={() => void loadTab(activeTab)}>{renderTabBody()}</ResourceState></div>
       </section>
 
       <section className="panel">
@@ -538,6 +559,7 @@ export default function Bible() {
           <span className="muted">状态来自 状态/角色状态.md；记忆来自 状态/角色记忆.md</span>
         </div>
         <div className="panel__body stack">
+          <ResourceState {...charactersResource} hasData={charactersResource.loaded} onRetry={() => void loadCharacters()}>
           {characters.length === 0 ? (
             <p className="muted">暂无角色：设定/人物设定.md 为空或未解析到角色节。</p>
           ) : (
@@ -568,6 +590,7 @@ export default function Bible() {
                       <button
                         className="btn btn--sm"
                         type="button"
+                        disabled={!!action.pending}
                         onClick={() =>
                           setStateForm(
                             currentStateForm
@@ -581,6 +604,7 @@ export default function Bible() {
                       <button
                         className="btn btn--sm"
                         type="button"
+                        disabled={!!action.pending}
                         onClick={() =>
                           setMemoryForm(
                             currentMemoryForm
@@ -614,6 +638,7 @@ export default function Bible() {
                           void submitStateForm()
                         }}
                       >
+                        <fieldset className="bible-form stack stack--tight" disabled={!!action.pending}>
                         <label className="field">
                           <span className="field__label">状态字段</span>
                           <select
@@ -659,6 +684,7 @@ export default function Bible() {
                           </button>
                         </div>
                         <span className="field__hint">保存后会写入角色状态。</span>
+                        </fieldset>
                       </form>
                     ) : null}
 
@@ -671,6 +697,7 @@ export default function Bible() {
                           void submitMemoryForm()
                         }}
                       >
+                        <fieldset className="bible-form stack stack--tight" disabled={!!action.pending}>
                         <label className="field">
                           <span className="field__label">知道什么</span>
                           <input
@@ -725,6 +752,7 @@ export default function Bible() {
                             取消
                           </button>
                         </div>
+                        </fieldset>
                       </form>
                     ) : null}
                   </article>
@@ -732,24 +760,24 @@ export default function Bible() {
               })}
             </div>
           )}
+          </ResourceState>
         </div>
       </section>
 
-      {growth ? (
+      {growthName ? (
         <section className="panel">
           <div className="panel__header">
-            <h2 className="panel__title">{growth.character} 的成长曲线</h2>
-            <button className="btn btn--ghost btn--sm" type="button" onClick={() => setGrowth(null)}>
+            <h2 className="panel__title">{growthName} 的成长曲线</h2>
+            <button className="btn btn--ghost btn--sm" type="button" onClick={() => { setGrowth(null); setGrowthName('') }}>
               收起
             </button>
           </div>
           <div className="panel__body stack">
-            {growthLoading ? (
-              <p className="muted">加载中…</p>
-            ) : Object.keys(growth.series).length === 0 ? (
+            <ResourceState {...growthResource} hasData={growthResource.loaded && growth?.character === growthName} onRetry={() => void loadGrowth()}>
+            {growth?.character === growthName && Object.keys(growth.series).length === 0 ? (
               <p className="muted">暂无状态变化点，先写入角色状态或执行章节摄取。</p>
             ) : (
-              Object.entries(growth.series).map(([field, points]) => (
+              Object.entries(growth?.character === growthName ? growth.series : {}).map(([field, points]) => (
                 <div className="stack stack--tight" key={field}>
                   <h3 className="panel__title">{field}</h3>
                   {points.map((point, index) => {
@@ -770,10 +798,10 @@ export default function Bible() {
                   })}
                 </div>
               ))
-            )}
+            )}</ResourceState>
           </div>
         </section>
       ) : null}
-    </div>
+    </WorkspacePage>
   )
 }

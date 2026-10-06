@@ -128,7 +128,15 @@ export function apply(ctx) {
       streamedSteps.set(data.step, (streamedSteps.get(data.step) || "") + text);
       write({ ...common, type: "delta", text });
     };
-    if (event.type === "step/start") {
+    if (event.type === "compaction/start" || event.type === "compaction/end" || event.type === "compaction/summary") {
+      // Only metadata crosses the bridge: vendor summary/rawOutput stay private.
+      const status = event.type === "compaction/start" ? "running" : data.error ? "error" : "done";
+      write({ ...common, type: "compaction", activity_id: `compact-${String(data.compactionId)}`,
+        compaction_id: String(data.compactionId), status,
+        phase: event.type.split("/")[1], shadowed_tokens: data.shadowedTokenCount,
+        range: data.shadowedRange, usage: data.usage,
+        message: data.error ? "长对话上下文整理失败；引擎会保留原有材料继续或报告错误。" : undefined });
+    } else if (event.type === "step/start") {
       phaseStarts.set(data.step, event.time);
       phaseLabels.set(data.step, "正在调用模型");
       turnSteps.set(data.turn, data.step);

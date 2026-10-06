@@ -10,16 +10,19 @@ import type {
   BibleEntity,
   BibleOverview,
   CardList,
+  CardHighlightEntry,
+  CardParseTask,
   ChapterDetail,
   ChapterSummary,
   ChatReply,
   ChatSession,
   ChatSessionDetail,
   ChatContext, ChatDefaults,
+  WritingPrefs,
   ChatRun,
   ChatRunEvent,
   ChatFileChange,
-  ChatInteractionResponse,
+  ChatInteractionResponse, ChatInteraction,
   ChatMemoryEntry,
   ChatPermissionMode,
   ConflictCheck,
@@ -34,6 +37,7 @@ import type {
   ImageProvider,
   ImageRecord,
   OperationLogEntry,
+  OutlineCandidate,
   OutlineState,
   PipelineResult,
   Project,
@@ -42,13 +46,20 @@ import type {
   Provider,
   QualityMatrix,
   ReviewResult,
+  SoftDeslopResult,
   RoutingDecision,
   RoutingInfo,
   Settings,
   SkillItem,
   StyleFingerprint,
+  StyleReferenceMetrics,
+  IngestionResult,
   TaskRecord,
   Template,
+  TemplateFile,
+  TemplatePackage,
+  TemplatePrefs,
+  TemplateTree,
   TimelineEntry,
   TrashEntry,
   TreeNode,
@@ -152,6 +163,7 @@ export async function readSSE(
   onEvent: (payload: Record<string, unknown>) => void,
   signal?: AbortSignal,
   method: 'POST' | 'GET' = 'POST',
+  onFrame?: () => void,
 ): Promise<void> {
   const response = await fetch(`${API_BASE}${path}`, {
     method,
@@ -166,6 +178,7 @@ export async function readSSE(
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
   const dispatch = (part: string) => {
+    onFrame?.()
     const data = part.split(/\r?\n/).filter((line) => line.startsWith('data:'))
       .map((line) => line.slice(5).trimStart()).join('\n')
     if (!data) return
@@ -248,6 +261,13 @@ export const deleteCover = (projectId: number) =>
 export const archiveProject = (id: number, archived = true) =>
   request<Project>(`/projects/${id}/archive`, { method: 'POST', body: { archived } })
 
+/** 删除整本书：默认移入回收站（可恢复）；permanent=true 彻底删除。 */
+export const deleteProject = (id: number, permanent = false) =>
+  request<{ id: number; name: string; deleted: boolean; purged: boolean }>(
+    `/projects/${id}${qs({ permanent: permanent || undefined })}`,
+    { method: 'DELETE' },
+  )
+
 // ─────────────────────────── 文档树 / 章节 ───────────────────────────
 
 export const getTree = (projectId: number) => request<ProjectTree>(`/projects/${projectId}/tree`)
@@ -314,13 +334,19 @@ export const deleteChapter = (projectId: number, relPath: string) =>
 
 // ─────────────────────────── 回收站 / 快照 / 冲突 ───────────────────────────
 
-export const listTrash = (projectId: number) =>
-  request<TrashEntry[]>(`/projects/${projectId}/trash`)
+/** 回收站总表：整本书（软删除）+ 各项目的文件/文件夹条目。 */
+export const listTrash = () => request<TrashEntry[]>('/trash')
 
-export const restoreTrash = (projectId: number, trashRel: string) =>
-  request<{ rel_path: string; restored_from: string }>(`/projects/${projectId}/trash/restore`, {
+export const restoreTrash = (trashRel: string) =>
+  request<{ rel_path: string; restored_from: string }>('/trash/restore', {
     method: 'POST',
     body: { trash_rel: trashRel },
+  })
+
+/** 从回收站恢复整本书。 */
+export const restoreProject = (id: number) =>
+  request<{ rel_path: string; restored_from: string }>(`/projects/${id}/restore`, {
+    method: 'POST',
   })
 
 export const listSnapshots = (projectId: number, relPath?: string) =>
@@ -374,6 +400,69 @@ export const duplicateTemplate = (name: string, newName: string) =>
   request<Template>(`/templates/${encodeURIComponent(name)}/duplicate`, {
     method: 'POST',
     body: { new_name: newName },
+  })
+
+export const createBlankTemplate = (name: string) =>
+  request<Template>('/templates/blank', { method: 'POST', body: { name } })
+
+export const renameTemplate = (name: string, newName: string) =>
+  request<Template>(`/templates/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    body: { new_name: newName },
+  })
+
+export const getTemplatePrefs = () => request<TemplatePrefs>('/templates/prefs')
+
+export const updateTemplatePrefs = (patch: Partial<TemplatePrefs>) =>
+  request<TemplatePrefs>('/templates/prefs', { method: 'PUT', body: patch })
+
+export const importTemplate = (payload: TemplatePackage, newName?: string) =>
+  request<Template>('/templates/import', {
+    method: 'POST',
+    body: { payload, new_name: newName },
+  })
+
+export const exportTemplate = (name: string) =>
+  request<TemplatePackage>(`/templates/${encodeURIComponent(name)}/export`)
+
+export const getTemplateTree = (name: string) =>
+  request<TemplateTree>(`/templates/${encodeURIComponent(name)}/tree`)
+
+export const readTemplateFile = (name: string, relPath: string) =>
+  request<TemplateFile>(
+    `/templates/${encodeURIComponent(name)}/file${qs({ rel_path: relPath })}`,
+  )
+
+export const writeTemplateFile = (name: string, relPath: string, content: string) =>
+  request<TemplateFile>(`/templates/${encodeURIComponent(name)}/file`, {
+    method: 'PUT',
+    body: { rel_path: relPath, content },
+  })
+
+export const createTemplateNode = (
+  name: string,
+  parentRel: string,
+  nodeName: string,
+  isDir: boolean,
+) =>
+  request(`/templates/${encodeURIComponent(name)}/node`, {
+    method: 'POST',
+    body: { parent_rel: parentRel, name: nodeName, is_dir: isDir },
+  })
+
+export const patchTemplateNode = (
+  name: string,
+  relPath: string,
+  patch: { new_name?: string; dst_parent_rel?: string },
+) =>
+  request(`/templates/${encodeURIComponent(name)}/node`, {
+    method: 'PATCH',
+    body: { rel_path: relPath, ...patch },
+  })
+
+export const deleteTemplateNode = (name: string, relPath: string) =>
+  request(`/templates/${encodeURIComponent(name)}/node${qs({ rel_path: relPath })}`, {
+    method: 'DELETE',
   })
 
 export const exportChapters = (
@@ -529,6 +618,9 @@ export const checkGates = (projectId: number, chapterRel: string) =>
 export const freezeOutline = (projectId: number) =>
   request<Record<string, unknown>>(`/projects/${projectId}/outline/freeze`, { method: 'POST' })
 
+export const unfreezeOutline = (projectId: number) =>
+  request<Record<string, unknown>>(`/projects/${projectId}/outline/unfreeze`, { method: 'POST' })
+
 export const runPipeline = (projectId: number, payload: Record<string, unknown>) =>
   request<PipelineResult>(`/projects/${projectId}/pipeline/run`, { method: 'POST', body: payload })
 
@@ -547,6 +639,13 @@ export const getProposal = (id: number) => request<ProposalItem>(`/proposals/${i
 
 export const updateProposal = (id: number, content: string) =>
   request<ProposalItem>(`/proposals/${id}`, { method: 'PUT', body: { content } })
+
+export const rebaseStateProposal = (id: number) =>
+  request<{ proposal_id: number | null; already_current: boolean; proposal: ProposalItem | null }>(
+    `/proposals/${id}/rebase-state`, { method: 'POST' })
+
+export const reviewProposal = (id: number, useAi = true) =>
+  request<ReviewResult>(`/proposals/${id}/review`, { method: 'POST', body: { use_ai: useAi } })
 
 export const applyProposal = (id: number, content?: string, status?: string) =>
   request<Record<string, unknown>>(`/proposals/${id}/apply`, {
@@ -575,7 +674,7 @@ export const reviewChapter = (projectId: number, chapterRel: string, useAi = tru
   })
 
 export const softDeslop = (projectId: number, chapterRel: string, useAi = true) =>
-  request<{ suggestions: Array<Record<string, unknown>>; proposal_ids: number[]; style_comparison: Record<string, unknown> | null }>(
+  request<SoftDeslopResult>(
     `/projects/${projectId}/review/deslop`,
     { method: 'POST', body: { chapter_rel: chapterRel, use_ai: useAi } },
   )
@@ -594,7 +693,7 @@ export const resolveDebt = (debtId: number, status = 'resolved') =>
 // ─────────────────────────── 摄取（四件套） ───────────────────────────
 
 export const ingestChapter = (projectId: number, chapterRel: string, useAi = true) =>
-  request<Record<string, unknown>>(`/projects/${projectId}/ingest`, {
+  request<IngestionResult>(`/projects/${projectId}/ingest`, {
     method: 'POST',
     body: { chapter_rel: chapterRel, use_ai: useAi },
   })
@@ -605,9 +704,9 @@ export const listTimeline = (projectId: number) =>
 export const listForeshadows = (projectId: number) =>
   request<Foreshadow[]>(`/projects/${projectId}/foreshadows`)
 
-export const confirmForeshadow = (projectId: number, line: number, plannedChapter = '') =>
+export const confirmForeshadow = (projectId: number, line: number, plannedChapter = '', expectedHash?: string) =>
   request<Record<string, unknown>>(
-    `/projects/${projectId}/foreshadows/confirm${qs({ line, planned_chapter: plannedChapter })}`,
+    `/projects/${projectId}/foreshadows/confirm${qs({ line, planned_chapter: plannedChapter, expected_hash: expectedHash })}`,
     { method: 'POST' },
   )
 
@@ -634,16 +733,21 @@ export const ghostText = (
   body: payload,
 })
 
-export const sampleStyle = (projectId: number, relPath: string, approved = true) =>
+export const sampleStyle = (projectId: number, relPath: string, approved = true, note?: string) =>
   request<StyleFingerprint>(`/projects/${projectId}/style/sample`, {
     method: 'POST',
-    body: { rel_path: relPath, approved },
+    body: { rel_path: relPath, approved, note },
   })
 
 export const listStyleFingerprints = (projectId: number, approvedOnly = false) =>
-  request<{ samples: StyleFingerprint[]; reference: Record<string, unknown> | null }>(
+  request<{ samples: StyleFingerprint[]; reference: StyleReferenceMetrics | null }>(
     `/projects/${projectId}/style/fingerprints${qs({ approved_only: approvedOnly })}`,
   )
+
+export const cancelStyleApproval = (projectId: number, fingerprintId: number) =>
+  request<StyleFingerprint>(`/projects/${projectId}/style/fingerprints/${fingerprintId}`, {
+    method: 'PATCH', body: { approved: false },
+  })
 
 export const listPrompts = () =>
   request<Array<{ prompt_id: string; version: string; task_type: string; current: boolean }>>('/prompts')
@@ -659,7 +763,7 @@ export const bibleEntities = (projectId: number, kind: string) =>
   )
 
 export const bibleUnknown = (projectId: number) =>
-  request<Array<{ kind: string; name: string; ref: string; 说明: string }>>(
+  request<Array<{ kind: string; name: string; ref: string; 说明: string; reason: 'source_unknown' | 'missing_field'; rel_path: string; field?: string }>>(
     `/projects/${projectId}/bible/unknown`,
   )
 
@@ -685,15 +789,21 @@ export const expandOutline = (projectId: number, idea: string, useAi = true) =>
   })
 
 export const outlineCandidates = (projectId: number, idea: string, count = 3, useAi = true) =>
-  request<{ candidates: Array<{ title: string; content: string }> }>(
+  request<{ candidates: OutlineCandidate[]; count: number; added_count: number; duplicate_count: number; message?: string }>(
     `/projects/${projectId}/outline/candidates`,
     { method: 'POST', body: { idea, count, use_ai: useAi } },
   )
 
-export const lockOutline = (projectId: number, index: number) =>
+export const refineOutlineCandidate = (projectId: number, candidateId: string, message: string) =>
+  request<{ candidate: OutlineCandidate; candidates: OutlineCandidate[]; count: number }>(
+    `/projects/${projectId}/outline/candidates/${encodeURIComponent(candidateId)}/refine`,
+    { method: 'POST', body: { message } },
+  )
+
+export const lockOutline = (projectId: number, candidateId: string | number) =>
   request<Record<string, unknown>>(`/projects/${projectId}/outline/lock`, {
     method: 'POST',
-    body: { index, confirm: true },
+    body: { ...(typeof candidateId === 'number' ? { index: candidateId } : { candidate_id: candidateId }), confirm: true },
   })
 
 export const rollingPlan = (projectId: number, useAi = true) =>
@@ -711,15 +821,24 @@ export const listCards = (
 ) => request<CardList>(`/projects/${projectId}/cards${qs(params)}`)
 
 export const refreshCards = (projectId: number, category?: string, force = false) =>
-  request<Record<string, unknown>>(`/projects/${projectId}/cards/refresh`, {
+  request<CardParseTask>(`/projects/${projectId}/cards/refresh`, {
     method: 'POST',
-    body: { category: category ?? null, force, use_ai: false },
+    body: { category: category ?? null, force },
   })
 
-export const setCardHighlight = (projectId: number, ref: string, color: string) =>
+export const getCardParseTask = (projectId: number, taskId: string) =>
+  request<CardParseTask>(`/projects/${projectId}/cards/tasks/${taskId}`)
+
+export const cancelCardParseTask = (projectId: number, taskId: string) =>
+  request<CardParseTask>(`/projects/${projectId}/cards/tasks/${taskId}/cancel`, { method: 'POST' })
+
+export const listCardHighlights = (projectId: number) =>
+  request<CardHighlightEntry[]>(`/projects/${projectId}/cards/highlights`)
+
+export const setCardHighlight = (projectId: number, ref: string, color: string, mode?: 'auto' | 'manual' | 'off') =>
   request<{ ref: string; highlight: string }>(`/projects/${projectId}/cards/highlight`, {
     method: 'POST',
-    body: { ref, color },
+    body: { ref, color, mode },
   })
 
 export const cardChapterLine = (projectId: number, ref: string) =>
@@ -727,10 +846,11 @@ export const cardChapterLine = (projectId: number, ref: string) =>
     `/projects/${projectId}/cards/chapter-line${qs({ ref })}`,
   )
 
-export const updateCard = (projectId: number, ref: string, fields: Record<string, string>) =>
+export const updateCard = (projectId: number, ref: string, fields: Record<string, string>, name?: string,
+  options?: { field_edits?: Array<{ original_name: string; new_name?: string; value?: string; delete?: boolean }>; expected_hash?: string }) =>
   request<Record<string, unknown>>(`/projects/${projectId}/cards`, {
     method: 'PATCH',
-    body: { ref, fields },
+    body: { ref, fields, name, ...options },
   })
 
 export const addCard = (
@@ -813,7 +933,7 @@ export const vectorSearch = (projectId: number, q: string, limit = 5) =>
 // ─────────────────────────── 技能 / Agent / 规则 / 路由 ───────────────────────────
 
 export const listSkills = () =>
-  request<{ skills: SkillItem[]; budget_bytes: number; target_root: string }>('/skills')
+  request<{ skills: SkillItem[]; estimated_tokens: number; target_root: string }>('/skills')
 
 export const getSkill = (name: string) =>
   request<SkillItem & { content: string }>(`/skills/${encodeURIComponent(name)}`)
@@ -960,6 +1080,12 @@ export const getChatDefaults = (projectId: number) =>
 export const putChatDefaults = (projectId: number, defaults: Pick<ChatDefaults, 'permission_mode' | 'discussion_only'>) =>
   request<ChatDefaults>(`/projects/${projectId}/chat-defaults`, { method: 'PUT', body: defaults })
 
+export const getWritingPrefs = (projectId: number) =>
+  request<WritingPrefs>(`/projects/${projectId}/writing-prefs`)
+
+export const putWritingPrefs = (projectId: number, prefs: Pick<WritingPrefs, 'chapter_min_words' | 'chapter_max_words'>) =>
+  request<WritingPrefs>(`/projects/${projectId}/writing-prefs`, { method: 'PUT', body: prefs })
+
 export const createChatSession = (payload: {
   project_id?: number; title?: string; agent?: string; agent_pinned?: number
   provider_id?: string; model_id?: string; mode?: 'write' | 'read'; auto_apply?: number
@@ -992,15 +1118,15 @@ export const getChatRun = (runId: string, signal?: AbortSignal) =>
   request<ChatRun>(`/chat/runs/${runId}`, { signal })
 
 export const streamChatRun = (runId: string, after: number,
-  onEvent: (event: ChatRunEvent) => void, signal?: AbortSignal) =>
+  onEvent: (event: ChatRunEvent) => void, signal?: AbortSignal, onFrame?: () => void) =>
   readSSE(`/chat/runs/${runId}/events${qs({ after })}`, undefined,
-    (event) => onEvent(event as ChatRunEvent), signal, 'GET')
+    (event) => onEvent(event as ChatRunEvent), signal, 'GET', onFrame)
 
 export const cancelChatRun = (runId: string) =>
   request<ChatRun>(`/chat/runs/${runId}/cancel`, { method: 'POST' })
 
 export const respondChatInteraction = (runId: string, interactionId: string, response: ChatInteractionResponse) =>
-  request<unknown>(`/chat/runs/${runId}/interactions/${encodeURIComponent(interactionId)}/respond`, {
+  request<ChatInteraction>(`/chat/runs/${runId}/interactions/${encodeURIComponent(interactionId)}/respond`, {
     method: 'POST', body: { response },
   })
 

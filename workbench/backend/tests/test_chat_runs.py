@@ -241,7 +241,7 @@ def test_target_chapter_is_separate_from_viewed_reference(workspace, monkeypatch
     engine = install(monkeypatch, turns=[[("read_file", {}), "已读取目标。"]])
     context = {"active_file": reference["path"], "base_hash": reference["hash"],
                "target_chapter": chapter["rel_path"]}
-    result = finish(runs.create_run(session["id"], text="继续写当前章节", context=context))
+    result = finish(runs.create_run(session["id"], text="读取当前目标章节供讨论", context=context))
     assert result["ok"]
     assert result["request"]["context"]["target_chapter"] == chapter["rel_path"]
     assert f"当前参考文件：{reference['path']}" in engine.calls[0]["context"]
@@ -264,20 +264,21 @@ def test_explicit_continuation_retains_original_task_and_applied_changes(workspa
     engine = install(monkeypatch, turns=[[
         ("create_file", {"rel_path": "备忘录/已完成.md", "content": "已完成的记录。"}),
         {"type": "error", "code": "TIMEOUT", "message": "模型无进展"}],
-        ["接着处理剩余事项。"], ["再次续接。"]])
-    first = finish(runs.create_run(session["id"], text="完成本书设定与后续章节", client_request_id="origin"))
+        [("create_file", {"rel_path": "设定/续接.md", "content": "剩余设定已保存。"}), "接着处理剩余事项。"],
+        [("read_file", {"rel_path": "设定/续接.md"}), ("write_file", {"rel_path": "设定/续接.md", "content": "进一步完善的设定。"}), "再次续接。"]])
+    first = finish(runs.create_run(session["id"], text="完善本书设定", client_request_id="origin"))
     assert first["status"] == "failed" and first["changes"][0]["status"] == "applied"
     second = finish(runs.create_run(session["id"], text="", continue_from_run_id=first["id"],
                                     client_request_id="continue-1"))
     assert second["ok"] and second["request"]["text"] == "继续完成上一轮未完成的任务。"
     assert second["request"]["continue_from_run_id"] == first["id"]
     assert engine.calls[1]["user_text"] == "继续完成上一轮未完成的任务。"
-    assert "完成本书设定与后续章节" in engine.calls[1]["context"]
+    assert "完善本书设定" in engine.calls[1]["context"]
     assert "备忘录/已完成.md" in engine.calls[1]["context"]
-    assert len(second["changes"]) == 0
+    assert len(second["changes"]) == 1
     assert changes.file_state(project["id"], "备忘录/已完成.md")["content"] == "已完成的记录。"
     third = finish(runs.create_run(session["id"], text="", continue_from_run_id=second["id"]))
-    assert third["ok"] and "完成本书设定与后续章节" in engine.calls[2]["context"]
+    assert third["ok"] and "完善本书设定" in engine.calls[2]["context"]
     assert "备忘录/已完成.md" in engine.calls[2]["context"]
     same = runs.create_run(session["id"], text="", continue_from_run_id=first["id"],
                            client_request_id="continue-1")
@@ -337,16 +338,18 @@ def test_followup_keeps_write_authority_and_invalid_auto_attachment_is_warning(w
     engine = install(monkeypatch, turns=[
         ["请确认主角姓名。"],
         ["已收到李长歌。"],
-        [("create_file", {"rel_path": "备忘录/确认.md", "content": "主角李长歌。"}), "已保存。"],
+        [("create_file", {"rel_path": "设定/确认.md", "content": "主角李长歌。"}), "已保存。"],
     ])
     finish(runs.create_run(session["id"], text="完善世界设定"))
     answer = finish(runs.create_run(session["id"], text="主角名字用哪个：李长歌。",
                                    context={"active_file": "章节/第一章：test.txt"}))
-    assert answer["ok"] and len(answer["context_warnings"]) == 1
+    assert answer["ok"]
+    attachment_warnings = [message for message in answer["context_warnings"] if "未附带当前文件" in message]
+    assert len(attachment_warnings) == 1
     assert engine.calls[1]["user_text"] == "主角名字用哪个：李长歌。"
     continued = finish(runs.create_run(session["id"], text="请接着完成上一轮未完成的要求"))
     assert continued["ok"]
-    assert changes.file_state(project["id"], "备忘录/确认.md")["content"] == "主角李长歌。"
+    assert changes.file_state(project["id"], "设定/确认.md")["content"] == "主角李长歌。"
     assert {"create_file", "delete_file", "move_file"} <= {s["name"] for s in engine.calls[2]["tool_specs"]}
 
 
@@ -401,7 +404,7 @@ def test_approval_wait_continue_and_next_round_permission_snapshot(workspace, mo
     chat_service.update_session(session["id"], {"permission_mode": "ask"})
     install(monkeypatch, turns=[[("create_file", {"rel_path": "备忘录/批准.md", "content": "确认后的正文"}),
                                 "保存完成，可以继续创作。"]])
-    run = runs.create_run(session["id"], text="继续")
+    run = runs.create_run(session["id"], text="创建备忘录")
     card = wait_interaction(run)
     assert card["kind"] == "approval"
     assert not changes.file_state(project["id"], "备忘录/批准.md")["exists"]
@@ -538,3 +541,334 @@ def test_disk_run_recovery_uses_book_path_when_project_index_ids_change(workspac
     assert restored["project_id"] == new_id
     assert restored["request"]["session"]["project_id"] == new_id
     assert restored["last_seq"] == completed["last_seq"]
+
+
+def test_session_permission_reads_live_values_and_fails_safe(workspace):
+    _, session, _ = workspace
+    assert chat_service.get_session_permission(session["id"]) == {
+        "permission_mode": "auto", "discussion_only": False}
+    chat_service.update_session(session["id"], {"permission_mode": "ask", "discussion_only": True})
+    assert chat_service.get_session_permission(session["id"]) == {
+        "permission_mode": "ask", "discussion_only": True}
+    # 会话已不存在时返回安全值，绝不放宽写权限。
+    assert chat_service.get_session_permission(999999) == {
+        "permission_mode": "ask", "discussion_only": True}
+
+
+def test_running_permission_change_applies_to_next_tool_call(workspace, monkeypatch):
+    from workbench.backend.services import chat_interaction_service as interactions
+    project, session, _ = workspace
+    chat_service.update_session(session["id"], {"permission_mode": "ask"})
+    install(monkeypatch, turns=[[
+        ("create_file", {"rel_path": "备忘录/第一步.md", "content": "第一份正文。"}),
+        ("write_file", {"rel_path": "备忘录/第一步.md", "content": "第二份正文。"}),
+        "两项修改都已完成。"]])
+    run = runs.create_run(session["id"], text="先建一份备忘录再整篇改写")
+    card = wait_interaction(run)
+    assert card["kind"] == "approval"
+    # 任务运行中作者把权限从 ask 改为 auto：下一个工具调用必须按新值判定。
+    chat_service.update_session(session["id"], {"permission_mode": "auto"})
+    interactions.respond(run["id"], card["id"], {"decision": "approve"})
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        snapshot = runs.get_run(run["id"])
+        if snapshot["status"] in runs.TERMINAL:
+            break
+        if any(item["kind"] == "approval" and item["status"] == "pending" for item in snapshot["interactions"]):
+            break
+        time.sleep(0.02)
+    snapshot = runs.get_run(run["id"])
+    approvals = [item for item in snapshot["interactions"] if item["kind"] == "approval"]
+    if snapshot["status"] not in runs.TERMINAL or len(approvals) != 1:
+        runs.cancel(run["id"])
+        pytest.fail("运行中切换权限未实时生效：后续写操作仍然弹出了审批卡")
+    result = finish(run)
+    assert result["ok"]
+    assert len(approvals) == 1
+    assert changes.file_state(project["id"], "备忘录/第一步.md")["content"] == "第二份正文。"
+    assert [change["status"] for change in result["changes"]] == ["applied", "applied"]
+    # 轮次展示仍保留开跑时的快照，判定已按实时权限执行。
+    assert result["permission_mode"] == "ask"
+
+
+def test_discussion_only_turned_on_mid_run_refuses_writes(workspace, monkeypatch):
+    from workbench.backend.services import chat_interaction_service as interactions
+    project, session, _ = workspace
+    install(monkeypatch, turns=[[
+        ("ask_user_question", {"questions": [{"id": "scope", "question": "写到哪个备忘录？"}]}),
+        ("create_file", {"rel_path": "备忘录/只读.md", "content": "不应写入"}),
+        "已结束。"]])
+    run = runs.create_run(session["id"], text="先问清楚再写一份备忘录")
+    card = wait_interaction(run)
+    assert card["kind"] == "question"
+    # 运行中作者勾选「仅讨论」：写操作立即一律拒绝，不因权限放宽而放行。
+    chat_service.update_session(session["id"], {"discussion_only": True})
+    interactions.respond(run["id"], card["id"], {"answers": [
+        {"id": "scope", "selected": [], "custom": "备忘录/只读.md"}]})
+    result = finish(run)
+    step = next(item for item in result["steps"] if item.get("tool") == "create_file")
+    assert step["status"] == "error" and "只读" in step["summary"]
+    assert not changes.file_state(project["id"], "备忘录/只读.md")["exists"]
+    assert result["changes"] == []
+
+
+def test_always_inject_skill_reaches_non_writing_round(workspace, monkeypatch):
+    """未命中写作触发词、但本轮可执行写工具时，仍兜底注入去 AI 味技能正文。"""
+    _, session, root = workspace
+    skill = root / "skills/human-linguistics/SKILL.md"
+    skill.parent.mkdir()
+    skill.write_text("---\nname: human-linguistics\ndescription: 去AI味\n---\n"
+                     "叙述层禁用推测词，不用三连排比。", encoding="utf-8")
+    engine = install(monkeypatch)
+    run = finish(runs.create_run(session["id"], text="这段节奏有点拖，帮我想想怎么调整。"))
+    assert run["ok"]
+    assert run["routing"]["matched"] is False        # 未命中写作类意图触发词
+    assert "叙述层禁用推测词" in engine.calls[0]["system"]
+    assert "human-linguistics" in [step.get("tool") for step in run["steps"]]
+
+
+def test_complete_skill_tokens_survive_events_snapshot_and_history(workspace, monkeypatch):
+    from workbench.backend.engine.runtime import estimate_tokens
+    from workbench.backend.services import skill_service
+
+    _, session, root = workspace
+    skill = root / "skills/human-linguistics/SKILL.md"
+    skill.parent.mkdir()
+    body = "完整注入规则。" * 2000 + "技能尾部保留。"
+    skill.write_text("---\nname: human-linguistics\ndescription: 去AI味\n---\n" + body, encoding="utf-8")
+    engine = install(monkeypatch)
+    result = finish(runs.create_run(session["id"], text="这段节奏有点拖，帮我调整。"))
+    assert result["ok"] and body in engine.calls[0]["system"]
+    tokens = estimate_tokens(skill_service.skill_digest(["human-linguistics"]))
+    event = next(item for item in runs.events_after(result["id"])
+                 if item["event"] == "step" and item.get("tool") == "human-linguistics")
+    assert event["estimated_tokens"] == tokens
+    assert f"约 {tokens:,} token" in event["label"]
+    assert "预算" not in event["summary"]
+    snapshot = runs.get_run(result["id"])
+    step = next(item for item in snapshot["steps"] if item.get("tool") == "human-linguistics")
+    assert step["estimated_tokens"] == tokens
+    history = chat_service.list_messages(session["id"])[-1]
+    historical = next(item for item in history["meta"]["steps"] if item.get("tool") == "human-linguistics")
+    assert historical["estimated_tokens"] == tokens
+
+
+# ─────────────────────── 多步协作计划（多智能体接力） ───────────────────────
+
+TWO_STEPS = [
+    {"step": 1, "agent": "setting-keeper", "write_targets": ["设定"],
+     "read_only_refs": [], "note": "先补设定"},
+    {"step": 2, "agent": "planner", "write_targets": ["大纲"],
+     "read_only_refs": ["设定"], "note": "再按设定列卷纲"},
+]
+
+
+def plan_route(monkeypatch, plan, *, agent="planner", write_targets=None):
+    """把路由结果换成带多步计划的结果（其余字段沿用真实路由）。"""
+    original = runs.routing_service.route
+
+    def fake(project_id, text, *, override_agent="", record=True, **context):
+        result = dict(original(project_id, text, override_agent=override_agent, record=record, **context))
+        result["agent"] = agent
+        result["write_targets"] = list(write_targets or ["大纲"])
+        result["plan"] = [dict(step) for step in plan]
+        return result
+
+    monkeypatch.setattr(runs.routing_service, "route", fake)
+    return fake
+
+
+def test_prepare_splits_steps_only_for_multi_step_plans(workspace, monkeypatch):
+    scope_guard = pytest.importorskip("workbench.backend.services.scope_guard")
+    project, session, _ = workspace
+    install(monkeypatch)
+    single = runs.create_run(session["id"], text="完善世界设定", start=False)
+    _s, system, _c, info, tools = runs._prepare(runs._row(single["id"]))
+    assert info["plan"] == [] and "plan_steps" not in tools
+    assert "【本轮协作计划】" not in system
+    assert scope_guard.evaluate(tools["scope"], "设定/世界设定.md")["allowed"] is True
+    assert info["scope_label"]
+
+    other = chat_service.create_session(project_id=project["id"])
+    plan_route(monkeypatch, TWO_STEPS)
+    multi = runs.create_run(other["id"], text="先帮我把设定补全，再按设定列一版卷纲", start=False)
+    _s2, _system2, _c2, info2, tools2 = runs._prepare(runs._row(multi["id"]))
+    steps = tools2["plan_steps"]
+    assert [step["agent_key"] for step in steps] == ["setting-keeper", "planner"]
+    assert [step["write_targets"] for step in steps] == [["设定"], ["大纲"]]
+    assert "第 1/2 步" in steps[0]["system"] and "第 2/2 步" in steps[1]["system"]
+    assert scope_guard.evaluate(steps[0]["scope"], "设定/世界设定.md")["allowed"] is True
+    assert scope_guard.evaluate(steps[0]["scope"], "大纲/大纲.md")["allowed"] is False
+    assert scope_guard.evaluate(steps[1]["scope"], "大纲/大纲.md")["allowed"] is True
+    assert scope_guard.evaluate(steps[1]["scope"], "设定/世界设定.md")["allowed"] is False
+    assert [item["agent"] for item in info2["plan"]] == ["setting-keeper", "planner"]
+    assert info2["write_targets"] == ["设定", "大纲"]
+    assert info2["plan"][0]["write_targets"] == ["设定"]
+    assert info2["plan"][1]["agent_title"]
+
+
+def test_multi_step_skill_usage_matches_each_steps_actual_context(workspace, monkeypatch):
+    from workbench.backend.engine.runtime import estimate_tokens
+    from workbench.backend.services import skill_service
+
+    _, session, root = workspace
+    for name in ("novel-setting", "novel-planning", "human-linguistics"):
+        path = root / "skills" / name / "SKILL.md"
+        path.parent.mkdir()
+        path.write_text(f"---\nname: {name}\ndescription: 规则\n---\n"
+                        + "完整规则。" * 1700 + f"{name}的尾部。", encoding="utf-8")
+    plan_route(monkeypatch, TWO_STEPS)
+    engine = install(monkeypatch, turns=[[("create_file", {"rel_path": "设定/技能验收.md", "content": "设定已补全。"}), "设定已补全。"],
+                                      [("create_file", {"rel_path": "大纲/技能验收.md", "content": "大纲已列出。"}), "大纲已列出。"]])
+    result = finish(runs.create_run(session["id"], text="先补设定再列卷纲"))
+    assert result["ok"] and len(engine.calls) == 2
+    steps = [item for item in result["steps"] if item.get("kind") == "skill"]
+    assert any(item["call_id"].startswith("skill-context:1:") for item in steps)
+    assert any(item["call_id"].startswith("skill-context:2:") for item in steps)
+    for step in steps:
+        position = int(step["call_id"].split(":")[1]) - 1
+        block = skill_service.skill_digest([step["tool"]])
+        assert block in engine.calls[position]["system"]
+        assert step["estimated_tokens"] == estimate_tokens(block)
+        assert "预算" not in step["summary"]
+
+
+def test_routing_event_and_history_meta_carry_plan(workspace, monkeypatch):
+    _, session, _ = workspace
+    plan_route(monkeypatch, TWO_STEPS)
+    engine = install(monkeypatch, turns=[[("create_file", {"rel_path": "设定/计划验收.md", "content": "设定已补全。"}), "设定已补全。"],
+                                      [("create_file", {"rel_path": "大纲/计划验收.md", "content": "大纲已列出。"}), "大纲已列出。"]])
+    result = finish(runs.create_run(session["id"], text="先补设定再列卷纲"))
+    assert result["ok"] and len(engine.calls) == 2
+    route = next(event for event in runs.events_after(result["id"]) if event["event"] == "routing")
+    assert [item["agent"] for item in route["plan"]] == ["setting-keeper", "planner"]
+    assert route["plan"][0]["write_targets"] == ["设定"] and route["plan"][1]["agent_title"]
+    assert route["write_targets"] == ["设定", "大纲"]
+    assert route["scope_label"]
+    labels = [step.get("label") for step in result["steps"] if step.get("kind") == "plan_step"]
+    assert labels == ["协作步骤 1/2：设定（setting-keeper）", "协作步骤 2/2：大纲（planner）"]
+    # 刷新回看：计划随消息 meta 落库。
+    meta = chat_service.list_messages(session["id"])[-1]["meta"]
+    assert [item["agent"] for item in meta["routing"]["plan"]] == ["setting-keeper", "planner"]
+    assert meta["routing"]["scope_label"] == route["scope_label"]
+
+
+def test_plan_step_scope_limits_writes_and_hands_off(workspace, monkeypatch):
+    from workbench.backend.services import chat_workspace_tools
+    scope_guard = pytest.importorskip("workbench.backend.services.scope_guard")
+    project, session, _ = workspace
+    plan_route(monkeypatch, TWO_STEPS)
+    observed = []
+    real_execute = chat_workspace_tools.execute
+
+    def spy(name, args, ctx):
+        observed.append((name, dict(ctx.get("scope") or {})))
+        return real_execute(name, args, ctx)
+
+    monkeypatch.setattr(chat_workspace_tools, "execute", spy)
+    engine = install(monkeypatch, turns=[
+        [("create_file", {"rel_path": "设定/新增设定卡.md", "content": "设定一。"}), "设定已补全。"],
+        [("create_file", {"rel_path": "大纲/新增卷纲.md", "content": "大纲一。"}), "大纲已列出。"]])
+    result = finish(runs.create_run(session["id"], text="先补设定再列卷纲"))
+    assert result["ok"]
+    assert [name for name, _scope in observed] == ["create_file", "create_file"]
+    assert scope_guard.evaluate(observed[0][1], "设定/新增设定卡.md")["allowed"] is True
+    assert scope_guard.evaluate(observed[0][1], "大纲/新增卷纲.md")["allowed"] is False
+    assert scope_guard.evaluate(observed[1][1], "大纲/新增卷纲.md")["allowed"] is True
+    assert scope_guard.evaluate(observed[1][1], "设定/新增设定卡.md")["allowed"] is False
+    assert changes.file_state(project["id"], "设定/新增设定卡.md")["exists"]
+    assert changes.file_state(project["id"], "大纲/新增卷纲.md")["exists"]
+    # 每步换成该步的 system / 工具清单，且第 2 步带上第 1 步的答复摘要。
+    assert "第 1/2 步" in engine.calls[0]["system"]
+    assert "第 2/2 步" in engine.calls[1]["system"]
+    assert engine.calls[1]["resume"] is True
+    assert engine.calls[1]["user_text"] != engine.calls[0]["user_text"]
+    assert "上一步（" in engine.calls[1]["context"] and "设定已补全。" in engine.calls[1]["context"]
+
+
+def test_plan_step_failure_keeps_prior_work_and_skips_remaining(workspace, monkeypatch):
+    project, session, _ = workspace
+    plan_route(monkeypatch, TWO_STEPS)
+    engine = install(monkeypatch, turns=[
+        [("create_file", {"rel_path": "设定/新增设定卡.md", "content": "设定一。"}),
+         {"type": "error", "code": "TIMEOUT", "message": "模型无进展"}]])
+    result = finish(runs.create_run(session["id"], text="先补设定再列卷纲"))
+    assert result["status"] == "failed" and result["error_code"] == "TIMEOUT"
+    assert len(engine.calls) == 1                      # 第 2 步未执行
+    assert changes.file_state(project["id"], "设定/新增设定卡.md")["exists"]    # 第 1 步成果保留
+    steps = [step for step in result["steps"] if step.get("kind") == "plan_step"]
+    assert len(steps) == 1 and steps[0]["status"] == "error"
+    assert [item["agent"] for item in result["routing"]["plan"]] == ["setting-keeper", "planner"]
+    assert any("第 1/2 步未完成" in warning and "后续 1 步未执行" in warning
+               for warning in result["context_warnings"])
+
+
+def test_single_material_round_escalates_out_of_scope_write_to_approval(workspace, monkeypatch):
+    """单材料轮：写域只含路由声明的材料，越界写按当前档位（auto）降级为批准卡。"""
+    from workbench.backend.services import chat_interaction_service as interactions
+    pytest.importorskip("workbench.backend.services.scope_guard")
+    project, session, _ = workspace
+    install(monkeypatch, turns=[[
+        ("create_file", {"rel_path": "大纲/越界大纲.md", "content": "越界大纲。"}),
+        "已按批准继续。"]])
+    run = runs.create_run(session["id"], text="现在我需要完善设定")
+    card = wait_interaction(run)
+    assert card["kind"] == "approval"
+    assert card["payload"]["scope"]["out_of_scope"] is True
+    assert card["payload"]["scope"]["material"] == "大纲"
+    assert "越界" in card["payload"]["reason"]
+    assert [option["id"] for option in card["payload"]["scope"]["options"]] == ["once", "material"]
+    assert not changes.file_state(project["id"], "大纲/越界大纲.md")["exists"]
+    interactions.respond(run["id"], card["id"], {"decision": "approve"})
+    result = finish(run)
+    assert result["error_code"] == "DELIVERY_UNVERIFIED"  # 越界批准不证明原目标设定已完成。
+    assert changes.file_state(project["id"], "大纲/越界大纲.md")["exists"]
+
+
+def test_builtin_agent_upgrade_keeps_author_model_and_never_overwrites_custom(workspace):
+    """内置定义升级：只覆盖技能/文案/版本，保留作者改过的模型与温度；自建同名不覆盖。"""
+    _, _, root = workspace
+    legacy = (
+        "name: writing-assistant\n"
+        "title: 旧创作助理\n"
+        "description: 旧描述\n"
+        "system_prompt: 旧提示词\n"
+        "skills:\n- novel-planning\n- novel-setting\n"
+        "provider_id: custom-provider\n"
+        "model_id: custom-model\n"
+        "tools:\n- 检索\n"
+        "params:\n  temperature: 0.9\n"
+        "is_builtin: true\n"
+        "enabled: false\n"
+        "version: 1\n"
+    )
+    (root / "agents/writing-assistant.yaml").write_text(legacy, encoding="utf-8")
+    custom = (
+        "name: planner\n"
+        "title: 我的规划\n"
+        "description: 自建\n"
+        "system_prompt: 我的自定义提示词\n"
+        "skills: []\n"
+        "tools:\n- 检索\n"
+        "is_builtin: false\n"
+        "enabled: true\n"
+        "version: 1\n"
+    )
+    (root / "agents/planner.yaml").write_text(custom, encoding="utf-8")
+
+    agent_service.ensure_builtin_agents()
+    upgraded = agent_service.get_agent("writing-assistant")
+    assert upgraded["version"] == agent_service.BUILTIN_AGENTS["writing-assistant"]["version"]
+    assert upgraded["retrieval_profile"] == "history"
+    assert upgraded["skills"] == ["human-linguistics"]
+    assert upgraded["title"] == "创作助理（只读咨询）"
+    assert upgraded["provider_id"] == "custom-provider"   # 作者改过的模型被保留
+    assert upgraded["model_id"] == "custom-model"
+    assert upgraded["params"] == {"temperature": 0.9}
+    assert upgraded["enabled"] is False
+
+    # 作者自建的同名非内置文件绝不覆盖。
+    agent_service.ensure_builtin_agents()
+    assert agent_service.get_agent("planner")["system_prompt"] == "我的自定义提示词"
+    assert agent_service.get_agent("planner")["is_builtin"] is False
+    assert agent_service.get_agent("writing-assistant")["version"] == upgraded["version"]

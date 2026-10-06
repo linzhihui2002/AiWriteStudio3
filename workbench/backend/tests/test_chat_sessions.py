@@ -69,7 +69,9 @@ def test_default_settings_and_session_values_are_independent(workspace):
     assert chats.get_session(first["id"])["permission_mode"] == "auto"
     changed = chats.update_session(first["id"], {"permission_mode": "full"})
     assert (changed["permission_mode"], changed["discussion_only"]) == ("full", False)
-    assert settings_service.read_settings()["chat"] == {"permission_mode": "ask", "discussion_only": True}
+    # 写域两项（scope_strictness / scope_limit_full）是后加的对话偏好，只断言权限两项。
+    saved_chat = settings_service.read_settings()["chat"]
+    assert (saved_chat["permission_mode"], saved_chat["discussion_only"]) == ("ask", True)
 
 
 def test_book_defaults_apply_only_to_new_sessions(workspace):
@@ -124,8 +126,9 @@ def test_malformed_book_defaults_fail_closed(workspace, bad):
     path.write_text(bad, encoding="utf-8")
     defaults = chat_preference_service.get_chat_defaults(project_id)
     session = chats.create_session(project_id=project_id)
-    assert defaults == {"permission_mode": "ask", "discussion_only": True, "source": "book"}
-    assert (session["permission_mode"], session["discussion_only"]) == ("ask", True)
+    # 书级文件损坏时不继承全局值，而是回退到书级安全默认（与全局默认同为自动执行）。
+    assert defaults == {"permission_mode": "auto", "discussion_only": False, "source": "book"}
+    assert (session["permission_mode"], session["discussion_only"]) == ("auto", False)
     assert path.read_text(encoding="utf-8") == bad
 
 

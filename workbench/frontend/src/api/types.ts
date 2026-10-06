@@ -101,6 +101,46 @@ export interface Template {
   created_at: string
 }
 
+/** 开书模板偏好：默认模板 + 题材/平台映射。 */
+export interface TemplatePrefs {
+  default: string
+  by_genre: Record<string, string>
+  by_platform: Record<string, string>
+}
+
+/** 模板内文件树节点（与项目文档树不同：无章节语义）。 */
+export interface TemplateTreeNode {
+  name: string
+  rel_path: string
+  type: 'file' | 'dir'
+  is_empty?: boolean
+  size?: number
+  mtime?: number
+  children?: TemplateTreeNode[]
+}
+
+export interface TemplateTree {
+  name: string
+  exists: boolean
+  nodes: TemplateTreeNode[]
+}
+
+export interface TemplateFile {
+  rel_path: string
+  content: string
+  is_empty: boolean
+  size: number
+  mtime: number
+}
+
+/** 模板包（导出/导入）。 */
+export interface TemplatePackage {
+  name: string
+  exported_at?: string
+  dirs: string[]
+  files: Record<string, string>
+}
+
 export interface ConflictCheck {
   changed: boolean
   reason: string
@@ -141,6 +181,56 @@ export interface ContextBlock {
   tokens: number
   mandatory: boolean
   truncated?: boolean
+  retrieval?: ContextRetrievalHit
+  type?: 'style'
+  style_reference?: { reference_hash: string; samples: StyleReferenceSample[] }
+}
+
+export interface StyleReferenceSample {
+  id: number
+  rel_path: string
+  content_hash: string
+  excerpt_hash?: string
+  injected_hash?: string
+  fragment_index?: number
+  text?: string
+  tokens?: number
+  truncated?: boolean
+  note?: string
+}
+
+export interface StyleReferenceSummary {
+  enabled?: boolean
+  injected?: boolean
+  status?: string
+  samples: StyleReferenceSample[]
+  reference_hash?: string
+  tokens?: number
+  selected_samples?: StyleReferenceSample[]
+  selected_reference_hash?: string
+  selected_tokens?: number
+  excluded?: Array<{ id: number; rel_path: string; code: string; reason: string }>
+  degradation?: string[]
+}
+
+export interface ContextRetrievalHit {
+  id?: string
+  evidence_id?: string
+  rel_path: string
+  line_start?: number
+  line_end?: number
+  hash?: string
+  document_hash?: string
+  source?: string
+  injected?: boolean
+  score?: number
+}
+
+export interface ContextRetrievalSummary {
+  profile?: string
+  queries?: string[]
+  hits?: ContextRetrievalHit[]
+  degradation?: string[]
 }
 
 export interface ContextPreview {
@@ -150,6 +240,9 @@ export interface ContextPreview {
   usage_ratio: number
   degradation: Array<{ level: number; title: string; reason: string }>
   excluded_levels: number[]
+  retrieval?: ContextRetrievalSummary
+  style_reference?: StyleReferenceSummary
+  prose_history_reference?: ProseHistoryReferenceSummary
 }
 
 export interface Contract {
@@ -190,11 +283,134 @@ export interface ReviewResult {
   rel_path: string
   verdict: string
   hard_gates: { passed: boolean; words: number; gates: HardGate[]; locations: Location[]; blocking_gates: string[] }
-  items: Array<{ 项: string; 判定: string; 证据: string }>
+  items: Array<{ 项: string; 判定: string; 证据: string; 核验说明?: string; 证据行?: number; 证据列?: number }>
   consistency: Array<{ 类型: string; 说明: string; 证据: string }>
   revise_instructions: string[]
   counts: { 已完成: number; 未完成: number; 待核实: number }
   ai_used: boolean
+  ai_error?: string
+  ai_error_code?: string
+  task_id?: number
+  source_hash?: string
+  candidate_hash?: string
+  contract_hash?: string
+  contract_changed?: boolean
+  contract_present?: boolean
+  prose_quality?: ProseQuality
+  prose_review?: ProseReviewSuggestion[]
+  prose_history?: ProseHistoryQuality
+}
+
+export interface ProseLocation {
+  line: number
+  column: number
+  end_line: number
+  end_column?: number
+}
+
+export interface ProseQualityFinding extends ProseLocation {
+  kind: string
+  severity: 'warning'
+  text: string
+  related_locations: ProseLocation[]
+  reason: string
+  suggestion: string
+  text_truncated?: boolean
+}
+
+export interface ProseQuality {
+  version: 1
+  blocking: false
+  findings: ProseQualityFinding[]
+  counters: Record<string, number>
+  truncated: boolean
+}
+
+export interface ProseHistorySource extends ProseLocation {
+  rel_path: string
+  content_hash: string
+  text?: string
+  text_truncated?: boolean
+}
+
+export interface ProseHistoryQualityFinding extends Omit<ProseQualityFinding, 'kind' | 'related_locations'> {
+  kind: 'cross_chapter_paragraph' | 'cross_chapter_sentence'
+  related_locations?: ProseLocation[]
+  related_sources: ProseHistorySource[]
+}
+
+export interface ProseHistoryQuality {
+  version: 1
+  blocking: false
+  findings: ProseHistoryQualityFinding[]
+  counters: Record<string, number>
+  truncated: boolean
+  status?: 'available' | 'empty' | 'degraded' | 'not_checked'
+  sources?: Array<{ rel_path: string; content_hash: string }>
+  reference_hash?: string
+  excluded?: Array<{ rel_path: string; reason: string }>
+  degradation?: string[]
+}
+
+export interface ProseHistoryReferenceSummary {
+  enabled?: boolean
+  injected?: boolean
+  status?: string
+  samples: ProseHistorySource[]
+  reference_hash?: string
+  tokens?: number
+  truncated?: boolean
+  selected_samples?: ProseHistorySource[]
+  selected_reference_hash?: string
+  selected_tokens?: number
+  excluded?: Array<{ rel_path: string; reason: string }>
+  degradation?: string[]
+}
+
+export interface ProseReviewSuggestion {
+  kind: string
+  evidence: string
+  line: number
+  column: number
+  reason: string
+  suggestion: string
+}
+
+export interface SoftDeslopResult {
+  suggestions: Array<{ line: number; issue: string; original: string; replacement: string }>
+  proposal_ids: number[]
+  style_comparison: Record<string, unknown> | null
+  ai_used: boolean
+  ai_error: string
+  ai_error_code?: string
+  task_id?: number
+  source_changed: boolean
+  candidate_hash: string
+  rejected_suggestions: Array<{ index: number; reason: string; count?: number }>
+}
+
+export interface IngestionResult {
+  chapter_rel: string
+  summary: string
+  timeline_added: number
+  ledger_added: number
+  foreshadow_added: number
+  proposals_created: number[]
+  memory_added: number
+  characters_present: string[]
+  ai_used: boolean
+  state_changes_detected: number
+  source_hash?: string
+  source_changed?: boolean
+  status?: string
+  skipped?: boolean
+  reused?: boolean
+  replayed?: boolean
+  run_id?: string
+  proposal_ids?: number[]
+  rejected?: Array<{ kind: string; reason: string }>
+  counts?: Record<'timeline' | 'ledger' | 'foreshadow' | 'state', { added: number; updated: number; skipped: number; rejected: number }>
+  warnings?: string[]
 }
 
 export interface Location {
@@ -238,17 +454,53 @@ export interface PipelineResult {
   }
 }
 
-export interface CardItem {
-  id: string
+export interface CardEvidence {
+  quote: string
+  start: number
+  end: number
+  rel_path: string
+  line_start: number
+  line_end: number
+  document_hash: string
+}
+
+export interface CardHighlightEntry {
+  entity_id: string
+  ref: string
   name: string
+  aliases: string[]
+  highlight: string
+  highlight_mode: 'auto' | 'manual' | 'off'
+  highlight_colors: { light: string; dark: string; paper: string }
+}
+
+export interface CardParseTask {
+  id: string
+  project_id: number
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  phase: string
+  files_total: number
+  files_completed: number
+  parsed_files: number
+  cached_files: number
+  current_file: string | null
+  failures: Array<{ file: string; error: string }>
+  error: string
+}
+
+export interface CardItem extends CardHighlightEntry {
+  id: string
   fields: Record<string, string>
+  field_meta: Record<string, { source: string; evidence: CardEvidence; source_evidence: CardEvidence | null; capabilities?: { rename: boolean; delete: boolean; reason?: string } }>
   summary: string
   source: string
   category: string
   file: string
-  ref: string
-  highlight: string
   field_list: string[]
+  evidence: CardEvidence
+  extent: CardEvidence | null
+  source_hash: string
+  stale: boolean
 }
 
 export interface CardList {
@@ -259,6 +511,10 @@ export interface CardList {
   counts_by_category: Record<string, number>
   palette: string[]
   categories: Array<{ key: string; label: string; path: string; builtin: boolean }>
+  parse_status: 'not_parsed' | 'pending' | 'running' | 'completed' | 'failed'
+  task_id: string | null
+  task: CardParseTask | null
+  stale_files: string[]
 }
 
 export interface BibleOverview {
@@ -270,6 +526,7 @@ export interface BibleOverview {
   timeline_count: number
   foreshadow_open: number
   foreshadow_total: number
+  foreshadow_planned?: number
   unknown_refs: string[]
   unknown_count: number
 }
@@ -279,8 +536,10 @@ export interface BibleEntity {
   content: string
   summary: string
   ref: string
+  rel_path: string
   source: string
   fields?: Record<string, string>
+  field_sources?: Record<string, string>
   missing?: string[]
   status?: string
   planted_in?: string
@@ -310,6 +569,11 @@ export interface Foreshadow {
   status: string
   planted_in: string
   evidence: string
+  document_hash: string
+  is_planned: boolean
+  planned_chapter?: string
+  record_id?: string
+  source?: string
 }
 
 export interface ProviderModel {
@@ -387,6 +651,7 @@ export interface TaskRecord {
 
 export interface UsageSummary {
   days: number
+  period?: { start: string; end: string }
   totals: { tokens: number; cost: number; calls: number; today_tokens: number }
   by_day: Array<{ day: string; tokens: number; prompt: number; completion: number; cost: number; calls: number }>
   by_project: Array<{ project_id: number | null; tokens: number; cost: number; calls: number }>
@@ -406,6 +671,8 @@ export interface SkillItem {
   path: string
   enabled: boolean
   size_bytes: number
+  estimated_tokens: number
+  references_estimated_tokens: number
   synced: boolean
   synced_path?: string
   error?: string
@@ -483,6 +750,13 @@ export interface ChatDefaults {
   source: string
 }
 
+/** 每章字数区间（书级覆盖优先，缺省回落全局 settings.writing）。 */
+export interface WritingPrefs {
+  chapter_min_words: number
+  chapter_max_words: number
+  source: string
+}
+
 export interface ChatSession {
   id: number
   project_id: number | null
@@ -506,6 +780,7 @@ export interface ChatSession {
 /** 对话中的一次工具调用（步骤时间线） */
 export interface ChatStep {
   index: number
+  estimated_tokens?: number
   call_id?: string
   tool: string
   label: string
@@ -513,7 +788,7 @@ export interface ChatStep {
   status: 'running' | 'done' | 'error' | 'cancelled'
   summary?: string
   elapsed_ms?: number
-  kind?: 'tool' | 'skill' | 'agent' | 'phase'
+  kind?: 'tool' | 'skill' | 'agent' | 'phase' | 'plan_step'
   started_at?: string
   finished_at?: string
   result?: unknown
@@ -542,6 +817,16 @@ export interface ChatInteraction {
     after_content?: string | null
     diff?: DiffLine[] | string
     expected_hash?: string
+    reason?: string
+    /** 写域越界信息（本轮范围 / 目标材料 / 授权粒度选项），仅越界批准卡带 */
+    scope?: {
+      out_of_scope?: boolean
+      material?: string
+      reason?: string
+      label?: string
+      options?: Array<{ id: string; label: string }>
+      resolved?: string
+    }
     [key: string]: unknown
   }
   status: 'pending' | 'answered' | 'cancelled' | 'interrupted' | 'expired'
@@ -549,7 +834,8 @@ export interface ChatInteraction {
   revision?: number
 }
 
-export type ChatInteractionResponse = { decision: 'approve' | 'reject' } | {
+/** scope=task：批准并在本次任务内不再询问；scope=material：本任务内允许改这类材料；scope=once：仅此次批准。 */
+export type ChatInteractionResponse = { decision: 'approve' | 'reject'; scope?: 'task' | 'once' | 'material' } | {
   answers: Array<{ id: string; selected: string[]; custom?: string }>
 }
 
@@ -574,6 +860,9 @@ export interface ChatMessage {
 }
 
 export interface ChatContext {
+  /** Descriptive page context; server-side session identity grants authority. */
+  project_id?: number
+  page_type?: string
   active_file?: string
   target_chapter?: string
   selection?: { text: string; start?: number; end?: number }
@@ -612,6 +901,9 @@ export interface ChatRun {
   permission_mode?: ChatPermissionMode
   discussion_only?: boolean
   read_only?: boolean
+  plan_state?: { fingerprint?: string; active_step?: number; steps: Array<{ step_id?: string; step?: number; label?: string; agent?: string; status: string; write_targets?: string[]; receipts?: Array<Record<string, unknown>>; failure_reason?: string; error?: string; reused?: boolean }> }
+  completion?: { status?: string; message?: string; receipts?: Array<Record<string, unknown>>; error_code?: string }
+  metrics?: Record<string, number | string | null>
 }
 
 export interface ChatRunEvent {
@@ -639,6 +931,13 @@ export interface RoutingDecision {
   agent_title?: string
   available_agents?: string[]
   silent_write?: boolean
+  skills?: string[]
+  write_targets?: string[]
+  read_only_refs?: string[]
+  plan?: Array<{ step: number; agent: string; write_targets: string[]; read_only_refs: string[]; note?: string }>
+  source?: string
+  scope_unresolved?: boolean
+  reason?: string
 }
 
 export interface ChatReply {
@@ -657,6 +956,12 @@ export interface ChatReply {
 
 export interface Settings {
   chat?: { permission_mode: ChatPermissionMode; discussion_only: boolean }
+  writing?: {
+    always_inject_skills: string[]
+    chapter_min_words: number
+    chapter_max_words: number
+    auto_deslop: { enabled: boolean; max_rounds: number }
+  }
   milestone: { enabled: boolean; step: number }
   appearance: {
     theme: string
@@ -691,6 +996,22 @@ export interface StyleFingerprint {
   dialog_ratio: number
   dash_per_1000: number
   created_at: string
+  note?: string
+  content_hash?: string
+  sample_version?: number
+  usable?: boolean
+  reference_status?: string
+  reference_reason?: string
+}
+
+export interface StyleReferenceMetrics {
+  samples: number
+  sentence_len_mean: number
+  sentence_len_cv: number
+  dialog_ratio: number
+  dash_per_1000: number
+  ellipsis_per_1000: number
+  top_bigrams: Array<{ word: string; count: number }>
 }
 
 export interface VectorStats {
@@ -703,12 +1024,21 @@ export interface VectorStats {
   ready: boolean
 }
 
+export interface OutlineCandidate {
+  id: string
+  title: string
+  content: string
+  source: string
+  parent_id?: string
+  conversation?: Array<{ role: 'user' | 'assistant'; content: string }>
+}
+
 export interface OutlineState {
   project_id: number
   project_name: string
   content: string
-  candidates: Array<{ title: string; content: string; source: string }>
-  locked: { title: string; at: string } | null
+  candidates: OutlineCandidate[]
+  locked: { title: string; at: string; candidate_id?: string } | null
   questions: string[]
   frozen: boolean
   history_count: number
@@ -727,6 +1057,7 @@ export interface OperationLogEntry {
 export interface TrashEntry {
   trash_rel: string
   project_name: string
+  project_id?: number | null
   rel_path: string | null
   kind: string | null
   deleted_at: string | null
